@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/tern-core", "crates/tern-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+tern-core = { path = "crates/tern-core" }
+gpui-kit = "0.8"
+
+[profile.dev]
+# GPUI is slow unoptimized; keep our crates debuggable but optimize dependencies.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

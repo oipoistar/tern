@@ -1,0 +1,13 @@
+[package]
+name = "tern-app"
+description = "Tern desktop app (GPUI)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tern"
+path = "src/main.rs"
+
+[dependencies]
+tern-core.workspace = true
+gpui-kit.workspace = true
