@@ -79,6 +79,9 @@ claude.ai account). Each item below names the artboard it comes from.
       snippets, port forwards and settings, private keys one by one; the
       devices and "Synced 2 min ago" in Settings, the real state in the
       header; the passphrase in the system's credential store
+- [x] Save passwords (item 16): a password field and "Save in the system
+      keychain" in the host editor; sessions try a saved password before
+      asking; never in `vault.json`, forgotten with the host
 
 ## Known gaps in what's built
 
@@ -105,10 +108,6 @@ claude.ai account). Each item below names the artboard it comes from.
   server-opened `auth-agent@openssh.com` channels by piping them to the local
   agent (`SSH_AUTH_SOCK`, the OpenSSH agent pipe, or Pageant).
 - An end-to-end test.
-
-### 16. Save passwords (host editor, Password sign-in)
-- A password field plus a "Save in the system keychain" switch (mockup).
-- Uses the `keyring` crate. Passwords are never written to `vault.json`.
 
 ### 17. Terminal niceties
 - Find in scrollback, clickable URLs, font zoom (Ctrl +/-), visual bell.

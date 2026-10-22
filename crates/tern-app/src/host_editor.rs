@@ -12,11 +12,13 @@ use gpui_kit::*;
 use tern_core::draft::{Field, HostDraft, Problem};
 use tern_core::randomart::Randomart;
 use tern_core::reach::Place;
+use tern_core::secrets::host_password;
 use tern_core::ssh::{KeyInfo, key_file_info, probe};
 use tern_core::{Auth, Host, Vault};
 
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
+use crate::sync::secrets;
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{Ui, art_tile, button, icon, ink_button, switch};
 
@@ -74,6 +76,12 @@ pub struct HostEditor {
     user: Entity<InputState>,
     tag: Entity<InputState>,
     on_login: Entity<InputState>,
+    /// For password sign-in: typed to save it, empty to keep the one saved.
+    password: Entity<InputState>,
+    /// Keep the password in the system's credential store.
+    save_password: bool,
+    /// The host already has a saved password.
+    password_saved: bool,
     group: String,
     sign_in: SignIn,
     /// The key file for key sign-in, kept while another method is picked.
@@ -117,6 +125,17 @@ impl HostEditor {
         let user = text_input(&draft.user, "", window, cx);
         let tag = text_input("", "Add tag", window, cx);
         let on_login = text_input(&draft.on_login, "", window, cx);
+        let password_saved =
+            host.is_some_and(|host| secrets(cx).load(&host_password(&host.id)).is_some());
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(if password_saved {
+                    "••••••••"
+                } else {
+                    ""
+                })
+                .masked(true)
+        });
 
         let mut subscriptions: Vec<Subscription> = [&name, &address, &port, &user]
             .into_iter()
@@ -157,6 +176,9 @@ impl HostEditor {
             user,
             tag,
             on_login,
+            password,
+            save_password: password_saved,
+            password_saved,
             group: draft.group,
             sign_in,
             key,
@@ -242,6 +264,7 @@ impl HostEditor {
     pub fn save(&mut self, cx: &mut Context<Self>) {
         match self.draft(cx).check(&self.vault, self.replacing.as_deref()) {
             Ok(host) => {
+                self.keep_password(&host, cx);
                 // A check of the place the vault will check is fresh news.
                 let first_hop = self.vault.first_hop(&host);
                 let checked = match &self.test {
@@ -263,6 +286,32 @@ impl HostEditor {
                 cx.notify();
             }
         }
+    }
+
+    /// Saves the typed password for `host` in the system's credential
+    /// store, or forgets the saved one when the switch is off or the host
+    /// no longer signs in with a password. Never in the vault file.
+    fn keep_password(&mut self, host: &Host, cx: &mut Context<Self>) {
+        let name = host_password(&host.id);
+        let typed = self.password.read(cx).value().to_string();
+        let store = secrets(cx);
+        if host.auth == Auth::Password && self.save_password {
+            if !typed.is_empty() {
+                let _ = store.store(&name, &typed);
+            }
+        } else if self.password_saved {
+            let _ = store.forget(&name);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn password_input(&self) -> Entity<InputState> {
+        self.password.clone()
+    }
+
+    #[cfg(test)]
+    pub fn saves_password(&self) -> bool {
+        self.save_password
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
@@ -496,6 +545,31 @@ impl HostEditor {
             )
             .when(self.sign_in == SignIn::Key, |d| {
                 d.child(self.key_row(t, cx))
+            })
+            .when(self.sign_in == SignIn::Password, |d| {
+                d.child(self.field("Password", &self.password, None, true, t))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .min_h(px(36.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Save in the system keychain"),
+                            )
+                            .child(
+                                switch("save-password", self.save_password, t)
+                                    .debug_selector(|| "save-password".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_password = !this.save_password;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
             })
     }
 

@@ -196,6 +196,7 @@ impl Vault {
         };
         Ok(Connection {
             host: Some(host.name.clone()),
+            host_id: Some(host.id.clone()),
             target: host.ssh_target(),
             auth: host.auth.clone(),
             jump,

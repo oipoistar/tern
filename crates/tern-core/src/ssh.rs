@@ -89,6 +89,8 @@ pub struct Jump {
 pub struct Connection {
     /// The saved host this opens, if it is one.
     pub host: Option<String>,
+    /// That host's id, which its saved password is kept under.
+    pub host_id: Option<String>,
     pub target: Target,
     pub auth: Auth,
     pub jump: Option<Jump>,
@@ -104,6 +106,7 @@ impl Connection {
     pub fn typed(target: Target, identity: Option<PathBuf>) -> Self {
         Self {
             host: None,
+            host_id: None,
             target,
             auth: identity.map_or(Auth::Agent, Auth::Key),
             jump: None,

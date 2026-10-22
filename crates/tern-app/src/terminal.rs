@@ -149,8 +149,18 @@ impl Dimensions for GridSize {
 impl TerminalView {
     pub fn new(connection: Connection, cx: &mut Context<Self>) -> Self {
         let mut view = Self::idle(connection, cx);
+        view.password = view.saved_password(cx);
         view.connect(cx);
         view
+    }
+
+    /// The password saved for this connection's host, if it signs in with
+    /// one; it's tried before asking.
+    fn saved_password(&self, cx: &App) -> Option<String> {
+        let id = self.connection.host_id.as_deref()?;
+        (self.connection.auth == tern_core::Auth::Password)
+            .then(|| crate::sync::secrets(cx).load(&tern_core::secrets::host_password(id)))
+            .flatten()
     }
 
     /// A live pane with no connection behind it, for tests.
@@ -162,6 +172,20 @@ impl TerminalView {
             user: "me".into(),
         };
         Self::offline_to(Connection::typed(target, None), cx)
+    }
+
+    #[cfg(test)]
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    /// A pane for `connection` that only reads its saved password, for
+    /// tests.
+    #[cfg(test)]
+    pub fn unconnected(connection: Connection, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::idle(connection, cx);
+        view.password = view.saved_password(cx);
+        view
     }
 
     /// A live pane for `connection` with nothing behind it, for tests.

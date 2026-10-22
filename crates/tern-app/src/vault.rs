@@ -1100,7 +1100,11 @@ impl VaultContent {
                 self.refresh_keys();
             }
             EditorEvent::Delete(name) => {
+                let id = self.vault.find(name).map(|host| host.id.clone());
                 if self.vault.delete(name).is_ok() {
+                    if let Some(id) = id {
+                        let _ = sync::secrets(cx).forget(&tern_core::secrets::host_password(&id));
+                    }
                     self.persist(cx);
                     if self.selected == *name {
                         self.selected = self
@@ -1867,7 +1871,7 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use gpui_kit::Entity;
+    use gpui_kit::{AppContext as _, Entity};
     use tern_core::draft::Field;
     use tern_core::ssh::Connection;
     use tern_core::{Host, Vault};
@@ -2314,6 +2318,69 @@ mod tests {
         assert_eq!(state.devices[0].0, "Laptop");
         assert!(folder.join("Tern").join("desktop.tern").exists());
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[gpui::test]
+    fn saves_passwords_in_the_keychain_only(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        use tern_core::secrets::{MemorySecrets, Secrets as _, host_password};
+
+        use crate::sync::SecretsStore;
+        use crate::terminal::TerminalView;
+
+        let (vault, cx, _) = open_vault(cx);
+        let secrets = Arc::new(MemorySecrets::default());
+        let kept = secrets.clone();
+        cx.update(|_, cx| cx.set_global(SecretsStore(secrets)));
+        let editor = |cx: &mut VisualTestContext| {
+            vault.read_with(cx, |vault, _| {
+                vault.editor.clone().expect("the editor is open")
+            })
+        };
+
+        click(cx, "host-bastion");
+        click(cx, "edit-host");
+        click(cx, "sign-in-password");
+        let open = editor(cx);
+        cx.update(|window, cx| {
+            let input = open.read(cx).password_input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_input("s3cret");
+        click(cx, "save-password");
+        click(cx, "save-host");
+        let id = vault.read_with(cx, |vault, _| {
+            vault.vault.find("bastion").unwrap().id.clone()
+        });
+        assert_eq!(kept.load(&host_password(&id)).as_deref(), Some("s3cret"));
+
+        // Never in the vault file.
+        let dir = std::env::temp_dir().join(format!("tern-ui-password-{}", std::process::id()));
+        let path = dir.join("vault.json");
+        vault.read_with(cx, |vault, _| vault.vault.save_to(&path).unwrap());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("s3cret"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A session tries it before asking.
+        let connection = vault.read_with(cx, |vault, _| {
+            vault
+                .vault
+                .connection(vault.vault.find("bastion").unwrap())
+                .unwrap()
+        });
+        let terminal = cx.new(|cx| TerminalView::unconnected(connection, cx));
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.password(), Some("s3cret"))
+        });
+
+        // Reopened, the switch is on; deleting the host forgets it.
+        click(cx, "edit-host");
+        let open = editor(cx);
+        open.read_with(cx, |editor, _| assert!(editor.saves_password()));
+        click(cx, "delete-host");
+        assert_eq!(kept.load(&host_password(&id)), None);
     }
 
     #[gpui::test]
