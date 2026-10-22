@@ -310,19 +310,26 @@ fn spawn_shell(
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
     let runtime = tokio::runtime::Handle::current();
-    std::thread::spawn(move || {
+    let output = handle.clone();
+    let pump = std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0
                 || runtime
-                    .block_on(handle.data(channel, buf[..n].to_vec()))
+                    .block_on(output.data(channel, buf[..n].to_vec()))
                     .is_err()
             {
                 break;
             }
         }
+    });
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
         let status = child.wait().map(|status| status.exit_code()).unwrap_or(1);
+        // Windows' ConPTY keeps the output open until the PTY itself is
+        // closed, so the pump would wait forever after the shell exits.
         slot.lock().unwrap().take();
+        let _ = pump.join();
         runtime.block_on(async {
             let _ = handle.exit_status_request(channel, status).await;
             let _ = handle.eof(channel).await;

@@ -2,7 +2,6 @@
 //! `~/.ssh/known_hosts`, which Tern only reads, and Tern's own file, whose
 //! entries can be forgotten.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use russh::keys::PublicKey;
@@ -134,17 +133,7 @@ fn forget_in(file: &Path, line: usize, expected: &str) -> Result<(), String> {
     if !rest.is_empty() {
         rest.push('\n');
     }
-    let mut temp = file.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let write = || -> std::io::Result<()> {
-        let mut out = std::fs::File::create(&temp)?;
-        out.write_all(rest.as_bytes())?;
-        out.sync_all()?;
-        drop(out);
-        std::fs::rename(&temp, file)
-    };
-    write().map_err(|error| error.to_string())
+    paths::write_atomically(file, rest.as_bytes()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

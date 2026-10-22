@@ -11,6 +11,7 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -21,6 +22,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
 use gpui_kit::*;
+use tern_core::history::{self, Visit};
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
 use crate::theme::{self, MONO, TermPalette, Theme};
@@ -49,6 +51,14 @@ pub enum Phase {
     Ended(SharedString),
 }
 
+pub enum TerminalEvent {
+    /// A connection attempt ended (closed, failed or given up), for
+    /// History.
+    Finished(Visit),
+}
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
 pub struct TerminalView {
     connection: Connection,
     password: Option<String>,
@@ -67,6 +77,10 @@ pub struct TerminalView {
     grid: Rc<Cell<GridGeometry>>,
     /// A drag is extending the selection.
     selecting: bool,
+    /// When the current attempt started, in seconds since the Unix epoch.
+    started: u64,
+    /// Since when the shell has been up.
+    live_since: Option<Instant>,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -161,6 +175,8 @@ impl TerminalView {
             focus: cx.focus_handle(),
             grid: Rc::default(),
             selecting: false,
+            started: history::now(),
+            live_since: None,
             #[cfg(test)]
             sent: RefCell::default(),
         }
@@ -178,7 +194,38 @@ impl TerminalView {
         })
     }
 
+    /// Whether the shell is up.
+    pub fn is_live(&self) -> bool {
+        matches!(self.phase, Phase::Live)
+    }
+
+    /// The current attempt as a History entry that `ended` as given.
+    pub fn visit(&self, ended: &str) -> Visit {
+        let target = &self.connection.target;
+        Visit {
+            host: self.connection.host.clone(),
+            user: target.user.clone(),
+            address: target.host.clone(),
+            port: target.port,
+            auth: self.connection.auth.clone(),
+            started: self.started,
+            lasted: self.live_since.map(|since| since.elapsed().as_secs()),
+            ended: ended.into(),
+        }
+    }
+
+    /// Ends the attempt with `message` on screen, and reports it.
+    fn end(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        cx.emit(TerminalEvent::Finished(self.visit(&message)));
+        self.phase = Phase::Ended(message);
+        self.live_since = None;
+    }
+
     fn connect(&mut self, cx: &mut Context<Self>) {
+        // Answering a trust or password prompt continues the same attempt.
+        if !matches!(self.phase, Phase::Trust { .. } | Phase::Password { .. }) {
+            self.started = history::now();
+        }
         let request =
             self.connection
                 .request(self.size, self.password.as_deref(), self.trust.clone());
@@ -202,6 +249,7 @@ impl TerminalView {
         match event {
             Event::Connected => {
                 self.phase = Phase::Live;
+                self.live_since = Some(Instant::now());
                 self.term = Term::new(
                     TermConfig {
                         scrolling_history: SCROLLBACK,
@@ -221,21 +269,22 @@ impl TerminalView {
             }
             Event::Closed { exit_status } => {
                 self.input = None;
-                self.phase = Phase::Ended(match exit_status {
+                let message = match exit_status {
                     Some(status) => format!("Exited with status {status}").into(),
                     None => "Connection closed".into(),
-                });
+                };
+                self.end(message, cx);
             }
             Event::Failed(error) => {
                 self.input = None;
-                self.phase = match error {
-                    ConnectError::UnknownHostKey { host, port, key, fingerprint } => Phase::Trust {
+                match error {
+                    ConnectError::UnknownHostKey { host, port, key, fingerprint } => self.phase = Phase::Trust {
                         host: if port == 22 { host.into() } else { format!("{host}:{port}").into() },
                         key: *key,
                         fingerprint: fingerprint.into(),
                     },
-                    ConnectError::AuthFailed { .. } => Phase::Password { typed: String::new(), rejected: self.password.is_some() },
-                    ConnectError::HostKeyChanged { fingerprint, file, line } => Phase::Ended(
+                    ConnectError::AuthFailed { .. } => self.phase = Phase::Password { typed: String::new(), rejected: self.password.is_some() },
+                    ConnectError::HostKeyChanged { fingerprint, file, line } => self.end(
                         // The one place the extra words earn their keep: this
                         // may be an attack, and the user needs the line to fix it.
                         format!(
@@ -243,9 +292,10 @@ impl TerminalView {
                             file.display()
                         )
                         .into(),
+                        cx,
                     ),
-                    ConnectError::Other(message) => Phase::Ended(message.into()),
-                };
+                    ConnectError::Other(message) => self.end(message.into(), cx),
+                }
             }
         }
         cx.notify();
@@ -347,12 +397,12 @@ impl TerminalView {
                 "backspace" => {
                     typed.pop();
                 }
-                "escape" => self.phase = Phase::Ended("Cancelled".into()),
+                "escape" => self.end("Cancelled".into(), cx),
                 _ => return,
             },
             Phase::Trust { .. } => match keystroke.key.as_str() {
                 "enter" => self.trust_and_connect(cx),
-                "escape" => self.phase = Phase::Ended("Not trusted".into()),
+                "escape" => self.end("Not trusted".into(), cx),
                 _ => return,
             },
             Phase::Ended(_) if keystroke.key == "enter" => self.connect(cx),
@@ -672,7 +722,7 @@ impl TerminalView {
                                 ))
                                 .child(button("cancel", "Cancel", false).on_click(cx.listener(
                                     |this, _, _, cx| {
-                                        this.phase = Phase::Ended("Not trusted".into());
+                                        this.end("Not trusted".into(), cx);
                                         cx.notify();
                                     },
                                 ))),
@@ -1247,6 +1297,45 @@ mod tests {
     fn selected(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Option<String> {
         view.read_with(cx, |view, _| view.term.selection_to_string())
             .filter(|text| !text.is_empty())
+    }
+
+    #[gpui::test]
+    fn reports_how_a_session_ended(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use tern_core::history::Visit;
+
+        use super::TerminalEvent;
+
+        let (view, cx) = pane_with(cx, "bye");
+        let finished: Rc<RefCell<Vec<Visit>>> = Rc::default();
+        let recorded = finished.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
+                let TerminalEvent::Finished(visit) = event;
+                recorded.borrow_mut().push(visit.clone());
+            })
+            .detach()
+        });
+        view.read_with(cx, |view, _| assert!(view.is_live()));
+        view.update(cx, |view, cx| {
+            view.on_session_event(
+                Event::Closed {
+                    exit_status: Some(0),
+                },
+                cx,
+            )
+        });
+        let visit = finished
+            .borrow()
+            .last()
+            .cloned()
+            .expect("the end is reported");
+        assert_eq!(visit.ended, "Exited with status 0");
+        assert_eq!(visit.target(), "me@example");
+        assert_eq!(visit.lasted, Some(0));
+        view.read_with(cx, |view, _| assert!(!view.is_live()));
     }
 
     #[gpui::test]

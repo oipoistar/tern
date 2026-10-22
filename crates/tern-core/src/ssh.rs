@@ -83,6 +83,8 @@ pub struct Jump {
 /// (`Vault::connection`) or a typed command ([`Connection::typed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connection {
+    /// The saved host this opens, if it is one.
+    pub host: Option<String>,
     pub target: Target,
     pub auth: Auth,
     pub jump: Option<Jump>,
@@ -95,6 +97,7 @@ impl Connection {
     /// A destination typed or passed on the command line, with defaults.
     pub fn typed(target: Target, identity: Option<PathBuf>) -> Self {
         Self {
+            host: None,
             target,
             auth: identity.map_or(Auth::Agent, Auth::Key),
             jump: None,

@@ -14,7 +14,7 @@ use tern_core::ssh::{Connection, parse_command};
 
 use crate::bench;
 use crate::live::{LiveSlots, live_layer};
-use crate::terminal::{Phase, TerminalView};
+use crate::terminal::{Phase, TerminalEvent, TerminalView};
 use crate::theme::{self, Theme};
 use crate::ui::{button, icon, status_dot, tern_mark};
 use crate::vault::{VaultContent, VaultEvent};
@@ -128,6 +128,18 @@ impl Workspace {
         // Tabs show each session's state and title.
         self._subscriptions
             .push(cx.observe(&terminal, |_, _, cx| cx.notify()));
+        self._subscriptions.push(
+            cx.subscribe(
+                &terminal,
+                |this, _, event: &TerminalEvent, cx| match event {
+                    TerminalEvent::Finished(visit) => {
+                        let visit = visit.clone();
+                        this.vault
+                            .update(cx, |vault, cx| vault.record_visit(visit, cx));
+                    }
+                },
+            ),
+        );
         self.sessions.push(terminal);
         self.activate(Some(self.sessions.len() - 1), window, cx);
     }
@@ -216,6 +228,13 @@ impl Workspace {
     }
 
     fn close_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A live session closed by hand still goes into History.
+        let terminal = self.sessions[index].read(cx);
+        if terminal.is_live() {
+            let visit = terminal.visit("Closed");
+            self.vault
+                .update(cx, |vault, cx| vault.record_visit(visit, cx));
+        }
         // Dropping the view drops the session's input, which disconnects.
         self.sessions.remove(index);
         let next = match self.active {

@@ -44,6 +44,9 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Snippets (item 6): saved commands in the vault file (version 2), a
       screen to add, edit and delete them, and a bar under each session
       whose chips type a command and Enter, with a dashed New snippet
+- [x] History (item 7): every connection attempt that ends, with when, how
+      long and how it ended, in `history.json` (last 200); Reconnect uses
+      the saved host's current settings
 
 ## Known gaps in what's built
 
@@ -57,11 +60,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 7. History (sidebar "History")
-- Recent connections: host, when, how long, how it ended. Reconnect in one
-  click.
-- Stored in the data folder, capped (for example the last 200).
 
 ### 8. Port forwarding (sidebar "Port forwarding"; Main artboard panel)
 - Per-host rules: local (`-L`), remote (`-R`), dynamic SOCKS (`-D`).

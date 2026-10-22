@@ -13,6 +13,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
 use tern_core::snippet::Snippet;
@@ -21,6 +22,7 @@ use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 use tern_core::{keys, known_hosts};
 
 use crate::bench;
+use crate::history::{HistoryEvent, HistoryView};
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::keychain::{KeychainEvent, KeychainView};
 use crate::known_hosts::KnownHostsView;
@@ -48,6 +50,7 @@ pub enum Section {
     Keychain,
     Snippets,
     KnownHosts,
+    History,
 }
 
 impl Section {
@@ -63,7 +66,7 @@ impl Section {
             "Known hosts",
             Some(Section::KnownHosts),
         ),
-        (IconName::Clock, "History", None),
+        (IconName::Clock, "History", Some(Section::History)),
     ];
 }
 
@@ -77,6 +80,11 @@ pub struct VaultContent {
     keychain: Option<Entity<KeychainView>>,
     snippets: Option<Entity<SnippetsView>>,
     known_hosts: Option<Entity<KnownHostsView>>,
+    history_view: Option<Entity<HistoryView>>,
+    /// Recent connections, and where they're saved (`None` keeps them in
+    /// memory).
+    history: History,
+    history_file: Option<PathBuf>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
     /// file this Tern mustn't overwrite).
@@ -123,6 +131,8 @@ impl VaultContent {
         }
         let mut content = Self::new(vault, opened.path, live, window, cx);
         content.notice = opened.notice.map(Into::into);
+        content.history = History::load(&paths::history());
+        content.history_file = Some(paths::history());
         content.start_checks(window, cx);
         content
     }
@@ -170,6 +180,28 @@ impl VaultContent {
                     self.snippets = Some(view);
                 }
             }
+            Section::History => match &self.history_view {
+                Some(view) => {
+                    let visits = self.history.visits.clone();
+                    view.update(cx, |view, cx| view.refresh(visits, cx));
+                }
+                None => {
+                    let view = cx.new(|_| HistoryView::new(self.history.visits.clone()));
+                    self._screen_events.push(cx.subscribe_in(
+                        &view,
+                        window,
+                        |this, _, event: &HistoryEvent, window, cx| match event {
+                            HistoryEvent::Reconnect(index) => {
+                                if let Some(visit) = this.history.visits.get(*index) {
+                                    let connection = visit.connection(&this.vault);
+                                    this.connect(connection, window, cx);
+                                }
+                            }
+                        },
+                    ));
+                    self.history_view = Some(view);
+                }
+            },
             Section::KnownHosts => match &self.known_hosts {
                 Some(view) => view.update(cx, |view, cx| view.refresh(cx)),
                 None => {
@@ -279,6 +311,9 @@ impl VaultContent {
             keychain: None,
             snippets: None,
             known_hosts: None,
+            history_view: None,
+            history: History::default(),
+            history_file: None,
             vault,
             file,
             notice: None,
@@ -361,6 +396,20 @@ impl VaultContent {
         self.search
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.emit(VaultEvent::Connect(connection));
+    }
+
+    /// Adds a finished connection to History and saves it.
+    pub fn record_visit(&mut self, visit: Visit, cx: &mut Context<Self>) {
+        self.history.record(visit);
+        if let Some(path) = &self.history_file {
+            // History is a convenience; failing to save it isn't worth a
+            // message.
+            let _ = self.history.save(path);
+        }
+        if let Some(view) = &self.history_view {
+            let visits = self.history.visits.clone();
+            view.update(cx, |view, cx| view.refresh(visits, cx));
+        }
     }
 
     /// The saved snippets, for a session's snippet bar.
@@ -758,6 +807,7 @@ impl Render for VaultContent {
             Section::Keychain => self.keychain.clone().map(Into::into),
             Section::Snippets => self.snippets.clone().map(Into::into),
             Section::KnownHosts => self.known_hosts.clone().map(Into::into),
+            Section::History => self.history_view.clone().map(Into::into),
         };
         div()
             .size_full()
@@ -1115,12 +1165,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn history_lists_visits_and_reconnects(cx: &mut TestAppContext) {
+        use tern_core::history::{Visit, now};
+
+        let (vault, cx, connects) = open_vault(cx);
+        let visit = |host: Option<&str>, address: &str| Visit {
+            host: host.map(Into::into),
+            user: "deploy".into(),
+            address: address.into(),
+            port: 22,
+            auth: tern_core::Auth::Agent,
+            started: now() - 120,
+            lasted: Some(65),
+            ended: "Exited with status 0".into(),
+        };
+        vault.update(cx, |vault, cx| {
+            vault.record_visit(visit(None, "10.0.0.9"), cx);
+            vault.record_visit(visit(Some("bastion"), "old.example.com"), cx);
+        });
+        click(cx, "nav-history");
+        assert!(cx.debug_bounds("reconnect-1").is_some());
+
+        // The newest first; a saved host comes back with today's settings.
+        click(cx, "reconnect-0");
+        let target = connects.borrow().last().cloned().expect("a session").target;
+        assert_eq!(target.host, "bastion.example.com");
+        click(cx, "reconnect-1");
+        let target = connects.borrow().last().cloned().expect("a session").target;
+        assert_eq!(target.host, "10.0.0.9");
+    }
+
+    #[gpui::test]
     fn the_sidebar_switches_screens(cx: &mut TestAppContext) {
         let (_, cx, _) = open_vault(cx);
         assert!(cx.debug_bounds("host-bastion").is_some());
         // Screens not built yet do nothing.
         click(cx, "nav-port-forwarding");
         assert!(cx.debug_bounds("host-bastion").is_some());
+        click(cx, "nav-history");
+        assert!(cx.debug_bounds("history").is_some());
 
         click(cx, "nav-known-hosts");
         assert!(cx.debug_bounds("known-hosts").is_some());

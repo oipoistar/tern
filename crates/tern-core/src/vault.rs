@@ -6,12 +6,12 @@
 //! (see [`crate::reach`]) isn't saved.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, HostGroup};
+use crate::paths;
 use crate::reach::Place;
 use crate::snippet::{self, Snippet};
 use crate::ssh::{Connection, Jump};
@@ -158,6 +158,7 @@ impl Vault {
             }
         };
         Ok(Connection {
+            host: Some(host.name.clone()),
             target: host.ssh_target(),
             auth: host.auth.clone(),
             jump,
@@ -187,23 +188,13 @@ impl Vault {
     /// Writes the vault to `path`: to a temporary file first, then renamed
     /// over the old one, so a crash mid-write never leaves half a file.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let mut json = serde_json::to_string_pretty(&FileOut {
             version: FILE_VERSION,
             groups: &self.groups,
             snippets: &self.snippets,
         })?;
         json.push('\n');
-        let mut temp = path.as_os_str().to_owned();
-        temp.push(".tmp");
-        let temp = PathBuf::from(temp);
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp, path)
+        paths::write_atomically(path, json.as_bytes())
     }
 }
 
