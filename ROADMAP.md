@@ -72,10 +72,16 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Vault list view and filters (item 13): a cards / list switch; Filter
       by group, tag and status with the count of chosen values on the
       button; arrows move the selection, Enter connects, E edits
+- [x] Sync through any folder (item 14): each device writes its own file,
+      encrypted with a passphrase (Argon2id, XChaCha20-Poly1305), into a
+      folder a sync client keeps in step; the newest change of each host or
+      snippet wins, deletions included; switches for hosts and groups,
+      snippets, port forwards and settings, private keys one by one; the
+      devices and "Synced 2 min ago" in Settings, the real state in the
+      header; the passphrase in the system's credential store
 
 ## Known gaps in what's built
 
-- The header's "Synced" is static text (item 14).
 - Only tested on Windows so far (item 23).
 
 ## Next, in order
@@ -86,18 +92,11 @@ claude.ai account). Each item below names the artboard it comes from.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
 
-### 14. Sync through your own storage (Sync artboard)
-- Providers: Google Drive, Dropbox, OneDrive, iCloud Drive, WebDAV /
-  Nextcloud, Any folder. Start with "Any folder": a desktop sync client then
-  covers most providers with no APIs or accounts. Add WebDAV directly next.
-- The vault is encrypted on the device with a passphrase before it leaves.
-  For example, Argon2id to derive a key, then XChaCha20-Poly1305.
-- "What syncs" switches: hosts and groups, snippets, port forwards, private
-  keys (off by default, per key in Keychain), themes and settings.
-- Shows the devices that sync, "Synced 2 min ago", and Sync now. The header's
-  "Synced" check reflects the real state. Its controls are the Settings
-  dialog's Sync tab.
-- Conflicts: last writer wins per item, using per-item timestamps.
+### 14b. More sync providers
+- WebDAV / Nextcloud directly, without a desktop client: the same
+  per-device files over HTTP. Then provider-specific choices in the Sync
+  page (Google Drive, Dropbox, OneDrive, iCloud Drive) where a folder isn't
+  enough.
 - No Tern servers and no accounts, ever.
 
 ### 15. Agent forwarding (host editor option, left out for now)

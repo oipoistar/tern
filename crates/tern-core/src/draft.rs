@@ -143,6 +143,7 @@ impl HostDraft {
         let previous = replacing.and_then(|old| vault.find(old));
         let on_login = self.on_login.trim();
         Ok(Host {
+            id: previous.map_or_else(crate::host::new_id, |host| host.id.clone()),
             name: name.into(),
             user: user.into(),
             address: address.into(),
@@ -156,6 +157,7 @@ impl HostDraft {
             forwards: previous
                 .map(|host| host.forwards.clone())
                 .unwrap_or_default(),
+            updated: previous.map_or(0, |host| host.updated),
         })
     }
 }

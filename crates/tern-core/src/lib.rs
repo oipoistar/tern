@@ -12,10 +12,12 @@ pub mod paths;
 pub mod putty;
 pub mod randomart;
 pub mod reach;
+pub mod secrets;
 pub mod settings;
 pub mod sftp;
 pub mod snippet;
 pub mod ssh;
+pub mod sync;
 pub mod vault;
 
 pub use host::{Auth, Host, HostGroup, HostStatus};

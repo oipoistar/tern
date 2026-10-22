@@ -24,6 +24,7 @@ What's built and what comes next: [ROADMAP.md](ROADMAP.md).
 cargo run -p tern-app                      # the app
 cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at start
 cargo run -p tern-app -- --edit prod-db-01                    # open the host editor (a new host without a name)
+cargo run -p tern-app -- --settings sync                      # open Settings at a page
 ```
 
 The quick-connect field in the vault accepts the same `ssh …` commands
@@ -37,6 +38,12 @@ When PuTTY has saved SSH sessions the vault lacks (in the registry on
 Windows, `~/.putty/sessions` elsewhere; only read), the vault offers "Import
 from PuTTY" and adds them to a PuTTY group. Sessions with a PuTTY `.ppk` key
 sign in through Pageant.
+
+Settings (the sliders in the header) can sync hosts, snippets, port
+forwards, settings and chosen private keys through a folder a sync client
+already keeps in step (Google Drive, Dropbox, OneDrive, iCloud Drive,
+Nextcloud…). Each device writes its own file there, encrypted with your
+passphrase; the passphrase stays in the system's credential store.
 
 Tern checks host keys against `~/.ssh/known_hosts` (read only) and its own
 known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application

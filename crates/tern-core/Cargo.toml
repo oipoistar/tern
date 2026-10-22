@@ -6,6 +6,11 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1"
+# Encrypting what sync writes: Argon2id for the key, XChaCha20-Poly1305 for the data.
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+# The system's credential store, for the sync passphrase and saved passwords.
+keyring = "4"
 # Generating keys.
 rand = { version = "0.10", features = ["thread_rng"] }
 # `ring` instead of the default aws-lc backend: it builds with only the

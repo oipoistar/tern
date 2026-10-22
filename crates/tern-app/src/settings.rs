@@ -9,10 +9,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::paths;
+use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::settings::{Appearance, Bell, CursorStyle, Settings, TerminalSettings};
+use tern_core::sync::SyncedSettings;
 
+use crate::sync::{self, Status, SyncState};
 use crate::theme::{self, MONO, Theme};
-use crate::ui::{button, icon, switch};
+use crate::ui::{button, icon, ink_button, switch};
 
 /// The settings in effect, and where they're saved (`None` in tests).
 struct Current {
@@ -44,10 +47,31 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
         .try_global::<Current>()
         .and_then(|current| current.file.clone());
     let mut settings = current(cx);
+    let before = (settings.appearance, settings.terminal.clone());
     change(&mut settings);
     settings.terminal = settings.terminal.clamped();
+    // What syncs carries a change time, so the newest wins.
+    if (settings.appearance, settings.terminal.clone()) != before {
+        settings.updated = tern_core::host::now_ms();
+    }
     if let Some(file) = &file {
         // A setting that can't be saved still applies until Tern quits.
+        let _ = settings.save(file);
+    }
+    cx.set_global(Current { settings, file });
+    cx.refresh_windows();
+}
+
+/// Takes settings another device synced, with their change time.
+pub fn take_synced(cx: &mut App, synced: &SyncedSettings) {
+    let file = cx
+        .try_global::<Current>()
+        .and_then(|current| current.file.clone());
+    let mut settings = current(cx);
+    settings.appearance = synced.appearance;
+    settings.terminal = synced.terminal.clone().clamped();
+    settings.updated = synced.updated;
+    if let Some(file) = &file {
         let _ = settings.save(file);
     }
     cx.set_global(Current { settings, file });
@@ -74,15 +98,18 @@ pub fn apply_appearance(window: &Window, cx: &mut App) {
 
 pub enum SettingsEvent {
     Close,
+    /// Sync now, after the sync settings changed or on request.
+    SyncNow,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Page {
+pub enum Page {
     General,
     Terminal,
     Appearance,
+    Sync,
 }
 
 pub struct SettingsView {
@@ -90,13 +117,19 @@ pub struct SettingsView {
     font_family: Entity<InputState>,
     font_size: Entity<InputState>,
     scrollback: Entity<InputState>,
+    passphrase: Entity<InputState>,
+    device: Entity<InputState>,
+    /// A sync passphrase is kept in the system's store.
+    passphrase_saved: bool,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(page: Page, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let terminal = current(cx).terminal;
+        let device_name = current(cx).sync.device;
+        let passphrase_saved = sync::secrets(cx).load(SYNC_PASSPHRASE).is_some();
         let input = |value: String,
                      placeholder: &'static str,
                      window: &mut Window,
@@ -110,6 +143,16 @@ impl SettingsView {
         let font_family = input(terminal.font_family.clone(), MONO, window, cx);
         let font_size = input(terminal.font_size.to_string(), "", window, cx);
         let scrollback = input(terminal.scrollback.to_string(), "", window, cx);
+        let passphrase = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(if passphrase_saved {
+                    "••••••••"
+                } else {
+                    "Passphrase"
+                })
+                .masked(true)
+        });
+        let device = input(device_name, "", window, cx);
         // Typed values apply as soon as they make sense.
         let subscriptions = vec![
             cx.subscribe(&font_family, |_, input, event: &InputEvent, cx| {
@@ -134,12 +177,28 @@ impl SettingsView {
                     update(cx, |settings| settings.terminal.scrollback = lines);
                 }
             }),
+            cx.subscribe(&device, |_, input, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    let name = input.read(cx).value().trim().to_string();
+                    if !name.is_empty() {
+                        update(cx, |settings| settings.sync.device = name);
+                    }
+                }
+            }),
+            cx.subscribe(&passphrase, |this: &mut Self, _, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.save_passphrase(cx);
+                }
+            }),
         ];
         Self {
-            page: Page::Terminal,
+            page,
             font_family,
             font_size,
             scrollback,
+            passphrase,
+            device,
+            passphrase_saved,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -147,6 +206,203 @@ impl SettingsView {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.focus.focus(window, cx);
+    }
+
+    /// Keeps the typed passphrase in the system's store and syncs.
+    fn save_passphrase(&mut self, cx: &mut Context<Self>) {
+        let typed = self.passphrase.read(cx).value().to_string();
+        if typed.is_empty() {
+            return;
+        }
+        if sync::secrets(cx).store(SYNC_PASSPHRASE, &typed).is_ok() {
+            self.passphrase_saved = true;
+            cx.emit(SettingsEvent::SyncNow);
+        }
+        cx.notify();
+    }
+
+    fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Sync here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = chosen.await
+                && let Some(folder) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |_, cx| {
+                    update(cx, |settings| {
+                        settings.sync.folder = Some(folder);
+                        settings.sync.ensure_device_id();
+                    });
+                    cx.emit(SettingsEvent::SyncNow);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Turns sync off here and forgets the passphrase; the folder and the
+    /// other devices keep their files.
+    fn stop_syncing(&mut self, cx: &mut Context<Self>) {
+        update(cx, |settings| settings.sync.folder = None);
+        let _ = sync::secrets(cx).forget(SYNC_PASSPHRASE);
+        self.passphrase_saved = false;
+        sync::set_state(cx, SyncState::default());
+        cx.notify();
+    }
+
+    fn sync_page(&self, settings: &Settings, t: &Theme, cx: &Context<Self>) -> Div {
+        let sync_settings = &settings.sync;
+        let state = sync::state(cx);
+        let folder = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .when_some(sync_settings.folder.clone(), |d, folder| {
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_start()
+                        .child(folder.display().to_string()),
+                )
+            })
+            .child(
+                button("sync-choose", t)
+                    .debug_selector(|| "sync-choose".into())
+                    .child(icon(IconName::FolderOpen, 14., t.text))
+                    .child("Choose")
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_folder(window, cx))),
+            );
+        let passphrase = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(Self::field(&self.passphrase, 220., t))
+            .child(
+                button("sync-save-passphrase", t)
+                    .debug_selector(|| "sync-save-passphrase".into())
+                    .child("Save")
+                    .on_click(cx.listener(|this, _, _, cx| this.save_passphrase(cx))),
+            );
+        let switch_row =
+            |label: &'static str, id: &'static str, on: bool, set: fn(&mut Settings)| {
+                Self::row(
+                    label,
+                    switch(id, on, t)
+                        .debug_selector(move || id.into())
+                        .on_click(move |_, _, cx| update(cx, set)),
+                    t,
+                )
+            };
+        let status: AnyElement = match &state.status {
+            Status::Off => div().into_any_element(),
+            Status::Syncing => icon(IconName::LoaderCircle, 14., t.text2).into_any_element(),
+            Status::Synced(at) => div()
+                .text_size(px(13.))
+                .text_color(t.text2)
+                .child(format!("Synced {}", sync::ago(*at)))
+                .into_any_element(),
+            Status::Failed(reason) => div()
+                .text_size(px(13.))
+                .text_color(t.danger)
+                .truncate()
+                .child(reason.clone())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(Self::row("Folder", folder, t))
+            .child(Self::row("Passphrase", passphrase, t))
+            .when(sync_settings.folder.is_some(), |d| {
+                d.child(Self::row(
+                    "This device",
+                    Self::field(&self.device, 220., t),
+                    t,
+                ))
+                .child(switch_row(
+                    "Hosts and groups",
+                    "sync-hosts",
+                    sync_settings.hosts,
+                    |settings| settings.sync.hosts = !settings.sync.hosts,
+                ))
+                .child(switch_row(
+                    "Snippets",
+                    "sync-snippets",
+                    sync_settings.snippets,
+                    |settings| settings.sync.snippets = !settings.sync.snippets,
+                ))
+                .child(switch_row(
+                    "Port forwards",
+                    "sync-forwards",
+                    sync_settings.forwards,
+                    |settings| settings.sync.forwards = !settings.sync.forwards,
+                ))
+                .child(switch_row(
+                    "Settings",
+                    "sync-settings",
+                    sync_settings.settings,
+                    |settings| settings.sync.settings = !settings.sync.settings,
+                ))
+                .when(!state.devices.is_empty(), |d| {
+                    d.child(Self::row(
+                        "Devices",
+                        div().flex_1().flex().flex_col().gap(px(4.)).children(
+                            state.devices.iter().map(|(name, written)| {
+                                div()
+                                    .flex()
+                                    .gap(px(10.))
+                                    .text_size(px(13.))
+                                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                                    .child(div().text_color(t.text2).child(sync::ago(*written)))
+                            }),
+                        ),
+                        t,
+                    ))
+                })
+                .child(
+                    div()
+                        .pt(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(div().flex_1().min_w_0().child(status))
+                        .child(
+                            div()
+                                .id("sync-stop")
+                                .debug_selector(|| "sync-stop".into())
+                                .h(px(36.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.danger)
+                                .cursor_pointer()
+                                .child("Stop syncing")
+                                .on_click(cx.listener(|this, _, _, cx| this.stop_syncing(cx))),
+                        )
+                        .child(
+                            ink_button("sync-now", t)
+                                .debug_selector(|| "sync-now".into())
+                                .child(icon(IconName::RefreshCw, 14., t.card))
+                                .child("Sync now")
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::SyncNow)),
+                                ),
+                        ),
+                )
+            })
     }
 
     #[cfg(test)]
@@ -312,6 +568,7 @@ impl SettingsView {
                         })),
                     t,
                 )),
+            Page::Sync => self.sync_page(settings, t, cx),
             Page::Appearance => div().child(Self::row(
                 "Theme",
                 Self::choice(
@@ -346,6 +603,7 @@ impl Render for SettingsView {
             (Page::General, "General", "settings-general"),
             (Page::Terminal, "Terminal", "settings-terminal"),
             (Page::Appearance, "Appearance", "settings-appearance"),
+            (Page::Sync, "Sync", "settings-sync"),
         ];
         div()
             .id("settings")

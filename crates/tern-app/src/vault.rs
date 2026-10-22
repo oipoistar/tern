@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
@@ -18,8 +19,10 @@ use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
+use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
+use tern_core::sync::{Merged, Syncer};
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 use tern_core::{keys, known_hosts};
 
@@ -31,12 +34,19 @@ use crate::keychain::{KeychainEvent, KeychainView};
 use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
+use crate::settings;
 use crate::snippets::{SnippetEvent, SnippetsView};
+use crate::sync::{self, Status, SyncState};
 use crate::terminal::Preview;
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{
     Ui, art_tile, button, group_heading, icon, ink_button, search_field, status_dot, switch,
 };
+
+/// How long after a change, or after starting, a sync waits.
+const SYNC_SETTLE: Duration = Duration::from_secs(2);
+/// How often other devices' changes are looked for.
+const SYNC_EVERY: Duration = Duration::from_secs(60);
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -152,6 +162,15 @@ pub struct VaultContent {
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
     _screen_events: Vec<Subscription>,
+    /// The window, for applying synced settings after background work.
+    window: AnyWindowHandle,
+    /// Seals and opens sync files, and the passphrase it was made with.
+    syncer: Option<(String, Arc<Mutex<Syncer>>)>,
+    /// The sync running now, the one waiting after a change, and the
+    /// minute-by-minute one.
+    _sync: Option<Task<()>>,
+    _sync_soon: Option<Task<()>>,
+    _sync_loop: Option<Task<()>>,
 }
 
 impl VaultContent {
@@ -174,6 +193,16 @@ impl VaultContent {
         content.history = History::load(&paths::history());
         content.history_file = Some(paths::history());
         content.start_checks(window, cx);
+        // Sync at start, then every minute for other devices' changes.
+        content._sync_loop = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SYNC_SETTLE).await;
+                if this.update(cx, |this, cx| this.sync_now(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(SYNC_EVERY).await;
+            }
+        }));
         content
     }
 
@@ -455,6 +484,11 @@ impl VaultContent {
             _subscription: subscription,
             _editor_events: None,
             _screen_events: Vec::new(),
+            window: window.window_handle(),
+            syncer: None,
+            _sync: None,
+            _sync_soon: None,
+            _sync_loop: None,
         };
         content.refresh_keys();
         content.putty = putty::importable_here(&content.vault);
@@ -471,14 +505,141 @@ impl VaultContent {
         for host in hosts {
             self.vault.save(None, host, putty::GROUP);
         }
-        self.persist();
+        self.persist(cx);
         self.refresh_keys();
         cx.notify();
     }
 
     /// Writes the vault to its file, if it has one. A failure stays on
     /// screen until a later save works.
-    fn persist(&mut self) {
+    /// Saves a change made here, and syncs it shortly.
+    fn persist(&mut self, cx: &mut Context<Self>) {
+        self.write_vault();
+        if settings::current(cx).sync.folder.is_some() {
+            self._sync_soon = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SYNC_SETTLE).await;
+                let _ = this.update(cx, |this, cx| this.sync_now(cx));
+            }));
+        }
+    }
+
+    /// Syncs now, if a folder and passphrase are set and no sync is
+    /// running already.
+    pub fn sync_now(&mut self, cx: &mut Context<Self>) {
+        let settings = settings::current(cx);
+        if settings.sync.folder.is_none() {
+            if sync::state(cx).status != Status::Off {
+                sync::set_state(cx, SyncState::default());
+            }
+            return;
+        }
+        if self._sync.is_some() {
+            return;
+        }
+        let devices = sync::state(cx).devices;
+        let Some(passphrase) = sync::secrets(cx).load(SYNC_PASSPHRASE) else {
+            sync::set_state(
+                cx,
+                SyncState {
+                    status: Status::Failed("Set the sync passphrase".into()),
+                    devices,
+                },
+            );
+            return;
+        };
+        let syncer = match &self.syncer {
+            Some((made_with, syncer)) if *made_with == passphrase => syncer.clone(),
+            _ => {
+                let syncer = Arc::new(Mutex::new(Syncer::new(&passphrase)));
+                self.syncer = Some((passphrase, syncer.clone()));
+                syncer
+            }
+        };
+        sync::set_state(
+            cx,
+            SyncState {
+                status: Status::Syncing,
+                devices,
+            },
+        );
+        let keys =
+            tern_core::sync::keys_to_sync(&keys::list_in(&keys::dirs()), &settings.sync.keys);
+        let vault = self.vault.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { sync::run(&syncer, &vault, &settings, keys) });
+        self._sync = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this._sync = None;
+                this.finish_sync(result, cx);
+            });
+        }));
+    }
+
+    /// Takes in what a sync brought: hosts and snippets, newer settings
+    /// and keys this device lacks.
+    fn finish_sync(
+        &mut self,
+        result: Result<(Merged, Vec<(String, u64)>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (merged, devices) = match result {
+            Ok(done) => done,
+            Err(reason) => {
+                let devices = sync::state(cx).devices;
+                sync::set_state(
+                    cx,
+                    SyncState {
+                        status: Status::Failed(reason.into()),
+                        devices,
+                    },
+                );
+                return;
+            }
+        };
+        let settings = settings::current(cx);
+        // Changes made here while the sync ran are newer than what it read.
+        let synced = tern_core::sync::snapshot(&merged.vault, &settings, Vec::new());
+        let vault = tern_core::sync::merge(&self.vault, &settings, &[synced]).vault;
+        if vault != self.vault {
+            self.vault = vault;
+            self.write_vault();
+            if self.vault.find(&self.selected).is_none() {
+                self.selected = self
+                    .vault
+                    .hosts()
+                    .next()
+                    .map(|host| host.name.clone())
+                    .unwrap_or_default();
+            }
+            self.refresh_keys();
+            self.refresh_forwards(cx);
+            if let Some(view) = &self.snippets {
+                let saved = self.vault.snippets.clone();
+                view.update(cx, |view, cx| view.refresh(saved, cx));
+            }
+        }
+        if let Some(newer) = &merged.settings {
+            settings::take_synced(cx, newer);
+            let window = self.window;
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| settings::apply_appearance(window, cx));
+            });
+        }
+        let have = keys::list_in(&keys::dirs());
+        let _ = tern_core::sync::receive_keys(&paths::keys(), &merged.keys, &have);
+        sync::set_state(
+            cx,
+            SyncState {
+                status: Status::Synced(tern_core::host::now_ms()),
+                devices,
+            },
+        );
+        cx.notify();
+    }
+
+    fn write_vault(&mut self) {
         self.filter.forget_missing(&self.vault);
         let Some(path) = &self.file else {
             return;
@@ -574,7 +735,7 @@ impl VaultContent {
     /// does.
     fn switch_forward(&mut self, host: &str, forward: &Forward, on: bool, cx: &mut Context<Self>) {
         self.vault.switch_forward(host, &forward.id(), on);
-        self.persist();
+        self.persist(cx);
         self.refresh_forwards(cx);
         cx.emit(VaultEvent::Forward {
             host: host.to_string(),
@@ -792,7 +953,7 @@ impl VaultContent {
                 live.push((host.clone(), forward.clone(), *on));
             }
         }
-        self.persist();
+        self.persist(cx);
         self.refresh_forwards(cx);
         for (host, forward, on) in live {
             cx.emit(VaultEvent::Forward { host, forward, on });
@@ -846,7 +1007,7 @@ impl VaultContent {
             }
             SnippetEvent::Delete(name) => self.vault.delete_snippet(name),
         }
-        self.persist();
+        self.persist(cx);
         let saved = self.vault.snippets.clone();
         view.update(cx, |view, cx| view.refresh(saved, cx));
         cx.notify();
@@ -930,7 +1091,7 @@ impl VaultContent {
             } => {
                 self.vault
                     .save(replacing.as_deref(), (**host).clone(), group);
-                self.persist();
+                self.persist(cx);
                 if let Some((place, latency_ms)) = checked {
                     self.monitor
                         .record(place, Some(*latency_ms), Instant::now());
@@ -940,7 +1101,7 @@ impl VaultContent {
             }
             EditorEvent::Delete(name) => {
                 if self.vault.delete(name).is_ok() {
-                    self.persist();
+                    self.persist(cx);
                     if self.selected == *name {
                         self.selected = self
                             .vault
@@ -1650,6 +1811,7 @@ fn dev_server_group() -> HostGroup {
         ..Host::new("tern-devserver", "tern", "127.0.0.1", 2222)
     };
     let through_itself = Host {
+        id: tern_core::host::new_id(),
         name: "devserver-via-jump".into(),
         tags: vec!["dev".into(), "jump".into()],
         jump: Some(dev.name.clone()),
@@ -2094,6 +2256,64 @@ mod tests {
         );
         cx.simulate_keystrokes("e");
         vault.read_with(cx, |vault, _| assert!(vault.editor.is_some()));
+    }
+
+    #[gpui::test]
+    fn syncs_with_another_device_through_a_folder(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        use tern_core::secrets::{MemorySecrets, SYNC_PASSPHRASE, Secrets as _};
+        use tern_core::settings::Settings;
+        use tern_core::sync::{SyncSettings, Syncer, snapshot};
+
+        use crate::sync::{SecretsStore, Status};
+
+        let folder = std::env::temp_dir().join(format!("tern-ui-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        // The other device already wrote its file, with a host we lack.
+        let mut theirs = Vault::default();
+        theirs.save(None, Host::new("nas", "admin", "nas.lan", 22), "Home");
+        let there = Settings {
+            sync: SyncSettings {
+                folder: Some(folder.clone()),
+                device: "Laptop".into(),
+                device_id: "laptop".into(),
+                ..SyncSettings::default()
+            },
+            ..Settings::default()
+        };
+        Syncer::new("open sesame")
+            .write(&folder, &snapshot(&theirs, &there, Vec::new()))
+            .unwrap();
+
+        let (vault, cx, _) = open_vault(cx);
+        let secrets = Arc::new(MemorySecrets::default());
+        secrets.store(SYNC_PASSPHRASE, "open sesame").unwrap();
+        cx.update(|_, cx| {
+            cx.set_global(SecretsStore(secrets));
+            crate::settings::update(cx, |settings| {
+                settings.sync.folder = Some(folder.clone());
+                settings.sync.device = "Desktop".into();
+                settings.sync.device_id = "desktop".into();
+            });
+        });
+        vault.update(cx, |vault, cx| vault.sync_now(cx));
+        cx.run_until_parked();
+
+        vault.read_with(cx, |vault, _| {
+            assert_eq!(vault.vault.group_of("nas"), Some("Home"));
+            assert!(vault.vault.find("bastion").is_some(), "ours are kept");
+        });
+        let state = cx.update(|_, cx| crate::sync::state(cx));
+        assert!(
+            matches!(state.status, Status::Synced(_)),
+            "{:?}",
+            state.status
+        );
+        assert_eq!(state.devices[0].0, "Laptop");
+        assert!(folder.join("Tern").join("desktop.tern").exists());
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[gpui::test]

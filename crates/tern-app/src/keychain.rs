@@ -12,8 +12,9 @@ use gpui_kit::*;
 use tern_core::Vault;
 use tern_core::keys::{self, KeyPair};
 
+use crate::settings;
 use crate::theme::{self, MONO, TermPalette, Theme};
-use crate::ui::{art_tile, button, group_heading, icon, ink_button, search_field};
+use crate::ui::{art_tile, button, group_heading, icon, ink_button, search_field, switch};
 
 /// Wide enough for a key's file name; three fit beside the details.
 const CARD_WIDTH: f32 = 250.;
@@ -533,6 +534,40 @@ impl KeychainView {
                                 .font_family(MONO)
                                 .text_size(px(12.))
                                 .child(users.join(" / ")),
+                        ),
+                )
+            })
+            // Only while sync is set up; private keys stay off it unless
+            // chosen one by one.
+            .when(settings::current(cx).sync.folder.is_some(), |d| {
+                let fingerprint = pair.fingerprint.clone();
+                let on = settings::current(cx).sync.keys.contains(&fingerprint);
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Include in encrypted sync"),
+                        )
+                        .child(
+                            switch("key-sync", on, t)
+                                .debug_selector(|| "key-sync".into())
+                                .on_click(move |_, _, cx| {
+                                    settings::update(cx, |settings| {
+                                        let keys = &mut settings.sync.keys;
+                                        match keys.iter().position(|have| *have == fingerprint) {
+                                            Some(index) => {
+                                                keys.remove(index);
+                                            }
+                                            None => keys.push(fingerprint.clone()),
+                                        }
+                                    })
+                                }),
                         ),
                 )
             })

@@ -7,12 +7,18 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
+use crate::sync::SyncSettings;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
     pub terminal: TerminalSettings,
+    /// How this device syncs; not synced itself.
+    pub sync: SyncSettings,
+    /// When the appearance or terminal settings last changed, in
+    /// milliseconds since the Unix epoch; sync keeps the newest.
+    pub updated: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +132,7 @@ mod tests {
                 copy_on_select: true,
                 ..TerminalSettings::default()
             },
+            ..Settings::default()
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);

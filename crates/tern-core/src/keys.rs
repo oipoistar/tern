@@ -270,6 +270,21 @@ pub fn install_command(public: &str) -> String {
     )
 }
 
+/// Writes a key pair: the private key readable by its owner only, the
+/// public half beside it.
+pub fn write_pair(path: &Path, private: &[u8], public: &str) -> Result<(), String> {
+    write_private(path, private)?;
+    std::fs::write(
+        public_path(path),
+        format!(
+            "{}
+",
+            public.trim()
+        ),
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Writes a private key so only its owner can read it, as OpenSSH insists.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {

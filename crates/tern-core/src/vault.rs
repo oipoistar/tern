@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::forward::{Forward, ForwardId};
-use crate::host::{Host, HostGroup};
+use crate::host::{Host, HostGroup, now_ms};
 use crate::paths;
 use crate::reach::Place;
 use crate::snippet::{self, Snippet};
@@ -21,29 +21,40 @@ use crate::ssh::{Connection, Jump};
 pub struct Vault {
     pub groups: Vec<HostGroup>,
     pub snippets: Vec<Snippet>,
+    /// Hosts and snippets deleted here, so sync deletes them elsewhere too.
+    pub deleted: Vec<Tombstone>,
 }
+
+/// A deleted host's or snippet's id and when it went, in milliseconds
+/// since the Unix epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub id: String,
+    pub at: u64,
+}
+
+/// Tombstones kept, newest first; older deletions are long synced.
+const KEEP_TOMBSTONES: usize = 1000;
 
 impl Vault {
     /// Sample hosts and snippets, for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn sample() -> Self {
-        let snippet = |name: &str, command: &str| Snippet {
-            name: name.into(),
-            command: command.into(),
-        };
         Self {
             groups: crate::host::sample_groups(),
             snippets: vec![
-                snippet("Disk space", "df -h"),
-                snippet("Follow syslog", "tail -f /var/log/syslog"),
+                Snippet::new("Disk space", "df -h"),
+                Snippet::new("Follow syslog", "tail -f /var/log/syslog"),
             ],
+            deleted: Vec::new(),
         }
     }
 
     /// Saves a snippet, replacing the one called `replacing` in place, after
     /// the checks in [`snippet::check`].
     pub fn save_snippet(&mut self, replacing: Option<&str>, typed: &Snippet) -> Result<(), String> {
-        let snippet = snippet::check(&self.snippets, replacing, typed)?;
+        let mut snippet = snippet::check(&self.snippets, replacing, typed)?;
+        snippet.updated = now_ms();
         match replacing.and_then(|old| self.snippets.iter().position(|s| s.name == old)) {
             Some(index) => self.snippets[index] = snippet,
             None => self.snippets.push(snippet),
@@ -52,7 +63,23 @@ impl Vault {
     }
 
     pub fn delete_snippet(&mut self, name: &str) {
+        let gone: Vec<String> = self
+            .snippets
+            .iter()
+            .filter(|snippet| snippet.name == name)
+            .map(|snippet| snippet.id.clone())
+            .collect();
         self.snippets.retain(|snippet| snippet.name != name);
+        for id in gone {
+            self.bury(id);
+        }
+    }
+
+    /// Records that the host or snippet `id` was deleted, for sync.
+    pub fn bury(&mut self, id: String) {
+        self.deleted.retain(|tombstone| tombstone.id != id);
+        self.deleted.insert(0, Tombstone { id, at: now_ms() });
+        self.deleted.truncate(KEEP_TOMBSTONES);
     }
 
     pub fn hosts(&self) -> impl Iterator<Item = &Host> {
@@ -82,7 +109,8 @@ impl Vault {
     /// `replacing` (the host's name before editing) the old entry is updated
     /// in place, or moved when the group changed, and hosts that went through
     /// the old name follow a rename. A group left empty goes away.
-    pub fn save(&mut self, replacing: Option<&str>, host: Host, group: &str) {
+    pub fn save(&mut self, replacing: Option<&str>, mut host: Host, group: &str) {
+        host.updated = now_ms();
         let mut slot = None;
         if let Some(old) = replacing {
             for (g, existing) in self.groups.iter_mut().enumerate() {
@@ -126,10 +154,18 @@ impl Vault {
         if !dependents.is_empty() {
             return Err(dependents.into_iter().map(String::from).collect());
         }
+        let gone: Vec<String> = self
+            .hosts()
+            .filter(|host| host.name == name)
+            .map(|host| host.id.clone())
+            .collect();
         for group in &mut self.groups {
             group.hosts.retain(|host| host.name != name);
         }
         self.groups.retain(|group| !group.hosts.is_empty());
+        for id in gone {
+            self.bury(id);
+        }
         Ok(())
     }
 
@@ -203,23 +239,25 @@ impl Vault {
             Some(index) => saved.forwards[index] = forward,
             None => saved.forwards.push(forward),
         }
+        saved.updated = now_ms();
         Ok(())
     }
 
     pub fn delete_forward(&mut self, host: &str, id: &ForwardId) {
         if let Some(saved) = self.host_mut(host) {
             saved.forwards.retain(|forward| forward.id() != *id);
+            saved.updated = now_ms();
         }
     }
 
     /// Switches a rule on or off; it then runs, or doesn't, whenever a
     /// session to the host is open.
     pub fn switch_forward(&mut self, host: &str, id: &ForwardId, on: bool) {
-        if let Some(forward) = self
-            .host_mut(host)
-            .and_then(|saved| saved.forwards.iter_mut().find(|f| f.id() == *id))
+        if let Some(saved) = self.host_mut(host)
+            && let Some(forward) = saved.forwards.iter_mut().find(|f| f.id() == *id)
         {
             forward.on = on;
+            saved.updated = now_ms();
         }
     }
 
@@ -248,6 +286,7 @@ impl Vault {
             version: FILE_VERSION,
             groups: &self.groups,
             snippets: &self.snippets,
+            deleted: &self.deleted,
         })?;
         json.push('\n');
         paths::write_atomically(path, json.as_bytes())
@@ -257,8 +296,8 @@ impl Vault {
 /// The vault file's shape. Bump it when a change would make an older Tern
 /// misread the file (dropping something it doesn't know when it saves);
 /// older versions then leave it alone instead. 2 added snippets, 3 port
-/// forwarding rules.
-pub const FILE_VERSION: u32 = 3;
+/// forwarding rules, 4 ids, change times and deletions for sync.
+pub const FILE_VERSION: u32 = 4;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -266,6 +305,7 @@ struct FileOut<'a> {
     version: u32,
     groups: &'a [HostGroup],
     snippets: &'a [Snippet],
+    deleted: &'a [Tombstone],
 }
 
 /// The vault file as read, from any version up to [`FILE_VERSION`].
@@ -275,6 +315,8 @@ struct FileIn {
     groups: Vec<HostGroup>,
     #[serde(default)]
     snippets: Vec<Snippet>,
+    #[serde(default)]
+    deleted: Vec<Tombstone>,
 }
 
 /// Just the version, read first so a newer file isn't misread.
@@ -354,6 +396,7 @@ fn parse(text: &str) -> Result<Vault, Unusable> {
     Ok(Vault {
         groups: file.groups,
         snippets: file.snippets,
+        deleted: file.deleted,
     })
 }
 
@@ -528,7 +571,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"version\": 4"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());
@@ -601,21 +644,26 @@ mod tests {
     #[test]
     fn saves_and_deletes_snippets() {
         let mut vault = Vault::sample();
-        let typed = |name: &str, command: &str| Snippet {
-            name: name.into(),
-            command: command.into(),
-        };
+        let typed = Snippet::new;
+        let shown = |snippet: &Snippet| (snippet.name.clone(), snippet.command.clone());
         vault
             .save_snippet(None, &typed(" Load ", "uptime"))
             .unwrap();
-        assert_eq!(vault.snippets.last(), Some(&typed("Load", "uptime")));
+        assert_eq!(
+            vault.snippets.last().map(shown),
+            Some(("Load".into(), "uptime".into()))
+        );
+        assert!(vault.snippets.last().unwrap().updated > 0);
         assert!(vault.save_snippet(None, &typed("load", "w")).is_err());
+        let disk = vault.snippets[0].id.clone();
         vault
             .save_snippet(Some("Disk space"), &typed("Disk", "df -h /"))
             .unwrap();
-        assert_eq!(vault.snippets[0], typed("Disk", "df -h /"));
+        assert_eq!(shown(&vault.snippets[0]), ("Disk".into(), "df -h /".into()));
+        assert_eq!(vault.snippets[0].id, disk, "an edit keeps the id");
         vault.delete_snippet("Disk");
         assert_eq!(vault.snippets.len(), 2);
+        assert_eq!(vault.deleted[0].id, disk, "a deletion is remembered");
     }
 
     #[test]

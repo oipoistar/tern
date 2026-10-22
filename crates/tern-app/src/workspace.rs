@@ -18,7 +18,8 @@ use crate::bench;
 use crate::files::FilesPanel;
 use crate::live::{LiveSlots, live_layer};
 use crate::marks;
-use crate::settings::{self, SettingsEvent, SettingsView};
+use crate::settings::{self, Page, SettingsEvent, SettingsView};
+use crate::sync::{self, Status};
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{button, icon, status_dot, tern_mark};
@@ -95,6 +96,18 @@ impl Workspace {
             workspace
                 .vault
                 .update(cx, |vault, cx| vault.open_editor(host, window, cx));
+        }
+        // `tern --settings [general|terminal|appearance|sync]` opens
+        // Settings at that page, likewise.
+        let mut args = std::env::args().skip_while(|arg| arg != "--settings");
+        if args.next().is_some() {
+            let page = match args.next().as_deref() {
+                Some("general") => Page::General,
+                Some("appearance") => Page::Appearance,
+                Some("sync") => Page::Sync,
+                _ => Page::Terminal,
+            };
+            workspace.open_settings(page, window, cx);
         }
         workspace
     }
@@ -443,8 +456,8 @@ impl Workspace {
             .update(cx, |terminal, cx| terminal.focus(window, cx));
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| SettingsView::new(window, cx));
+    fn open_settings(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| SettingsView::new(page, window, cx));
         view.update(cx, |view, cx| view.focus(window, cx));
         self._settings_events = Some(cx.subscribe(&view, |this, _, event, cx| match event {
             SettingsEvent::Close => {
@@ -452,6 +465,7 @@ impl Workspace {
                 this._settings_events = None;
                 cx.notify();
             }
+            SettingsEvent::SyncNow => this.vault.update(cx, |vault, cx| vault.sync_now(cx)),
         }));
         self.settings = Some(view);
         cx.notify();
@@ -802,20 +816,36 @@ impl Workspace {
             )
             .child(self.tabs(theme, cx))
             .child(div().flex_1())
-            // A state, not a control, so it gets no surface of its own.
-            .child(
-                div()
-                    .h(px(34.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.text2)
-                    .child(icon(IconName::Check, 14., theme.text))
-                    .child("Synced"),
-            )
+            // A state, not a control, so it gets no surface of its own;
+            // clicking it goes to the Sync settings. Nothing while sync is
+            // off.
+            .map(|d| {
+                let (glyph, label) = match sync::state(cx).status {
+                    Status::Off => return d,
+                    Status::Syncing => (IconName::LoaderCircle, "Syncing"),
+                    Status::Synced(_) => (IconName::Check, "Synced"),
+                    Status::Failed(_) => (IconName::CircleAlert, "Not synced"),
+                };
+                d.child(
+                    div()
+                        .id("sync-state")
+                        .debug_selector(|| "sync-state".into())
+                        .h(px(34.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text2)
+                        .cursor_pointer()
+                        .child(icon(glyph, 14., theme.text))
+                        .child(label)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings(Page::Sync, window, cx)
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("open-settings")
@@ -831,7 +861,9 @@ impl Workspace {
                     .shadow(theme.shadow_sm())
                     .cursor_pointer()
                     .child(icon(IconName::SlidersHorizontal, 18., theme.text2))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings(Page::Terminal, window, cx)
+                    })),
             )
             .child(
                 div()
@@ -1165,6 +1197,38 @@ mod tests {
         assert!(cx.debug_bounds("settings").is_none());
         click(cx, "theme-toggle");
         assert_eq!(current(cx).appearance, Appearance::Dark);
+    }
+
+    #[gpui::test]
+    fn the_sync_page_sets_what_syncs(cx: &mut TestAppContext) {
+        let (_, cx) = open_workspace(cx);
+        let current = |cx: &mut VisualTestContext| cx.update(|_, cx| crate::settings::current(cx));
+        // Off: no state in the header.
+        assert!(cx.debug_bounds("sync-state").is_none());
+        cx.update(|_, cx| {
+            crate::settings::update(cx, |settings| {
+                settings.sync.folder = Some(std::env::temp_dir());
+                settings.sync.ensure_device_id();
+            });
+            crate::sync::set_state(
+                cx,
+                crate::sync::SyncState {
+                    status: crate::sync::Status::Synced(tern_core::host::now_ms()),
+                    devices: vec![("Laptop".into(), tern_core::host::now_ms())],
+                },
+            );
+        });
+        click(cx, "sync-state");
+        click(cx, "sync-snippets");
+        click(cx, "sync-forwards");
+        let sync = current(cx).sync;
+        assert_eq!(
+            (sync.hosts, sync.snippets, sync.forwards),
+            (true, false, false)
+        );
+        click(cx, "sync-stop");
+        assert_eq!(current(cx).sync.folder, None);
+        assert!(cx.debug_bounds("sync-state").is_none());
     }
 
     #[gpui::test]

@@ -10,6 +10,7 @@ mod live;
 mod marks;
 mod settings;
 mod snippets;
+mod sync;
 mod terminal;
 mod theme;
 mod ui;
@@ -24,6 +25,9 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             settings::init(cx);
+            cx.set_global(sync::SecretsStore(std::sync::Arc::new(
+                tern_core::secrets::SystemSecrets,
+            )));
 
             let benching = bench::enabled();
             let options = WindowOptions {

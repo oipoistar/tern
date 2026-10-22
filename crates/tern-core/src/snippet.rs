@@ -3,13 +3,31 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::host::new_id;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snippet {
+    /// Stays through renames, so sync can tell snippets apart.
+    #[serde(default = "new_id")]
+    pub id: String,
     pub name: String,
     pub command: String,
+    /// When it last changed, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub updated: u64,
 }
 
 impl Snippet {
+    /// A new snippet, as typed.
+    pub fn new(name: &str, command: &str) -> Self {
+        Self {
+            id: new_id(),
+            name: name.into(),
+            command: command.into(),
+            updated: 0,
+        }
+    }
+
     /// What typing it into a shell sends: each line, then Enter.
     pub fn keystrokes(&self) -> Vec<u8> {
         let mut text = self
@@ -33,7 +51,8 @@ impl Snippet {
 
 /// Checks a snippet as typed against the saved ones: a name no other
 /// snippet has (ignoring case) and a command, both trimmed. `replacing` is
-/// the name before editing. The error is one line.
+/// the name before editing, whose id the result keeps. The error is one
+/// line.
 pub fn check(
     saved: &[Snippet],
     replacing: Option<&str>,
@@ -52,9 +71,14 @@ pub fn check(
     }) {
         return Err("Another snippet is already called that".into());
     }
+    let id = replacing
+        .and_then(|old| saved.iter().find(|snippet| snippet.name == old))
+        .map_or_else(|| typed.id.clone(), |old| old.id.clone());
     Ok(Snippet {
+        id,
         name: name.into(),
         command: command.into(),
+        updated: typed.updated,
     })
 }
 
@@ -63,10 +87,11 @@ mod tests {
     use super::*;
 
     fn snippet(name: &str, command: &str) -> Snippet {
-        Snippet {
-            name: name.into(),
-            command: command.into(),
-        }
+        Snippet::new(name, command)
+    }
+
+    fn named(result: Result<Snippet, String>) -> Result<(String, String), String> {
+        result.map(|snippet| (snippet.name, snippet.command))
     }
 
     #[test]
@@ -82,8 +107,8 @@ mod tests {
     fn checks_names_and_commands() {
         let saved = [snippet("Disk", "df -h"), snippet("Load", "uptime")];
         assert_eq!(
-            check(&saved, None, &snippet(" Logs ", " tail -f x ")),
-            Ok(snippet("Logs", "tail -f x"))
+            named(check(&saved, None, &snippet(" Logs ", " tail -f x "))),
+            Ok(("Logs".into(), "tail -f x".into()))
         );
         assert!(check(&saved, None, &snippet(" ", "ls")).is_err());
         assert!(check(&saved, None, &snippet("ls", " ")).is_err());
@@ -91,8 +116,9 @@ mod tests {
             check(&saved, None, &snippet("disk", "du")),
             Err("Another snippet is already called that".into())
         );
-        // Editing keeps its own name.
-        assert!(check(&saved, Some("Disk"), &snippet("DISK", "df")).is_ok());
+        // Editing keeps its own name, and its id.
+        let edited = check(&saved, Some("Disk"), &snippet("DISK", "df")).unwrap();
+        assert_eq!(edited.id, saved[0].id);
         assert!(snippet("Disk", "df -h").matches("DF disk"));
     }
 }

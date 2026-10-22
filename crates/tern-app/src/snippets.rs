@@ -126,10 +126,7 @@ impl SnippetsView {
         let Some(form) = &mut self.form else {
             return;
         };
-        let typed = Snippet {
-            name: form.name.read(cx).value().to_string(),
-            command: form.command.read(cx).value().to_string(),
-        };
+        let typed = Snippet::new(&form.name.read(cx).value(), &form.command.read(cx).value());
         match snippet::check(&self.snippets, form.replacing.as_deref(), &typed) {
             Ok(snippet) => cx.emit(SnippetEvent::Save {
                 replacing: form.replacing.clone(),

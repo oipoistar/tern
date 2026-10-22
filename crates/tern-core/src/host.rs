@@ -42,6 +42,9 @@ pub enum Auth {
 /// A saved host, as kept in the vault file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
+    /// Stays through renames, so sync can tell hosts apart.
+    #[serde(default = "new_id")]
+    pub id: String,
     pub name: String,
     pub user: String,
     pub address: String,
@@ -64,6 +67,22 @@ pub struct Host {
     /// Port forwarding rules, each switched on or off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
+    /// When it last changed, in milliseconds since the Unix epoch; sync
+    /// keeps the newest.
+    #[serde(default)]
+    pub updated: u64,
+}
+
+/// A fresh id for a host or snippet.
+pub fn new_id() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// Milliseconds since the Unix epoch, now.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 fn on() -> bool {
@@ -74,6 +93,7 @@ impl Host {
     /// A host with Tern's defaults for everything but where it is.
     pub fn new(name: &str, user: &str, address: &str, port: u16) -> Self {
         Self {
+            id: new_id(),
             name: name.into(),
             user: user.into(),
             address: address.into(),
@@ -85,6 +105,7 @@ impl Host {
             keep_alive: true,
             on_login: None,
             forwards: Vec::new(),
+            updated: 0,
         }
     }
 
