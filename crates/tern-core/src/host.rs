@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::forward::Forward;
+
 /// Reachability of a saved host, as last observed (see [`crate::reach`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostStatus {
@@ -59,6 +61,9 @@ pub struct Host {
     /// Typed into the shell once it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
+    /// Port forwarding rules, each switched on or off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<Forward>,
 }
 
 fn on() -> bool {
@@ -79,6 +84,7 @@ impl Host {
             jump: None,
             keep_alive: true,
             on_login: None,
+            forwards: Vec::new(),
         }
     }
 

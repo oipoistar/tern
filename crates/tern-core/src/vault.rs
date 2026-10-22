@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::forward::{Forward, ForwardId};
 use crate::host::{Host, HostGroup};
 use crate::paths;
 use crate::reach::Place;
@@ -164,7 +165,62 @@ impl Vault {
             jump,
             keep_alive: host.keep_alive,
             on_login: host.on_login.clone(),
+            forwards: host
+                .forwards
+                .iter()
+                .filter(|forward| forward.on)
+                .cloned()
+                .collect(),
         })
+    }
+
+    fn host_mut(&mut self, name: &str) -> Option<&mut Host> {
+        self.groups
+            .iter_mut()
+            .flat_map(|group| &mut group.hosts)
+            .find(|host| host.name == name)
+    }
+
+    /// Saves a port forwarding rule on `host`, replacing the rule
+    /// `replacing` in place. Refused when another of its rules of the same
+    /// kind already listens on that port.
+    pub fn save_forward(
+        &mut self,
+        host: &str,
+        replacing: Option<&ForwardId>,
+        forward: Forward,
+    ) -> Result<(), String> {
+        let saved = self.host_mut(host).ok_or("No saved host by that name")?;
+        let clash = saved.forwards.iter().any(|other| {
+            Some(&other.id()) != replacing
+                && other.kind == forward.kind
+                && other.listen_port == forward.listen_port
+        });
+        if clash {
+            return Err("Another rule already listens on that port".into());
+        }
+        match replacing.and_then(|id| saved.forwards.iter().position(|f| f.id() == *id)) {
+            Some(index) => saved.forwards[index] = forward,
+            None => saved.forwards.push(forward),
+        }
+        Ok(())
+    }
+
+    pub fn delete_forward(&mut self, host: &str, id: &ForwardId) {
+        if let Some(saved) = self.host_mut(host) {
+            saved.forwards.retain(|forward| forward.id() != *id);
+        }
+    }
+
+    /// Switches a rule on or off; it then runs, or doesn't, whenever a
+    /// session to the host is open.
+    pub fn switch_forward(&mut self, host: &str, id: &ForwardId, on: bool) {
+        if let Some(forward) = self
+            .host_mut(host)
+            .and_then(|saved| saved.forwards.iter_mut().find(|f| f.id() == *id))
+        {
+            forward.on = on;
+        }
     }
 
     /// Tags used on other hosts that `current` doesn't have, most used
@@ -200,8 +256,9 @@ impl Vault {
 
 /// The vault file's shape. Bump it when a change would make an older Tern
 /// misread the file (dropping something it doesn't know when it saves);
-/// older versions then leave it alone instead. 2 added snippets.
-pub const FILE_VERSION: u32 = 2;
+/// older versions then leave it alone instead. 2 added snippets, 3 port
+/// forwarding rules.
+pub const FILE_VERSION: u32 = 3;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -471,7 +528,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"version\": 3"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());
@@ -492,6 +549,53 @@ mod tests {
         let opened = open(&path);
         assert!(opened.notice.is_none() && opened.vault.find("bastion").is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_port_forwarding_rules_per_host() {
+        use crate::forward::ForwardKind;
+
+        let mut vault = Vault::sample();
+        let db = Forward::typed(ForwardKind::Local, "5432", "localhost:5432").unwrap();
+        let socks = Forward {
+            on: false,
+            ..Forward::typed(ForwardKind::Dynamic, "1080", "").unwrap()
+        };
+        vault.save_forward("bastion", None, db.clone()).unwrap();
+        vault.save_forward("bastion", None, socks.clone()).unwrap();
+        assert!(vault.save_forward("nowhere", None, db.clone()).is_err());
+        let again = Forward::typed(ForwardKind::Local, "5432", "other:1").unwrap();
+        assert!(vault.save_forward("bastion", None, again.clone()).is_err());
+        // Editing a rule may keep its own port.
+        vault
+            .save_forward("bastion", Some(&db.id()), again.clone())
+            .unwrap();
+
+        // A session gets the rules that are on.
+        let bastion = vault.find("bastion").unwrap();
+        assert_eq!(
+            vault.connection(bastion).unwrap().forwards,
+            std::slice::from_ref(&again)
+        );
+        vault.switch_forward("bastion", &socks.id(), true);
+        vault.switch_forward("bastion", &again.id(), false);
+        let bastion = vault.find("bastion").unwrap();
+        let on: Vec<u16> = vault
+            .connection(bastion)
+            .unwrap()
+            .forwards
+            .iter()
+            .map(|forward| forward.listen_port)
+            .collect();
+        assert_eq!(on, [1080]);
+
+        // Editing the host keeps them; deleting one removes it.
+        let edited = crate::draft::HostDraft::edit(bastion, "Production")
+            .check(&vault, Some("bastion"))
+            .unwrap();
+        assert_eq!(edited.forwards.len(), 2);
+        vault.delete_forward("bastion", &socks.id());
+        assert_eq!(vault.find("bastion").unwrap().forwards.len(), 1);
     }
 
     #[test]

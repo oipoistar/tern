@@ -71,8 +71,9 @@ impl HostDraft {
     }
 
     /// Checks the draft against the vault. `replacing` is the name of the
-    /// host being edited, so it doesn't clash with itself; its OS carries
-    /// over. Every problem is reported, in form order.
+    /// host being edited, so it doesn't clash with itself; its OS and port
+    /// forwarding rules carry over. Every problem is reported, in form
+    /// order.
     pub fn check(&self, vault: &Vault, replacing: Option<&str>) -> Result<Host, Vec<Problem>> {
         let mut problems = Vec::new();
         let mut problem = |field, message: &str| {
@@ -152,6 +153,9 @@ impl HostDraft {
             jump: self.jump.as_deref().map(|jump| jump.trim().to_string()),
             keep_alive: self.keep_alive,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
+            forwards: previous
+                .map(|host| host.forwards.clone())
+                .unwrap_or_default(),
         })
     }
 }

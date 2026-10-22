@@ -22,6 +22,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
 use gpui_kit::*;
+use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{self, Visit};
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
@@ -55,6 +56,13 @@ pub enum TerminalEvent {
     /// A connection attempt ended (closed, failed or given up), for
     /// History.
     Finished(Visit),
+    /// A port forwarding rule of the saved host `host` started, stopped or
+    /// failed.
+    Forwarding {
+        host: String,
+        forward: Forward,
+        state: ForwardState,
+    },
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -199,6 +207,18 @@ impl TerminalView {
         matches!(self.phase, Phase::Live)
     }
 
+    /// The saved host this session is, if it is one.
+    pub fn host(&self) -> Option<&str> {
+        self.connection.host.as_deref()
+    }
+
+    /// Starts or stops a port forwarding rule in the open session.
+    pub fn set_forward(&self, forward: Forward, on: bool) {
+        if let Some(input) = &self.input {
+            input.forward(forward, on);
+        }
+    }
+
     /// The current attempt as a History entry that `ended` as given.
     pub fn visit(&self, ended: &str) -> Visit {
         let target = &self.connection.target;
@@ -266,6 +286,15 @@ impl TerminalView {
             Event::Output(bytes) => {
                 self.parser.advance(&mut self.term, &bytes);
                 self.answer_terminal_events(cx);
+            }
+            Event::Forwarding { forward, state } => {
+                if let Some(host) = self.connection.host.clone() {
+                    cx.emit(TerminalEvent::Forwarding {
+                        host,
+                        forward,
+                        state,
+                    });
+                }
             }
             Event::Closed { exit_status } => {
                 self.input = None;
@@ -1313,8 +1342,9 @@ mod tests {
         let recorded = finished.clone();
         cx.update(|_, cx| {
             cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
-                let TerminalEvent::Finished(visit) = event;
-                recorded.borrow_mut().push(visit.clone());
+                if let TerminalEvent::Finished(visit) = event {
+                    recorded.borrow_mut().push(visit.clone());
+                }
             })
             .detach()
         });

@@ -18,6 +18,7 @@ use russh::{ChannelMsg, ChannelStream, client};
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::forward::{Forward, ForwardState, Forwarder, RemoteTargets, serve_remote};
 use crate::host::Auth;
 use crate::paths;
 use crate::randomart::Randomart;
@@ -70,6 +71,8 @@ pub struct ConnectRequest {
     pub trust: Option<PublicKey>,
     /// Ping idle connections so routers and firewalls keep them open.
     pub keep_alive: bool,
+    /// Port forwarding rules to start once signed in.
+    pub forwards: Vec<Forward>,
 }
 
 /// The host to go through first, and how to sign in there.
@@ -91,6 +94,8 @@ pub struct Connection {
     pub keep_alive: bool,
     /// Typed into the shell once it starts.
     pub on_login: Option<String>,
+    /// Port forwarding rules switched on for the host.
+    pub forwards: Vec<Forward>,
 }
 
 impl Connection {
@@ -103,6 +108,7 @@ impl Connection {
             jump: None,
             keep_alive: true,
             on_login: None,
+            forwards: Vec::new(),
         }
     }
 
@@ -124,6 +130,7 @@ impl Connection {
             size,
             trust,
             keep_alive: self.keep_alive,
+            forwards: self.forwards.clone(),
         }
     }
 }
@@ -209,11 +216,18 @@ pub enum Event {
         exit_status: Option<u32>,
     },
     Failed(ConnectError),
+    /// A port forwarding rule started, stopped or couldn't start.
+    Forwarding {
+        forward: Forward,
+        state: ForwardState,
+    },
 }
 
 enum Input {
     Data(Vec<u8>),
     Resize(TermSize),
+    /// Start (`true`) or stop a port forwarding rule.
+    Forward(Forward, bool),
     Close,
 }
 
@@ -235,6 +249,12 @@ impl SessionInput {
 
     pub fn resize(&self, size: TermSize) {
         let _ = self.0.send(Input::Resize(size));
+    }
+
+    /// Starts or stops a port forwarding rule; an
+    /// [`Event::Forwarding`] says how it went.
+    pub fn forward(&self, forward: Forward, on: bool) {
+        let _ = self.0.send(Input::Forward(forward, on));
     }
 
     pub fn close(&self) {
@@ -281,6 +301,10 @@ impl Session {
         self.input.resize(size);
     }
 
+    pub fn forward(&self, forward: Forward, on: bool) {
+        self.input.forward(forward, on);
+    }
+
     pub fn close(&self) {
         self.input.close();
     }
@@ -315,6 +339,7 @@ async fn run(
         size,
         trust,
         keep_alive,
+        forwards,
     } = request;
     let config = Arc::new(client::Config {
         keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
@@ -323,11 +348,20 @@ async fn run(
 
     // Through a jump host: sign in there, then run the target's SSH over a
     // forwarded channel. The jump connection must outlive the session.
+    // Where the host sends connections for remote forwarding rules.
+    let remote = RemoteTargets::default();
     let mut via = None;
     let mut handle = match jump {
-        None => open(config, &target, trust, None).await?,
+        None => open(config, &target, trust, None, remote.clone()).await?,
         Some((jump, jump_credentials)) => {
-            let mut jump_handle = open(config.clone(), &jump, trust.clone(), None).await?;
+            let mut jump_handle = open(
+                config.clone(),
+                &jump,
+                trust.clone(),
+                None,
+                RemoteTargets::default(),
+            )
+            .await?;
             authenticate(&mut jump_handle, &jump.user, &jump_credentials)
                 .await
                 .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
@@ -340,7 +374,14 @@ async fn run(
                         jump.host, target.host, target.port
                     ))
                 })?;
-            let handle = open(config, &target, trust, Some(channel.into_stream())).await?;
+            let handle = open(
+                config,
+                &target,
+                trust,
+                Some(channel.into_stream()),
+                remote.clone(),
+            )
+            .await?;
             via = Some(jump_handle);
             handle
         }
@@ -348,6 +389,11 @@ async fn run(
 
     authenticate(&mut handle, &target.user, &credentials).await?;
     let _ = events.send(Event::Connected);
+    let handle = Arc::new(handle);
+    let mut forwarder = Forwarder::new(handle.clone(), remote, events.clone());
+    for forward in forwards {
+        forwarder.set(forward, true).await;
+    }
 
     let channel = handle.channel_open_session().await.map_err(other)?;
     channel
@@ -377,6 +423,7 @@ async fn run(
                 Some(Input::Resize(size)) => {
                     let _ = writer.window_change(size.cols.into(), size.rows.into(), 0, 0).await;
                 }
+                Some(Input::Forward(forward, on)) => forwarder.set(forward, on).await,
                 Some(Input::Close) | None => {
                     let _ = writer.close().await;
                     break;
@@ -384,6 +431,7 @@ async fn run(
             },
         }
     }
+    forwarder.stop_all();
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
@@ -403,6 +451,7 @@ async fn open(
     target: &Target,
     trust: Option<PublicKey>,
     tunnel: Option<ChannelStream<client::Msg>>,
+    remote: RemoteTargets,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
     let verdict = Arc::new(Mutex::new(None));
     let handler = Verifier {
@@ -410,6 +459,7 @@ async fn open(
         port: target.port,
         trust,
         verdict: verdict.clone(),
+        remote,
     };
     let connected = match tunnel {
         Some(stream) => client::connect_stream(config, stream, handler).await,
@@ -430,12 +480,14 @@ fn other(error: impl std::fmt::Display) -> ConnectError {
 }
 
 /// Checks the server's host key against `~/.ssh/known_hosts` (read only) and
-/// Tern's own known hosts, learning a key the user explicitly trusted.
+/// Tern's own known hosts, learning a key the user explicitly trusted. Also
+/// answers the channels the server opens for remote forwarding rules.
 struct Verifier {
     host: String,
     port: u16,
     trust: Option<PublicKey>,
     verdict: Arc<Mutex<Option<ConnectError>>>,
+    remote: RemoteTargets,
 }
 
 impl client::Handler for Verifier {
@@ -458,6 +510,20 @@ impl client::Handler for Verifier {
                 Ok(false)
             }
         }
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _: &str,
+        connected_port: u32,
+        _: &str,
+        _: u32,
+        reply: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        serve_remote(&self.remote, connected_port, channel, reply);
+        Ok(())
     }
 }
 
@@ -627,7 +693,7 @@ async fn probe_now(host: &str, port: u16) -> Result<Reached, String> {
 }
 
 /// An I/O error in a few words, without the OS's error number.
-fn describe(error: &std::io::Error) -> String {
+pub(crate) fn describe(error: &std::io::Error) -> String {
     use std::io::ErrorKind;
     match error.kind() {
         ErrorKind::ConnectionRefused => "connection refused".into(),

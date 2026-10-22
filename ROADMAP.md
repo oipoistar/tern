@@ -47,6 +47,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] History (item 7): every connection attempt that ends, with when, how
       long and how it ended, in `history.json` (last 200); Reconnect uses
       the saved host's current settings
+- [x] Port forwarding (item 8): per-host `-L`, `-R` and `-D` (SOCKS5) rules
+      in the vault file (version 3), started with a session when switched
+      on and switched live while one is open; the screen shows a dot while
+      a rule runs and the reason when it can't
 
 ## Known gaps in what's built
 
@@ -60,13 +64,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 8. Port forwarding (sidebar "Port forwarding"; Main artboard panel)
-- Per-host rules: local (`-L`), remote (`-R`), dynamic SOCKS (`-D`).
-- Switch them on and off while connected. The vault's side panel shows the
-  selected host's rules as rows with ink switches (mockup).
-- Core: `-L` is a local listener plus `channel_open_direct_tcpip`; `-R` is
-  `tcpip_forward`. End-to-end tests against the in-process server.
 
 ### 9. Split panes and broadcast (Terminal artboard)
 - Layouts: single, side by side, main plus stack, grid of four.

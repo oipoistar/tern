@@ -1,5 +1,6 @@
 mod assets;
 mod bench;
+mod forwarding;
 mod history;
 mod host_editor;
 mod keychain;

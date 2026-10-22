@@ -13,6 +13,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
@@ -22,6 +23,7 @@ use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 use tern_core::{keys, known_hosts};
 
 use crate::bench;
+use crate::forwarding::{ForwardEvent, ForwardsView, States};
 use crate::history::{HistoryEvent, HistoryView};
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::keychain::{KeychainEvent, KeychainView};
@@ -41,6 +43,12 @@ const CARD_WIDTH: f32 = 320.;
 
 pub enum VaultEvent {
     Connect(Connection),
+    /// Start or stop a rule in any open session to the saved host `host`.
+    Forward {
+        host: String,
+        forward: Forward,
+        on: bool,
+    },
 }
 
 /// The screens the sidebar switches between.
@@ -49,6 +57,7 @@ pub enum Section {
     Hosts,
     Keychain,
     Snippets,
+    Forwarding,
     KnownHosts,
     History,
 }
@@ -60,7 +69,11 @@ impl Section {
         (IconName::Server, "Hosts", Some(Section::Hosts)),
         (IconName::KeyRound, "Keychain", Some(Section::Keychain)),
         (IconName::CodeXml, "Snippets", Some(Section::Snippets)),
-        (IconName::ArrowLeftRight, "Port forwarding", None),
+        (
+            IconName::ArrowLeftRight,
+            "Port forwarding",
+            Some(Section::Forwarding),
+        ),
         (
             IconName::ShieldCheck,
             "Known hosts",
@@ -79,12 +92,15 @@ pub struct VaultContent {
     /// Screens, made when first shown.
     keychain: Option<Entity<KeychainView>>,
     snippets: Option<Entity<SnippetsView>>,
+    forwards: Option<Entity<ForwardsView>>,
     known_hosts: Option<Entity<KnownHostsView>>,
     history_view: Option<Entity<HistoryView>>,
     /// Recent connections, and where they're saved (`None` keeps them in
     /// memory).
     history: History,
     history_file: Option<PathBuf>,
+    /// How each rule is doing in open sessions.
+    forward_states: States,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
     /// file this Tern mustn't overwrite).
@@ -180,6 +196,19 @@ impl VaultContent {
                     self.snippets = Some(view);
                 }
             }
+            Section::Forwarding => match &self.forwards {
+                Some(_) => self.refresh_forwards(cx),
+                None => {
+                    let (hosts, states) = (self.forward_hosts(), self.forward_states.clone());
+                    let view = cx.new(|_| ForwardsView::new(hosts, states));
+                    self._screen_events.push(cx.subscribe_in(
+                        &view,
+                        window,
+                        Self::on_forward_event,
+                    ));
+                    self.forwards = Some(view);
+                }
+            },
             Section::History => match &self.history_view {
                 Some(view) => {
                     let visits = self.history.visits.clone();
@@ -310,10 +339,12 @@ impl VaultContent {
             section: Section::Hosts,
             keychain: None,
             snippets: None,
+            forwards: None,
             known_hosts: None,
             history_view: None,
             history: History::default(),
             history_file: None,
+            forward_states: States::default(),
             vault,
             file,
             notice: None,
@@ -396,6 +427,87 @@ impl VaultContent {
         self.search
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.emit(VaultEvent::Connect(connection));
+    }
+
+    /// Every saved host's name and port forwarding rules.
+    fn forward_hosts(&self) -> Vec<(String, Vec<Forward>)> {
+        self.vault
+            .hosts()
+            .map(|host| (host.name.clone(), host.forwards.clone()))
+            .collect()
+    }
+
+    fn refresh_forwards(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.forwards {
+            let (hosts, states) = (self.forward_hosts(), self.forward_states.clone());
+            view.update(cx, |view, cx| view.refresh(hosts, states, cx));
+        }
+    }
+
+    /// How a rule is doing in a session to `host`.
+    pub fn set_forward_state(
+        &mut self,
+        host: String,
+        forward: &Forward,
+        state: ForwardState,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (host, forward.id());
+        match state {
+            ForwardState::Stopped => self.forward_states.remove(&key),
+            state => self.forward_states.insert(key, state),
+        };
+        self.refresh_forwards(cx);
+    }
+
+    /// The session to `host` ended, and its rules with it.
+    pub fn clear_forward_states(&mut self, host: &str, cx: &mut Context<Self>) {
+        self.forward_states.retain(|(of, _), _| of != host);
+        self.refresh_forwards(cx);
+    }
+
+    /// Applies a change from the Port forwarding screen, saves it, and
+    /// starts or stops the rules involved in open sessions.
+    fn on_forward_event(
+        &mut self,
+        view: &Entity<ForwardsView>,
+        event: &ForwardEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut live = Vec::new();
+        match event {
+            ForwardEvent::Save {
+                host,
+                replacing,
+                forward,
+            } => {
+                let old = replacing.as_ref().map(Forward::id);
+                if let Err(problem) = self.vault.save_forward(host, old.as_ref(), forward.clone()) {
+                    view.update(cx, |view, cx| view.refuse(problem, cx));
+                    return;
+                }
+                if let Some(old) = replacing {
+                    live.push((host.clone(), old.clone(), false));
+                }
+                live.push((host.clone(), forward.clone(), forward.on));
+                view.update(cx, |view, cx| view.saved(cx));
+            }
+            ForwardEvent::Delete { host, forward } => {
+                self.vault.delete_forward(host, &forward.id());
+                live.push((host.clone(), forward.clone(), false));
+            }
+            ForwardEvent::Switch { host, forward, on } => {
+                self.vault.switch_forward(host, &forward.id(), *on);
+                live.push((host.clone(), forward.clone(), *on));
+            }
+        }
+        self.persist();
+        self.refresh_forwards(cx);
+        for (host, forward, on) in live {
+            cx.emit(VaultEvent::Forward { host, forward, on });
+        }
+        cx.notify();
     }
 
     /// Adds a finished connection to History and saves it.
@@ -806,6 +918,7 @@ impl Render for VaultContent {
             Section::Hosts => None,
             Section::Keychain => self.keychain.clone().map(Into::into),
             Section::Snippets => self.snippets.clone().map(Into::into),
+            Section::Forwarding => self.forwards.clone().map(Into::into),
             Section::KnownHosts => self.known_hosts.clone().map(Into::into),
             Section::History => self.history_view.clone().map(Into::into),
         };
@@ -1009,8 +1122,9 @@ mod tests {
         let recorded = connects.clone();
         cx.update(|_, cx| {
             cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
-                let VaultEvent::Connect(connection) = event;
-                recorded.borrow_mut().push(connection.clone());
+                if let VaultEvent::Connect(connection) = event {
+                    recorded.borrow_mut().push(connection.clone());
+                }
             })
             .detach()
         });
@@ -1196,12 +1310,101 @@ mod tests {
     }
 
     #[gpui::test]
+    fn port_forwarding_rules_are_saved_and_switched_live(cx: &mut TestAppContext) {
+        use tern_core::forward::ForwardKind;
+
+        let (vault, cx, _) = open_vault(cx);
+        let switched: Rc<RefCell<Vec<(String, u16, bool)>>> = Rc::default();
+        let recorded = switched.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                if let VaultEvent::Forward { host, forward, on } = event {
+                    recorded
+                        .borrow_mut()
+                        .push((host.clone(), forward.listen_port, *on));
+                }
+            })
+            .detach()
+        });
+        let type_into = |cx: &mut VisualTestContext, port: bool, text: &str| {
+            cx.update(|window, cx| {
+                let view = vault.read(cx).forwards.clone().expect("the screen is open");
+                let (port_input, to_input) = view.read(cx).form_inputs();
+                let input = if port { port_input } else { to_input };
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            });
+            cx.simulate_input(text);
+        };
+        let rules = |cx: &mut VisualTestContext, host: &str| {
+            vault.read_with(cx, |vault, _| {
+                vault.vault.find(host).unwrap().forwards.clone()
+            })
+        };
+
+        // A new local rule on the first host, prod-db-01.
+        click(cx, "nav-port-forwarding");
+        click(cx, "new-forward");
+        type_into(cx, true, "15432");
+        type_into(cx, false, "localhost:5432");
+        click(cx, "save-forward");
+        let saved = rules(cx, "prod-db-01");
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].kind, saved[0].on), (ForwardKind::Local, true));
+        assert_eq!(
+            switched.borrow().last(),
+            Some(&("prod-db-01".to_string(), 15432, true))
+        );
+
+        // Switching it off saves that and stops it in open sessions.
+        click(cx, "switch-prod-db-01-0");
+        assert!(!rules(cx, "prod-db-01")[0].on);
+        assert_eq!(
+            switched.borrow().last(),
+            Some(&("prod-db-01".to_string(), 15432, false))
+        );
+
+        // A dynamic rule on another host, then deleting the first.
+        click(cx, "new-forward");
+        click(cx, "forward-host");
+        click(cx, "forward-host-bastion");
+        click(cx, "kind-dynamic");
+        type_into(cx, true, "1080");
+        click(cx, "save-forward");
+        assert_eq!(rules(cx, "bastion")[0].kind, ForwardKind::Dynamic);
+        click(cx, "forward-prod-db-01-0");
+        click(cx, "delete-forward");
+        assert!(rules(cx, "prod-db-01").is_empty());
+
+        // A session reports how its rules are doing.
+        let socks = rules(cx, "bastion")[0].clone();
+        vault.update(cx, |vault, cx| {
+            vault.set_forward_state(
+                "bastion".into(),
+                &socks,
+                tern_core::forward::ForwardState::Failed("address in use".into()),
+                cx,
+            )
+        });
+        assert_eq!(
+            vault.read_with(cx, |vault, _| vault.forward_states.len()),
+            1
+        );
+        vault.update(cx, |vault, cx| vault.clear_forward_states("bastion", cx));
+        assert!(vault.read_with(cx, |vault, _| vault.forward_states.is_empty()));
+    }
+
+    #[gpui::test]
     fn the_sidebar_switches_screens(cx: &mut TestAppContext) {
         let (_, cx, _) = open_vault(cx);
         assert!(cx.debug_bounds("host-bastion").is_some());
-        // Screens not built yet do nothing.
         click(cx, "nav-port-forwarding");
-        assert!(cx.debug_bounds("host-bastion").is_some());
+        assert!(cx.debug_bounds("forwarding").is_some());
         click(cx, "nav-history");
         assert!(cx.debug_bounds("history").is_some());
 

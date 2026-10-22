@@ -78,6 +78,14 @@ impl Workspace {
                     VaultEvent::Connect(connection) => {
                         this.open_session(connection.clone(), window, cx)
                     }
+                    VaultEvent::Forward { host, forward, on } => {
+                        for session in &this.sessions {
+                            let terminal = session.read(cx);
+                            if terminal.is_live() && terminal.host() == Some(host.as_str()) {
+                                terminal.set_forward(forward.clone(), *on);
+                            }
+                        }
+                    }
                 },
             );
         let ticker = cx.spawn(async move |this, cx| {
@@ -134,8 +142,22 @@ impl Workspace {
                 |this, _, event: &TerminalEvent, cx| match event {
                     TerminalEvent::Finished(visit) => {
                         let visit = visit.clone();
-                        this.vault
-                            .update(cx, |vault, cx| vault.record_visit(visit, cx));
+                        this.vault.update(cx, |vault, cx| {
+                            if let Some(host) = &visit.host {
+                                vault.clear_forward_states(host, cx);
+                            }
+                            vault.record_visit(visit, cx);
+                        });
+                    }
+                    TerminalEvent::Forwarding {
+                        host,
+                        forward,
+                        state,
+                    } => {
+                        let (host, forward, state) = (host.clone(), forward.clone(), state.clone());
+                        this.vault.update(cx, |vault, cx| {
+                            vault.set_forward_state(host, &forward, state, cx)
+                        });
                     }
                 },
             ),
@@ -232,8 +254,12 @@ impl Workspace {
         let terminal = self.sessions[index].read(cx);
         if terminal.is_live() {
             let visit = terminal.visit("Closed");
-            self.vault
-                .update(cx, |vault, cx| vault.record_visit(visit, cx));
+            self.vault.update(cx, |vault, cx| {
+                if let Some(host) = &visit.host {
+                    vault.clear_forward_states(host, cx);
+                }
+                vault.record_visit(visit, cx);
+            });
         }
         // Dropping the view drops the session's input, which disconnects.
         self.sessions.remove(index);
