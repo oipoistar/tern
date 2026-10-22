@@ -65,6 +65,10 @@ claude.ai account). Each item below names the artboard it comes from.
       its open session (painted by the live layer, so the vault doesn't
       re-render), Open terminal (shows the open session if there is one),
       SFTP, and its port forwarding switches
+- [x] Settings (item 12): `settings.json` in the data folder; the header's
+      sliders open General (the data folder), Terminal (font, size, cursor,
+      scrollback, visual bell, copy on select) and Appearance (system, light
+      or dark, also set by the header's toggle)
 
 ## Known gaps in what's built
 
@@ -78,13 +82,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 12. Settings (Sync artboard tabs: General, Terminal, Appearance, Sync)
-- Appearance: light, dark or system.
-- Terminal: font family and size, cursor style, scrollback length, bell,
-  copy on select.
-- `settings.json` in the data folder.
-- The header's sliders button opens Settings (mockup).
 
 ### 13. Vault list view and filters (Main artboard toolbar)
 - A grid / list switch.
@@ -101,7 +98,8 @@ claude.ai account). Each item below names the artboard it comes from.
 - "What syncs" switches: hosts and groups, snippets, port forwards, private
   keys (off by default, per key in Keychain), themes and settings.
 - Shows the devices that sync, "Synced 2 min ago", and Sync now. The header's
-  "Synced" check reflects the real state.
+  "Synced" check reflects the real state. Its controls are the Settings
+  dialog's Sync tab.
 - Conflicts: last writer wins per item, using per-item timestamps.
 - No Tern servers and no accounts, ever.
 

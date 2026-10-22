@@ -28,6 +28,7 @@ gpui_kit::assets::icon_assets!(
         Server,
         Shield,
         ShieldCheck,
+        SlidersHorizontal,
         Trash,
         Upload,
         Usb,

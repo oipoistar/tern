@@ -30,6 +30,11 @@ pub fn vault() -> PathBuf {
     data_dir().join("vault.json")
 }
 
+/// How Tern looks and its terminals behave.
+pub fn settings() -> PathBuf {
+    data_dir().join("settings.json")
+}
+
 /// Recent connections.
 pub fn history() -> PathBuf {
     data_dir().join("history.json")

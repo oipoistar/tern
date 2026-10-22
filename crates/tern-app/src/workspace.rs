@@ -18,6 +18,7 @@ use crate::bench;
 use crate::files::FilesPanel;
 use crate::live::{LiveSlots, live_layer};
 use crate::marks;
+use crate::settings::{self, SettingsEvent, SettingsView};
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{button, icon, status_dot, tern_mark};
@@ -62,6 +63,9 @@ pub struct Workspace {
     live: LiveSlots,
     started: Instant,
     new_terminal: NewTerminal,
+    /// The Settings dialog, while open.
+    settings: Option<Entity<SettingsView>>,
+    _settings_events: Option<Subscription>,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -142,6 +146,10 @@ impl Workspace {
                 }
             }
         });
+        // With the system's appearance chosen, follow it as it changes.
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            settings::apply_appearance(window, cx)
+        });
         Self {
             vault,
             tabs: Vec::new(),
@@ -149,8 +157,10 @@ impl Workspace {
             live,
             started: Instant::now(),
             new_terminal,
+            settings: None,
+            _settings_events: None,
             _ticker: ticker,
-            _subscriptions: vec![connect],
+            _subscriptions: vec![connect, appearance],
         }
     }
 
@@ -431,6 +441,20 @@ impl Workspace {
         self.tabs[active]
             .focused()
             .update(cx, |terminal, cx| terminal.focus(window, cx));
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| SettingsView::new(window, cx));
+        view.update(cx, |view, cx| view.focus(window, cx));
+        self._settings_events = Some(cx.subscribe(&view, |this, _, event, cx| match event {
+            SettingsEvent::Close => {
+                this.settings = None;
+                this._settings_events = None;
+                cx.notify();
+            }
+        }));
+        self.settings = Some(view);
+        cx.notify();
     }
 
     /// Goes to the vault's Snippets screen with a new snippet's form open.
@@ -794,7 +818,25 @@ impl Workspace {
             )
             .child(
                 div()
+                    .id("open-settings")
+                    .debug_selector(|| "open-settings".into())
+                    .size(px(38.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(theme.line)
+                    .bg(theme.card)
+                    .shadow(theme.shadow_sm())
+                    .cursor_pointer()
+                    .child(icon(IconName::SlidersHorizontal, 18., theme.text2))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+            )
+            .child(
+                div()
                     .id("theme-toggle")
+                    .debug_selector(|| "theme-toggle".into())
                     .size(px(38.))
                     .flex()
                     .items_center()
@@ -810,7 +852,17 @@ impl Workspace {
                         18.,
                         theme.text2,
                     ))
-                    .on_click(move |_, _, cx| theme::set_dark(!dark, cx)),
+                    // A choice made here sticks, as if made in Settings.
+                    .on_click(move |_, window, cx| {
+                        settings::update(cx, |settings| {
+                            settings.appearance = if dark {
+                                tern_core::settings::Appearance::Light
+                            } else {
+                                tern_core::settings::Appearance::Dark
+                            }
+                        });
+                        settings::apply_appearance(window, cx);
+                    }),
             )
     }
 
@@ -978,6 +1030,23 @@ impl Render for Workspace {
             .child(self.header(&theme, cx))
             .child(div().flex_1().min_h_0().child(body))
             .child(live_layer(&self.live, time))
+            .when_some(self.settings.clone(), |d, view| {
+                d.child(
+                    div()
+                        .id("settings-scrim")
+                        .occlude()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .p(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.scrim())
+                        .child(view),
+                )
+            })
     }
 }
 
@@ -1045,6 +1114,57 @@ mod tests {
         click(cx, "new-snippet");
         workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
         assert!(cx.debug_bounds("save-snippet").is_some());
+    }
+
+    #[gpui::test]
+    fn settings_change_the_theme_and_terminals(cx: &mut TestAppContext) {
+        use tern_core::settings::{Appearance, CursorStyle};
+
+        let (workspace, cx) = open_workspace(cx);
+        let dark = |cx: &mut VisualTestContext| cx.update(|_, cx| crate::theme::current(cx).dark);
+        let current = |cx: &mut VisualTestContext| cx.update(|_, cx| crate::settings::current(cx));
+
+        click(cx, "open-settings");
+        click(cx, "settings-appearance");
+        click(cx, "appearance-dark");
+        assert!(dark(cx));
+        assert_eq!(current(cx).appearance, Appearance::Dark);
+        click(cx, "appearance-light");
+        assert!(!dark(cx));
+
+        click(cx, "settings-terminal");
+        click(cx, "cursor-beam");
+        click(cx, "copy-on-select");
+        let terminal = current(cx).terminal;
+        assert_eq!(
+            (terminal.cursor, terminal.copy_on_select),
+            (CursorStyle::Beam, true)
+        );
+
+        // A typed size applies once it makes sense.
+        cx.update(|window, cx| {
+            let view = workspace
+                .read(cx)
+                .settings
+                .clone()
+                .expect("Settings is open");
+            let input = view.read(cx).font_size_input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input("16");
+        assert_eq!(current(cx).terminal.font_size, 16.);
+
+        // The header's toggle sticks too; Escape closes.
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("settings").is_none());
+        click(cx, "theme-toggle");
+        assert_eq!(current(cx).appearance, Appearance::Dark);
     }
 
     #[gpui::test]

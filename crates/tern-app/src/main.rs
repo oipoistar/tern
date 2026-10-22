@@ -8,6 +8,7 @@ mod keychain;
 mod known_hosts;
 mod live;
 mod marks;
+mod settings;
 mod snippets;
 mod terminal;
 mod theme;
@@ -22,6 +23,7 @@ fn main() {
         .with_assets(assets::TernAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            settings::init(cx);
 
             let benching = bench::enabled();
             let options = WindowOptions {
@@ -39,17 +41,7 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                // Start in the system's appearance; `TERN_THEME=light|dark`
-                // overrides it (handy for screenshots).
-                let dark = match std::env::var("TERN_THEME").as_deref() {
-                    Ok("dark") => true,
-                    Ok("light") => false,
-                    _ => matches!(
-                        window.appearance(),
-                        WindowAppearance::Dark | WindowAppearance::VibrantDark
-                    ),
-                };
-                theme::set_dark(dark, cx);
+                settings::apply_appearance(window, cx);
                 cx.new(|cx| workspace::Workspace::new(window, cx))
             })
             .expect("failed to open the Tern window");

@@ -21,19 +21,24 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, CursorStyle as TermCursorStyle, NamedColor, Processor, Rgb,
+};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{self, Visit};
+use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
+use crate::settings;
 use crate::theme::{self, MONO, TermPalette, Theme};
 
-const FONT_SIZE: f32 = 13.5;
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.35;
-const SCROLLBACK: usize = 10_000;
+/// How long the visual bell lights the pane.
+const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
 /// Lines a session's preview keeps: those ending at the cursor.
 const PREVIEW_LINES: i32 = 9;
 
@@ -100,6 +105,10 @@ pub struct TerminalView {
     /// Since when the shell has been up.
     live_since: Option<Instant>,
     preview: Preview,
+    /// The scrollback and cursor the terminal was last configured with.
+    configured: (usize, CursorStyle),
+    /// The visual bell lights the pane until then.
+    flash_until: Option<Instant>,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -212,10 +221,8 @@ impl TerminalView {
             rows: 30,
         };
         let term_events = Rc::new(RefCell::new(Vec::new()));
-        let config = TermConfig {
-            scrolling_history: SCROLLBACK,
-            ..Default::default()
-        };
+        let terminal = settings::current(cx).terminal;
+        let config = term_config(&terminal);
         Self {
             connection,
             password: None,
@@ -234,6 +241,8 @@ impl TerminalView {
             started: history::now(),
             live_since: None,
             preview: Preview::default(),
+            configured: (terminal.scrollback, terminal.cursor),
+            flash_until: None,
             #[cfg(test)]
             sent: RefCell::default(),
         }
@@ -347,10 +356,7 @@ impl TerminalView {
                 self.phase = Phase::Live;
                 self.live_since = Some(Instant::now());
                 self.term = Term::new(
-                    TermConfig {
-                        scrolling_history: SCROLLBACK,
-                        ..Default::default()
-                    },
+                    term_config(&settings::current(cx).terminal),
                     &GridSize(self.size),
                     Listener(self.term_events.clone()),
                 );
@@ -433,6 +439,9 @@ impl TerminalView {
                         })
                         .into_bytes(),
                     );
+                }
+                TermEvent::Bell if settings::current(cx).terminal.bell == Bell::Visual => {
+                    self.flash(cx)
                 }
                 TermEvent::ClipboardStore(_, text) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text))
@@ -593,6 +602,25 @@ impl TerminalView {
         }
     }
 
+    /// A drag or click ends; with copy on select, the selection goes to
+    /// the clipboard.
+    fn end_selection(&mut self, cx: &mut Context<Self>) {
+        let dragged = std::mem::take(&mut self.selecting);
+        if dragged && settings::current(cx).terminal.copy_on_select {
+            self.copy(cx);
+        }
+    }
+
+    /// Lights the pane briefly, for the bell.
+    fn flash(&mut self, cx: &mut Context<Self>) {
+        self.flash_until = Some(Instant::now() + BELL_FLASH);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BELL_FLASH).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
     fn copy(&self, cx: &mut Context<Self>) {
         if let Some(text) = self
             .term
@@ -613,7 +641,7 @@ impl TerminalView {
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let line_height = px(FONT_SIZE * LINE_SPACING);
+        let line_height = px(settings::current(cx).terminal.font_size * LINE_SPACING);
         let lines = (event.delta.pixel_delta(line_height).y / line_height).round() as i32;
         if lines != 0 {
             self.term.scroll_display(Scroll::Delta(lines));
@@ -867,6 +895,14 @@ impl Render for TerminalView {
         let theme = theme::current(cx);
         let palette = TermPalette::for_theme(&theme);
         let focused = self.focus.is_focused(window);
+        let terminal = settings::current(cx).terminal;
+        // Settings changed since: scrollback and the default cursor apply
+        // to the running terminal too.
+        if self.configured != (terminal.scrollback, terminal.cursor) {
+            self.term.set_options(term_config(&terminal));
+            self.configured = (terminal.scrollback, terminal.cursor);
+        }
+        let flashing = self.flash_until.is_some_and(|until| Instant::now() < until);
         let frame = Rc::new(self.frame(&palette, focused));
         let entity = cx.entity();
         let this = entity.downgrade();
@@ -884,11 +920,11 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.selecting = false),
+                cx.listener(|this, _, _, cx| this.end_selection(cx)),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.selecting = false),
+                cx.listener(|this, _, _, cx| this.end_selection(cx)),
             )
             .relative()
             .size_full()
@@ -898,7 +934,7 @@ impl Render for TerminalView {
             .child(
                 canvas(
                     move |bounds, window, cx| {
-                        let metrics = Metrics::measure(window);
+                        let metrics = Metrics::measure(window, &terminal);
                         let size = metrics.grid_size(bounds.size);
                         if size != current {
                             cx.defer(move |cx| {
@@ -926,7 +962,35 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when(flashing, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .rounded(px(18.))
+                        .bg(palette.foreground.opacity(0.14)),
+                )
+            })
             .children(self.overlay(&theme, cx))
+    }
+}
+
+/// alacritty_terminal's configuration from Tern's terminal settings.
+fn term_config(terminal: &TerminalSettings) -> TermConfig {
+    let shape = match terminal.cursor {
+        CursorStyle::Block => CursorShape::Block,
+        CursorStyle::Beam => CursorShape::Beam,
+        CursorStyle::Underline => CursorShape::Underline,
+    };
+    TermConfig {
+        scrolling_history: terminal.scrollback,
+        default_cursor_style: TermCursorStyle {
+            shape,
+            blinking: false,
+        },
+        ..Default::default()
     }
 }
 
@@ -939,19 +1003,25 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn measure(window: &mut Window) -> Self {
-        let font = font(MONO);
-        let font_size = px(FONT_SIZE);
+    fn measure(window: &mut Window, terminal: &TerminalSettings) -> Self {
+        let family = if terminal.font_family.is_empty() {
+            MONO.to_string()
+        } else {
+            terminal.font_family.clone()
+        };
+        let font = font(family);
+        let size = terminal.font_size;
+        let font_size = px(size);
         let text = window.text_system();
         let cell_width = text
             .advance(text.resolve_font(&font), font_size, 'm')
             .map(|size| size.width)
-            .unwrap_or(px(FONT_SIZE * 0.6));
+            .unwrap_or(px(size * 0.6));
         Self {
             font,
             font_size,
             cell_width,
-            line_height: px((FONT_SIZE * LINE_SPACING).round()),
+            line_height: px((size * LINE_SPACING).round()),
         }
     }
 
