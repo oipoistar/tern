@@ -24,6 +24,11 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+/// The saved hosts.
+pub fn vault() -> PathBuf {
+    data_dir().join("vault.json")
+}
+
 /// Host keys the user accepted in Tern. Kept apart from `~/.ssh/known_hosts`,
 /// which Tern reads but never writes.
 pub fn known_hosts() -> PathBuf {

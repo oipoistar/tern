@@ -1,9 +1,16 @@
-//! The saved hosts, in groups. Kept in memory for now; the encrypted vault
-//! file comes later.
+//! The saved hosts, in groups, and `vault.json`, the file they're kept in.
+//!
+//! The file holds no secrets (names, addresses, users and key-file paths,
+//! like `~/.ssh/config`); encrypting it belongs to sync. Observed status
+//! isn't saved.
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
-use crate::host::{Host, HostGroup, sample_groups};
+use serde::{Deserialize, Serialize};
+
+use crate::host::{Host, HostGroup};
 use crate::ssh::{Connection, Jump};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -12,9 +19,11 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Sample hosts, for tests and screenshots.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn sample() -> Self {
         Self {
-            groups: sample_groups(),
+            groups: crate::host::sample_groups(),
         }
     }
 
@@ -44,7 +53,7 @@ impl Vault {
     /// Saves `host` into `group`, creating the group if needed. With
     /// `replacing` (the host's name before editing) the old entry is updated
     /// in place, or moved when the group changed, and hosts that went through
-    /// the old name follow a rename.
+    /// the old name follow a rename. A group left empty goes away.
     pub fn save(&mut self, replacing: Option<&str>, host: Host, group: &str) {
         let mut slot = None;
         if let Some(old) = replacing {
@@ -79,10 +88,11 @@ impl Vault {
                 }),
             },
         }
+        self.groups.retain(|group| !group.hosts.is_empty());
     }
 
     /// Removes a host. Refused while other hosts go through it; the error
-    /// names them.
+    /// names them. A group left empty goes away.
     pub fn delete(&mut self, name: &str) -> Result<(), Vec<String>> {
         let dependents = self.dependents(name);
         if !dependents.is_empty() {
@@ -91,6 +101,7 @@ impl Vault {
         for group in &mut self.groups {
             group.hosts.retain(|host| host.name != name);
         }
+        self.groups.retain(|group| !group.hosts.is_empty());
         Ok(())
     }
 
@@ -134,12 +145,167 @@ impl Vault {
             .map(|(tag, _)| tag.to_string())
             .collect()
     }
+
+    /// Writes the vault to `path`: to a temporary file first, then renamed
+    /// over the old one, so a crash mid-write never leaves half a file.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut json = serde_json::to_string_pretty(&FileOut {
+            version: FILE_VERSION,
+            groups: &self.groups,
+        })?;
+        json.push('\n');
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(".tmp");
+        let temp = PathBuf::from(temp);
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    }
+}
+
+/// The vault file's shape. Bump it when a change would make an older Tern
+/// misread the file; older versions then leave it alone instead of guessing.
+pub const FILE_VERSION: u32 = 1;
+
+/// The vault file as written.
+#[derive(Serialize)]
+struct FileOut<'a> {
+    version: u32,
+    groups: &'a [HostGroup],
+}
+
+/// The vault file as read.
+#[derive(Deserialize)]
+struct FileIn {
+    #[serde(default)]
+    groups: Vec<HostGroup>,
+}
+
+/// Just the version, read first so a newer file isn't misread.
+#[derive(Deserialize)]
+struct FileVersion {
+    version: Option<u32>,
+}
+
+/// What opening the vault file found.
+#[derive(Debug)]
+pub struct Opened {
+    pub vault: Vault,
+    /// There was no file yet: a first run.
+    pub fresh: bool,
+    /// Where to save changes. `None` when saving would replace a file this
+    /// Tern can't use, which is never overwritten.
+    pub path: Option<PathBuf>,
+    /// One line for the user when the file couldn't be used.
+    pub notice: Option<String>,
+}
+
+/// Opens the vault file at `path`. A missing file is a fresh, empty vault.
+/// A file that can't be read is moved aside (as `vault.json.unreadable`,
+/// numbered if that exists) and the vault starts empty; one from a newer
+/// Tern stays where it is and nothing is saved over it.
+pub fn open(path: &Path) -> Opened {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Opened {
+                vault: Vault::default(),
+                fresh: true,
+                path: Some(path.to_path_buf()),
+                notice: None,
+            };
+        }
+        Err(error) => return set_aside(path, &error.to_string()),
+    };
+    match parse(&text) {
+        Ok(vault) => Opened {
+            vault,
+            fresh: false,
+            path: Some(path.to_path_buf()),
+            notice: None,
+        },
+        Err(Unusable::Newer(version)) => Opened {
+            vault: Vault::default(),
+            fresh: false,
+            path: None,
+            notice: Some(format!(
+                "{} is from a newer Tern (version {version}), so changes here aren't saved",
+                path.display()
+            )),
+        },
+        Err(Unusable::Broken(reason)) => set_aside(path, &reason),
+    }
+}
+
+enum Unusable {
+    Newer(u32),
+    Broken(String),
+}
+
+fn parse(text: &str) -> Result<Vault, Unusable> {
+    // Some Windows editors start UTF-8 files with a byte-order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let broken = |error: serde_json::Error| Unusable::Broken(error.to_string());
+    match serde_json::from_str::<FileVersion>(text)
+        .map_err(broken)?
+        .version
+    {
+        None => return Err(Unusable::Broken("no version".into())),
+        Some(version) if version > FILE_VERSION => return Err(Unusable::Newer(version)),
+        Some(_) => {}
+    }
+    let file: FileIn = serde_json::from_str(text).map_err(broken)?;
+    Ok(Vault {
+        groups: file.groups,
+    })
+}
+
+/// Moves an unreadable vault file out of the way, never over another file,
+/// and starts empty.
+fn set_aside(path: &Path, reason: &str) -> Opened {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = (1..)
+        .map(|n| match n {
+            1 => path.with_file_name(format!("{name}.unreadable")),
+            n => path.with_file_name(format!("{name}.unreadable.{n}")),
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused name");
+    match std::fs::rename(path, &aside) {
+        Ok(()) => Opened {
+            vault: Vault::default(),
+            fresh: false,
+            path: Some(path.to_path_buf()),
+            notice: Some(format!(
+                "Couldn't read {name} ({reason}); it was moved to {}",
+                aside.display()
+            )),
+        },
+        // It can't even be moved: leave it alone and save nothing over it.
+        Err(error) => Opened {
+            vault: Vault::default(),
+            fresh: false,
+            path: None,
+            notice: Some(format!(
+                "Couldn't read {} ({reason}) or move it aside ({error})",
+                path.display()
+            )),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Auth;
+    use crate::host::{Auth, HostStatus};
 
     fn names(vault: &Vault, group: usize) -> Vec<&str> {
         vault.groups[group]
@@ -147,6 +313,14 @@ mod tests {
             .iter()
             .map(|host| host.name.as_str())
             .collect()
+    }
+
+    /// A fresh folder for one test's files.
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tern-vault-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -168,6 +342,20 @@ mod tests {
 
         vault.save(None, Host::new("nas", "admin", "nas.lan", 22), "Home");
         assert_eq!(vault.group_of("nas"), Some("Home"));
+    }
+
+    #[test]
+    fn a_group_goes_when_its_last_host_does() {
+        let mut vault = Vault::sample();
+        vault.save(None, Host::new("nas", "admin", "nas.lan", 22), "Home");
+        let nas = vault.find("nas").unwrap().clone();
+        vault.save(Some("nas"), nas, "Production");
+        assert!(vault.groups.iter().all(|group| group.name != "Home"));
+
+        for name in ["stage-api", "stage-worker", "pi-homelab"] {
+            vault.delete(name).unwrap();
+        }
+        assert_eq!(vault.groups.len(), 1);
     }
 
     #[test]
@@ -218,5 +406,93 @@ mod tests {
         let vault = Vault::sample();
         let have = vec!["Docker".to_string()];
         assert_eq!(vault.tag_suggestions(&have, 2), ["eu-west", "nginx"]);
+    }
+
+    #[test]
+    fn the_file_keeps_everything_but_observed_status() {
+        let dir = scratch("round-trip");
+        let path = dir.join("vault.json");
+        let mut vault = Vault::sample();
+        let mut db = vault.find("prod-db-01").unwrap().clone();
+        db.auth = Auth::Key(PathBuf::from("keys/id_ed25519"));
+        db.jump = Some("bastion".into());
+        db.on_login = Some("cd /srv".into());
+        db.keep_alive = false;
+        vault.save(Some("prod-db-01"), db, "Production");
+
+        vault.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("latency") && !text.contains("status"));
+        assert!(!dir.join("vault.json.tmp").exists());
+
+        let opened = open(&path);
+        assert!(!opened.fresh && opened.notice.is_none());
+        assert_eq!(opened.path.as_deref(), Some(path.as_path()));
+        for host in vault.groups.iter_mut().flat_map(|group| &mut group.hosts) {
+            host.status = HostStatus::Unknown;
+        }
+        assert_eq!(opened.vault, vault);
+
+        // Saving again replaces the file.
+        vault.delete("pi-homelab").unwrap();
+        vault.save_to(&path).unwrap();
+        assert!(open(&path).vault.find("pi-homelab").is_none());
+
+        // A byte-order mark from a hand edit is fine.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("\u{feff}{text}")).unwrap();
+        let opened = open(&path);
+        assert!(opened.notice.is_none() && opened.vault.find("bastion").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_file_is_a_fresh_empty_vault() {
+        let dir = scratch("fresh");
+        let opened = open(&dir.join("vault.json"));
+        assert!(opened.fresh && opened.notice.is_none() && opened.path.is_some());
+        assert_eq!(opened.vault, Vault::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_file_is_moved_aside_never_over_another() {
+        let dir = scratch("unreadable");
+        let path = dir.join("vault.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let opened = open(&path);
+        assert!(!opened.fresh);
+        assert_eq!(opened.vault, Vault::default());
+        assert_eq!(opened.path.as_deref(), Some(path.as_path()));
+        assert!(opened.notice.unwrap().contains("vault.json.unreadable"));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("vault.json.unreadable")).unwrap(),
+            "{ not json"
+        );
+
+        // A second bad file doesn't replace the first one set aside.
+        std::fs::write(&path, r#"{"groups": []}"#).unwrap();
+        assert!(open(&path).notice.unwrap().contains("no version"));
+        assert!(dir.join("vault.json.unreadable.2").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("vault.json.unreadable")).unwrap(),
+            "{ not json"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_newer_file_is_left_alone() {
+        let dir = scratch("newer");
+        let path = dir.join("vault.json");
+        let newer = r#"{"version": 99, "groups": [], "everything": "else"}"#;
+        std::fs::write(&path, newer).unwrap();
+        let opened = open(&path);
+        assert!(opened.path.is_none(), "nothing may be saved over it");
+        assert!(opened.notice.unwrap().contains("newer Tern"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

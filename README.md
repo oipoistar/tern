@@ -28,9 +28,10 @@ cargo run -p tern-app -- --edit prod-db-01                    # open the host ed
 
 The quick-connect field in the vault accepts the same `ssh …` commands
 (`-p`, `-l` and `-i` are understood). Hosts are added and changed in the host
-editor (New host, or the pencil on the selected host). For now they live in
-memory: the vault starts from sample hosts and forgets edits on quit, until
-the encrypted vault file exists.
+editor (New host, or the pencil on the selected host) and saved to
+`vault.json` in Tern's data folder. The file holds no secrets: names,
+addresses, users and key-file paths, like `~/.ssh/config`. If it can't be
+read, Tern moves it aside as `vault.json.unreadable` and starts empty.
 
 When PuTTY has saved SSH sessions the vault lacks (in the registry on
 Windows, `~/.putty/sessions` elsewhere; only read), the vault offers "Import
@@ -39,7 +40,8 @@ sign in through Pageant.
 
 Tern checks host keys against `~/.ssh/known_hosts` (read only) and its own
 known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application
-Support/Tern` or `~/.local/share/tern`; `TERN_DATA_DIR` overrides it).
+Support/Tern` or `~/.local/share/tern`; `TERN_DATA_DIR` overrides it, which
+also keeps a test run away from your real vault).
 
 ## Develop
 
@@ -48,9 +50,10 @@ cargo run -p tern-devserver                # SSH server on 127.0.0.1:2222
 ```
 
 It creates a test key and password in `dev/test-ssh/` (git-ignored) on first
-run, and the app then lists it under "Local dev server", once directly and
-once as `devserver-via-jump`, which goes through the dev server itself as a
-jump host (it forwards only to addresses on this computer).
+run. When that key exists and there is no `vault.json` yet, the app starts
+with a "Local dev server" group listing it once directly and once as
+`devserver-via-jump`, which goes through the dev server itself as a jump
+host (it forwards only to addresses on this computer).
 
 ```sh
 cargo test --workspace                     # includes an end-to-end SSH test

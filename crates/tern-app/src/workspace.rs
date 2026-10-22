@@ -36,7 +36,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let live = LiveSlots::default();
-        let vault = cx.new(|cx| VaultContent::new(live.clone(), window, cx));
+        let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
         let connect =
             cx.subscribe_in(
                 &vault,

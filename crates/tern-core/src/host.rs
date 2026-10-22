@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// Reachability of a saved host, as last observed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostStatus {
     /// Never checked, like a host that was just added.
+    #[default]
     Unknown,
     /// Answering; with the round trip in milliseconds when it was measured.
     Online {
@@ -22,7 +25,8 @@ impl HostStatus {
 }
 
 /// How Tern signs in to a host.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Auth {
     /// The SSH agent, then the usual key files in `~/.ssh`.
     #[default]
@@ -33,22 +37,35 @@ pub enum Auth {
     Password,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A saved host. Everything but `status` is kept in the vault file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
     pub name: String,
     pub user: String,
     pub address: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub os: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Observed while Tern runs, never saved.
+    #[serde(skip)]
     pub status: HostStatus,
+    #[serde(default)]
     pub auth: Auth,
     /// Another saved host to connect through first, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
     /// Ping the server every 30 seconds so idle connections stay up.
+    #[serde(default = "on")]
     pub keep_alive: bool,
     /// Typed into the shell once it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
+}
+
+fn on() -> bool {
+    true
 }
 
 impl Host {
@@ -105,13 +122,15 @@ impl Host {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostGroup {
     pub name: String,
     pub hosts: Vec<Host>,
 }
 
-/// Placeholder vault contents until the encrypted vault exists.
+/// Sample hosts with observed statuses, for tests and screenshots. A real
+/// vault starts empty.
+#[cfg(any(test, feature = "test-support"))]
 pub fn sample_groups() -> Vec<HostGroup> {
     let host = |name: &str, user, address, port, os: &str, tags: &[&str], status| Host {
         os: os.into(),

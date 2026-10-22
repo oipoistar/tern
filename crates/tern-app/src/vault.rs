@@ -1,6 +1,6 @@
 //! The hosts vault: Tern's home screen. It asks the workspace to open a
-//! session with [`VaultEvent::Connect`], and opens the host editor over
-//! itself to add or change hosts.
+//! session with [`VaultEvent::Connect`], opens the host editor over itself
+//! to add or change hosts, and saves every change to the vault file.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::randomart::Randomart;
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, quick_destination};
-use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, putty};
+use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::live::LiveSlots;
@@ -36,6 +36,11 @@ impl EventEmitter<VaultEvent> for VaultContent {}
 /// Everything on the vault screen except the header.
 pub struct VaultContent {
     vault: Vault,
+    /// Where changes are saved; `None` keeps them in memory (tests, or a
+    /// file this Tern mustn't overwrite).
+    file: Option<PathBuf>,
+    /// One line about the vault file: why it couldn't be read or saved.
+    notice: Option<SharedString>,
     selected: String,
     live: LiveSlots,
     /// Art for each host whose key a known_hosts file already trusts, by
@@ -54,7 +59,27 @@ pub struct VaultContent {
 }
 
 impl VaultContent {
-    pub fn new(live: LiveSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// The vault saved in Tern's data folder. A first run in a dev checkout
+    /// starts with the dev server's hosts.
+    pub fn open(live: LiveSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let opened = tern_core::vault::open(&paths::vault());
+        let mut vault = opened.vault;
+        if opened.fresh && Path::new(DEV_KEY).exists() {
+            vault.groups.insert(0, dev_server_group());
+        }
+        let mut content = Self::new(vault, opened.path, live, window, cx);
+        content.notice = opened.notice.map(Into::into);
+        content
+    }
+
+    /// Shows `vault`, saving changes to `file` when there is one.
+    pub fn new(
+        vault: Vault,
+        file: Option<PathBuf>,
+        live: LiveSlots,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe_in(
             &search,
@@ -78,13 +103,15 @@ impl VaultContent {
             },
         );
 
-        let mut vault = Vault::sample();
-        if Path::new(DEV_KEY).exists() {
-            vault.groups.insert(0, dev_server_group());
-        }
-        let selected = vault.groups[0].hosts[0].name.clone();
+        let selected = vault
+            .hosts()
+            .next()
+            .map(|host| host.name.clone())
+            .unwrap_or_default();
         let mut content = Self {
             vault,
+            file,
+            notice: None,
             selected,
             live,
             keys: HashMap::new(),
@@ -111,8 +138,22 @@ impl VaultContent {
         for host in hosts {
             self.vault.save(None, host, putty::GROUP);
         }
+        self.persist();
         self.refresh_keys();
         cx.notify();
+    }
+
+    /// Writes the vault to its file, if it has one. A failure stays on
+    /// screen until a later save works.
+    fn persist(&mut self) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        self.notice = self
+            .vault
+            .save_to(path)
+            .err()
+            .map(|error| format!("Can't save {}: {error}", path.display()).into());
     }
 
     #[cfg(test)]
@@ -206,17 +247,21 @@ impl VaultContent {
             } => {
                 self.vault
                     .save(replacing.as_deref(), (**host).clone(), group);
+                self.persist();
                 self.selected = host.name.clone();
                 self.refresh_keys();
             }
             EditorEvent::Delete(name) => {
-                if self.vault.delete(name).is_ok() && self.selected == *name {
-                    self.selected = self
-                        .vault
-                        .hosts()
-                        .next()
-                        .map(|host| host.name.clone())
-                        .unwrap_or_default();
+                if self.vault.delete(name).is_ok() {
+                    self.persist();
+                    if self.selected == *name {
+                        self.selected = self
+                            .vault
+                            .hosts()
+                            .next()
+                            .map(|host| host.name.clone())
+                            .unwrap_or_default();
+                    }
                 }
             }
             EditorEvent::Close => {}
@@ -243,6 +288,16 @@ impl VaultContent {
             .flex_col()
             .gap(px(22.))
             .child(self.toolbar(theme, cx))
+            .when_some(self.notice.clone(), |d, notice| {
+                d.child(
+                    div()
+                        .px(px(4.))
+                        .text_size(px(13.))
+                        .text_color(theme.danger)
+                        .truncate()
+                        .child(notice),
+                )
+            })
             .when_some(self.destination.clone(), |d, (target, identity)| {
                 d.child(destination_card(target, identity, theme, cx))
             })
@@ -679,13 +734,14 @@ mod tests {
 
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use gpui_kit::Entity;
-    use tern_core::Host;
     use tern_core::draft::Field;
     use tern_core::ssh::Connection;
+    use tern_core::{Host, Vault};
 
     use super::{VaultContent, VaultEvent};
     use crate::live::LiveSlots;
 
+    /// The sample vault, kept in memory only.
     fn open_vault(
         cx: &mut TestAppContext,
     ) -> (
@@ -694,8 +750,9 @@ mod tests {
         Rc<RefCell<Vec<Connection>>>,
     ) {
         cx.update(gpui_kit::init);
-        let (vault, cx) =
-            cx.add_window_view(|window, cx| VaultContent::new(LiveSlots::default(), window, cx));
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(Vault::sample(), None, LiveSlots::default(), window, cx)
+        });
         let connects: Rc<RefCell<Vec<Connection>>> = Rc::default();
         let recorded = connects.clone();
         cx.update(|_, cx| {
@@ -866,5 +923,37 @@ mod tests {
         click(cx, "delete-host");
         assert!(!editor_open(cx));
         vault.read_with(cx, |vault, _| assert!(vault.vault.find("db-new").is_none()));
+    }
+
+    #[gpui::test]
+    fn an_empty_vault_saves_what_is_added(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("tern-ui-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("vault.json");
+        cx.update(gpui_kit::init);
+        let file = Some(path.clone());
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(Vault::default(), file, LiveSlots::default(), window, cx)
+        });
+        let saved = || tern_core::vault::open(&path).vault;
+
+        // Just the toolbar, and nothing written until something changes.
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-host").is_some());
+        assert!(!path.exists());
+
+        vault.update(cx, |vault, cx| {
+            vault.offer_putty(vec![Host::new("nas", "admin", "nas.lan", 22)]);
+            cx.notify();
+        });
+        click(cx, "import-putty");
+        assert_eq!(saved().group_of("nas"), Some("PuTTY"));
+
+        click(cx, "host-nas");
+        click(cx, "edit-host");
+        click(cx, "delete-host");
+        assert!(saved().hosts().next().is_none());
+        vault.read_with(cx, |vault, _| assert!(vault.notice.is_none()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

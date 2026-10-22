@@ -22,33 +22,17 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Light and dark themes; `tern --connect`, `tern --edit`, `--bench`
 - [x] `tern-devserver`: local SSH server with a real shell that also works as
       a jump host towards this computer
+- [x] Saved vault (item 1): `vault.json` in the data folder, versioned, no
+      secrets, written through a temp file; an unreadable file is moved
+      aside, a newer one left alone; empty on a fresh install
 
 ## Known gaps in what's built
 
-- Hosts live in memory and reset on quit (item 1).
 - Host status and latency on the cards are sample data (item 3).
 - The header's "Synced" is static text (item 14).
 - Only tested on Windows so far (item 23).
 
 ## Next, in order
-
-### 1. Saved vault
-Hosts survive a restart.
-- `vault.json` in `paths::data_dir()`, written with serde. A version field,
-  groups, hosts. Observed status isn't saved. Write to a temp file, then
-  rename it over the old one.
-- The file holds no secrets (names, addresses, users, key-file paths), like
-  `~/.ssh/config`. Encryption belongs to sync (item 14).
-- If the file can't be read, move it aside as `vault.json.unreadable`, start
-  empty and say so in one line. Never overwrite it.
-- A fresh install starts empty, not with the sample hosts. In a dev checkout,
-  seed the "Local dev server" group when `dev/test-ssh/id_ed25519` exists. The
-  sample hosts move to tests only.
-- `VaultContent` takes the `Vault` and an optional file path, so UI tests never
-  touch the real data folder. Save after editor save and delete, and after
-  PuTTY import.
-- Needs an empty state for the vault: only the toolbar (New host, Import from
-  PuTTY). No helper text.
 
 ### 2. Terminal select and copy
 - Drag to select, using alacritty_terminal's `Selection`. Double-click selects

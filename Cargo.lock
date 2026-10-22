@@ -7488,6 +7488,8 @@ dependencies = [
  "anyhow",
  "rand 0.10.3",
  "russh",
+ "serde",
+ "serde_json",
  "tokio",
  "windows-registry 0.6.1",
 ]

@@ -14,6 +14,7 @@ gpui-kit.workspace = true
 alacritty_terminal = "0.26"
 
 [dev-dependencies]
+tern-core = { workspace = true, features = ["test-support"] }
 # Headless UI tests use GPUI's own test support, from the exact GPUI build
 # gpui-kit pins. (gpui-kit's `test-support` also pulls the separate GPUI Fast
 # stack, whose version pins conflict with this one.) Named `gpui` because
