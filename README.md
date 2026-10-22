@@ -8,6 +8,7 @@ OneDrive, iCloud, WebDAV or any folder).
 Early development. Native Rust with [GPUI](https://gpui.rs) and
 [GPUI Kit](https://gpui-kit.com); SSH via [russh](https://github.com/Eugeny/russh);
 terminal emulation via [alacritty_terminal](https://crates.io/crates/alacritty_terminal).
+What's built and what comes next: [ROADMAP.md](ROADMAP.md).
 
 ## Layout
 

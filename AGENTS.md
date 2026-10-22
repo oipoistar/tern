@@ -1,7 +1,8 @@
 # Working on Tern
 
 Guidance for anyone changing this repo, people and coding agents alike. The
-README covers what Tern is and how to run it.
+README covers what Tern is and how to run it. What to build next is in
+[ROADMAP.md](ROADMAP.md), in order; tick an item in the commit that ships it.
 
 ## Checks before every commit
 
