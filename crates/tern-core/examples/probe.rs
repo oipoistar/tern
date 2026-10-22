@@ -7,7 +7,8 @@
 //!
 //! `--trust` accepts an unknown host key (and saves it to Tern's known hosts,
 //! so point `TERN_DATA_DIR` somewhere disposable when experimenting).
-//! `--jump` goes through that host first, like `ssh -J`.
+//! `--jump` goes through that host first, like `ssh -J`; repeat it for a
+//! chain, first hop first.
 
 use std::time::Duration;
 
@@ -29,12 +30,14 @@ async fn main() -> anyhow::Result<()> {
 
     let (target, key) = parse_command(command)?;
     let mut connection = Connection::typed(target.clone(), key);
-    if let Some(via) = args.iter().skip_while(|arg| *arg != "--jump").nth(1) {
-        let (target, key) = parse_command(via)?;
-        connection.jump = Some(Jump {
-            target,
-            auth: key.map_or(Auth::Agent, Auth::Key),
-        });
+    for (flag, via) in args.iter().zip(args.iter().skip(1)) {
+        if flag == "--jump" {
+            let (target, key) = parse_command(via)?;
+            connection.jumps.push(Jump {
+                target,
+                auth: key.map_or(Auth::Agent, Auth::Key),
+            });
+        }
     }
     let size = TermSize {
         cols: 100,

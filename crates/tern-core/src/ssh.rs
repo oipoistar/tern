@@ -64,8 +64,9 @@ pub struct TermSize {
 pub struct ConnectRequest {
     pub target: Target,
     pub credentials: Vec<Credential>,
-    /// Sign in here first and reach the target through it (`ssh -J`).
-    pub jump: Option<(Target, Vec<Credential>)>,
+    /// Sign in to each of these in turn, first hop first, and reach the
+    /// target through them (`ssh -J a,b`).
+    pub jumps: Vec<(Target, Vec<Credential>)>,
     pub size: TermSize,
     /// A host key the user has just accepted, for the target or the jump
     /// host. It's saved to Tern's known hosts once that host is verified.
@@ -78,7 +79,7 @@ pub struct ConnectRequest {
     pub agent_forwarding: bool,
 }
 
-/// The host to go through first, and how to sign in there.
+/// A host to go through, and how to sign in there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Jump {
     pub target: Target,
@@ -95,7 +96,8 @@ pub struct Connection {
     pub host_id: Option<String>,
     pub target: Target,
     pub auth: Auth,
-    pub jump: Option<Jump>,
+    /// The hosts to go through, first hop first.
+    pub jumps: Vec<Jump>,
     pub keep_alive: bool,
     /// Let the server use this computer's SSH agent.
     pub agent_forwarding: bool,
@@ -113,7 +115,7 @@ impl Connection {
             host_id: None,
             target,
             auth: identity.map_or(Auth::Agent, Auth::Key),
-            jump: None,
+            jumps: Vec::new(),
             keep_alive: true,
             agent_forwarding: false,
             on_login: None,
@@ -122,7 +124,7 @@ impl Connection {
     }
 
     /// The request that opens this connection. `password` is one the user
-    /// typed for the target; the jump host never gets a password.
+    /// typed for the target; jump hosts never get a password.
     pub fn request(
         &self,
         size: TermSize,
@@ -132,10 +134,11 @@ impl Connection {
         ConnectRequest {
             target: self.target.clone(),
             credentials: credentials_for(&self.auth, password),
-            jump: self
-                .jump
-                .as_ref()
-                .map(|jump| (jump.target.clone(), credentials_for(&jump.auth, None))),
+            jumps: self
+                .jumps
+                .iter()
+                .map(|jump| (jump.target.clone(), credentials_for(&jump.auth, None)))
+                .collect(),
             size,
             trust,
             keep_alive: self.keep_alive,
@@ -168,7 +171,7 @@ pub fn credentials_for(auth: &Auth, password: Option<&str>) -> Vec<Credential> {
 /// Why a connection didn't get to a shell.
 #[derive(Clone, Debug)]
 pub enum ConnectError {
-    /// The key of `host` (the target or the jump host) is in no known_hosts
+    /// The key of `host` (the target or a jump host) is in no known_hosts
     /// file. Ask the user, then retry with [`ConnectRequest::trust`] set to
     /// `key`.
     UnknownHostKey {
@@ -369,7 +372,7 @@ async fn run(
     let ConnectRequest {
         target,
         credentials,
-        jump,
+        jumps,
         size,
         trust,
         keep_alive,
@@ -381,58 +384,48 @@ async fn run(
         ..Default::default()
     });
 
-    // Through a jump host: sign in there, then run the target's SSH over a
-    // forwarded channel. The jump connection must outlive the session.
+    // Through jump hosts: sign in to each, then run the next one's SSH over
+    // a channel it forwards, and so on to the target. Every jump
+    // connection must outlive the session.
+    let mut via = Vec::new();
+    let mut tunnel = None;
+    for (at, (jump, jump_credentials)) in jumps.iter().enumerate() {
+        let mut jump_handle = open(
+            config.clone(),
+            jump,
+            trust.clone(),
+            tunnel.take(),
+            RemoteTargets::default(),
+            false,
+        )
+        .await?;
+        authenticate(&mut jump_handle, &jump.user, jump_credentials)
+            .await
+            .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
+        let next = jumps.get(at + 1).map_or(&target, |(next, _)| next);
+        let channel = jump_handle
+            .channel_open_direct_tcpip(next.host.clone(), next.port.into(), "127.0.0.1", 0)
+            .await
+            .map_err(|error| {
+                other(format!(
+                    "{} can't reach {}:{}: {error}",
+                    jump.host, next.host, next.port
+                ))
+            })?;
+        tunnel = Some(channel.into_stream());
+        via.push(jump_handle);
+    }
     // Where the host sends connections for remote forwarding rules.
     let remote = RemoteTargets::default();
-    let mut via = None;
-    let mut handle = match jump {
-        None => {
-            open(
-                config,
-                &target,
-                trust,
-                None,
-                remote.clone(),
-                agent_forwarding,
-            )
-            .await?
-        }
-        Some((jump, jump_credentials)) => {
-            let mut jump_handle = open(
-                config.clone(),
-                &jump,
-                trust.clone(),
-                None,
-                RemoteTargets::default(),
-                false,
-            )
-            .await?;
-            authenticate(&mut jump_handle, &jump.user, &jump_credentials)
-                .await
-                .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
-            let channel = jump_handle
-                .channel_open_direct_tcpip(target.host.clone(), target.port.into(), "127.0.0.1", 0)
-                .await
-                .map_err(|error| {
-                    other(format!(
-                        "{} can't reach {}:{}: {error}",
-                        jump.host, target.host, target.port
-                    ))
-                })?;
-            let handle = open(
-                config,
-                &target,
-                trust,
-                Some(channel.into_stream()),
-                remote.clone(),
-                agent_forwarding,
-            )
-            .await?;
-            via = Some(jump_handle);
-            handle
-        }
-    };
+    let mut handle = open(
+        config,
+        &target,
+        trust,
+        tunnel,
+        remote.clone(),
+        agent_forwarding,
+    )
+    .await?;
 
     authenticate(&mut handle, &target.user, &credentials).await?;
     let _ = events.send(Event::Connected);
@@ -491,8 +484,9 @@ async fn run(
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
-    if let Some(via) = via {
-        let _ = via
+    // The hop nearest the target first.
+    for jump in via.iter().rev() {
+        let _ = jump
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
@@ -500,8 +494,8 @@ async fn run(
     Ok(())
 }
 
-/// Connects to `target` and verifies its host key, over TCP or, through a
-/// jump host, over `tunnel`.
+/// Connects to `target` and verifies its host key, over TCP or, through
+/// jump hosts, over `tunnel`.
 async fn open(
     config: Arc<client::Config>,
     target: &Target,
@@ -1047,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn the_jump_host_never_gets_the_typed_password() {
+    fn jump_hosts_never_get_the_typed_password() {
         let target = Target {
             host: "db".into(),
             port: 22,
@@ -1055,22 +1049,28 @@ mod tests {
         };
         let mut connection = Connection::typed(target.clone(), None);
         connection.auth = Auth::Password;
-        connection.jump = Some(Jump {
-            target: Target {
-                host: "bastion".into(),
-                ..target
-            },
-            auth: Auth::Agent,
-        });
+        connection.jumps = ["gateway", "bastion"]
+            .map(|host| Jump {
+                target: Target {
+                    host: host.into(),
+                    ..target.clone()
+                },
+                auth: Auth::Agent,
+            })
+            .to_vec();
         let request = connection.request(TermSize { cols: 80, rows: 24 }, Some("pw"), None);
         assert!(matches!(request.credentials[..], [Credential::Password(_)]));
-        let (jump, jump_credentials) = request.jump.unwrap();
-        assert_eq!(jump.host, "bastion");
-        assert!(
-            jump_credentials
+        let hops: Vec<&str> = request
+            .jumps
+            .iter()
+            .map(|(jump, _)| jump.host.as_str())
+            .collect();
+        assert_eq!(hops, ["gateway", "bastion"]);
+        assert!(request.jumps.iter().all(|(_, credentials)| {
+            credentials
                 .iter()
                 .all(|credential| !matches!(credential, Credential::Password(_)))
-        );
+        }));
     }
 
     #[test]

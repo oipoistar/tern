@@ -44,7 +44,7 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 (`host.rs`, `vault.rs`), the bookkeeping of background reachability checks
 (`reach.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
-`Connection` resolves a saved host into what to dial, jump host included),
+`Connection` resolves a saved host into what to dial, jump hosts included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
 (`history.rs`), the vault's filter (`filter.rs`), links in terminal

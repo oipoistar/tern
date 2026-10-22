@@ -169,37 +169,73 @@ impl Vault {
         Ok(())
     }
 
-    /// Where to check that `host` answers: its jump host, the first hop,
-    /// when it goes through one, otherwise the host itself.
+    /// The hosts `host` goes through, first hop first: its jump host is
+    /// last, after the one that goes through, and so on. Fails when one of
+    /// them is missing or they go round in a loop.
+    pub fn jumps<'a>(&'a self, host: &'a Host) -> Result<Vec<&'a Host>, String> {
+        let mut chain: Vec<&Host> = Vec::new();
+        let mut next = host.jump.as_deref();
+        while let Some(name) = next {
+            let via = self
+                .find(name)
+                .ok_or_else(|| format!("No saved host named {name}"))?;
+            if via.name == host.name || chain.iter().any(|seen| seen.name == via.name) {
+                return Err(format!(
+                    "The jump hosts of {} go round in a loop",
+                    host.name
+                ));
+            }
+            chain.push(via);
+            next = via.jump.as_deref();
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// Whether `host` is `name` or goes through it, at any hop.
+    pub fn goes_through(&self, host: &Host, name: &str) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut next = Some(host);
+        while let Some(hop) = next {
+            if hop.name == name {
+                return true;
+            }
+            if seen.contains(&hop.name.as_str()) {
+                return false;
+            }
+            seen.push(&hop.name);
+            next = hop.jump.as_deref().and_then(|jump| self.find(jump));
+        }
+        false
+    }
+
+    /// Where to check that `host` answers: the first hop when it goes
+    /// through jump hosts, otherwise the host itself.
     pub fn first_hop(&self, host: &Host) -> Place {
-        let hop = host
-            .jump
-            .as_deref()
-            .and_then(|name| self.find(name))
+        let hop = self
+            .jumps(host)
+            .ok()
+            .and_then(|chain| chain.first().copied())
             .unwrap_or(host);
         (hop.address.clone(), hop.port)
     }
 
-    /// How to connect to `host`, with its jump host resolved.
+    /// How to connect to `host`, with its jump hosts resolved.
     pub fn connection(&self, host: &Host) -> Result<Connection, String> {
-        let jump = match &host.jump {
-            None => None,
-            Some(name) => {
-                let via = self
-                    .find(name)
-                    .ok_or_else(|| format!("No saved host named {name}"))?;
-                Some(Jump {
-                    target: via.ssh_target(),
-                    auth: via.auth.clone(),
-                })
-            }
-        };
+        let jumps = self
+            .jumps(host)?
+            .into_iter()
+            .map(|via| Jump {
+                target: via.ssh_target(),
+                auth: via.auth.clone(),
+            })
+            .collect();
         Ok(Connection {
             host: Some(host.name.clone()),
             host_id: Some(host.id.clone()),
             target: host.ssh_target(),
             auth: host.auth.clone(),
-            jump,
+            jumps,
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
             on_login: host.on_login.clone(),
@@ -526,7 +562,9 @@ mod tests {
         db.on_login = Some("cd /srv/app".into());
 
         let connection = vault.connection(&db).unwrap();
-        let jump = connection.jump.unwrap();
+        let [jump] = &connection.jumps[..] else {
+            panic!("one jump host, got {:?}", connection.jumps);
+        };
         assert_eq!(
             (jump.target.host.as_str(), jump.target.port),
             ("bastion.example.com", 2222)
@@ -537,6 +575,40 @@ mod tests {
 
         db.jump = Some("gone".into());
         assert!(vault.connection(&db).is_err());
+    }
+
+    #[test]
+    fn follows_a_chain_of_jump_hosts() {
+        let mut vault = Vault::sample();
+        let mut bastion = vault.find("bastion").unwrap().clone();
+        bastion.jump = Some("pi-homelab".into());
+        vault.save(Some("bastion"), bastion, "Production");
+        let mut db = vault.find("prod-db-01").unwrap().clone();
+        db.jump = Some("bastion".into());
+        vault.save(Some("prod-db-01"), db.clone(), "Production");
+
+        let hops: Vec<String> = vault
+            .connection(&db)
+            .unwrap()
+            .jumps
+            .into_iter()
+            .map(|jump| jump.target.host)
+            .collect();
+        let pi = vault.find("pi-homelab").unwrap().clone();
+        assert_eq!(hops, [pi.address.as_str(), "bastion.example.com"]);
+        assert_eq!(vault.first_hop(&db), (pi.address.clone(), pi.port));
+        assert!(vault.goes_through(&db, "pi-homelab"));
+        assert!(!vault.goes_through(&db, "prod-web-01"));
+
+        // A loop, as two devices' edits could make, is refused, not
+        // followed for ever.
+        let mut pi = pi;
+        pi.jump = Some("prod-db-01".into());
+        let group = vault.group_of("pi-homelab").unwrap().to_string();
+        vault.save(Some("pi-homelab"), pi, &group);
+        assert!(vault.connection(&db).unwrap_err().contains("loop"));
+        assert_eq!(vault.first_hop(&db), (db.address.clone(), db.port));
+        assert!(!vault.goes_through(&db, "prod-web-01"));
     }
 
     #[test]

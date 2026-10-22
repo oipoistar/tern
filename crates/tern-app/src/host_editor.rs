@@ -332,11 +332,18 @@ impl HostEditor {
         }
     }
 
-    /// Checks the first hop: the jump host when there is one, otherwise the
-    /// host as typed.
+    /// Checks the first hop: the first jump host when there are any,
+    /// otherwise the host as typed.
     fn test_connection(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft(cx);
         let via = draft.jump.as_deref().and_then(|name| self.vault.find(name));
+        let via = via.map(|via| {
+            self.vault
+                .jumps(via)
+                .ok()
+                .and_then(|chain| chain.first().copied())
+                .unwrap_or(via)
+        });
         let (hop, address, port) = match via {
             Some(via) => (Some(via.name.clone()), via.address.clone(), via.port),
             None => {
@@ -638,14 +645,31 @@ impl HostEditor {
         let value: SharedString = chosen
             .map(|via| format!("{} · {}", via.name, via.target()).into())
             .unwrap_or_default();
+        // A host can't go through one that already goes through it.
         let choices = self
             .vault
             .hosts()
             .filter(|host| {
-                Some(host.name.as_str()) != self.replacing.as_deref() && host.jump.is_none()
+                self.replacing
+                    .as_deref()
+                    .is_none_or(|this| !self.vault.goes_through(host, this))
             })
             .map(|host| (host.name.clone(), Some(host.target())))
             .collect();
+        // The whole route: the chosen host's own jump hosts come first.
+        let hops = chosen
+            .map(|via| {
+                let mut hops: Vec<String> = self
+                    .vault
+                    .jumps(via)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|hop| hop.name.clone())
+                    .collect();
+                hops.push(via.name.clone());
+                hops
+            })
+            .unwrap_or_default();
         card(t)
             .child(
                 div()
@@ -682,16 +706,18 @@ impl HostEditor {
                     t,
                     cx,
                 ))
-                .child(self.route(chosen.map(|via| via.name.clone()), t, cx))
+                .child(self.route(hops, t, cx))
             })
     }
 
-    /// This computer → jump host → this host.
-    fn route(&self, via: Option<String>, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    /// This computer → each jump host → this host. Before a jump host is
+    /// chosen, one blank stop stands for it.
+    fn route(&self, hops: Vec<String>, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let node = |glyph: IconName, label: Option<SharedString>, target: bool| {
             div()
                 .w(px(86.))
-                .flex_none()
+                .flex_shrink(1.)
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -710,7 +736,7 @@ impl HostEditor {
                 .when_some(label, |d, label| {
                     d.child(
                         div()
-                            .max_w(px(86.))
+                            .max_w_full()
                             .text_size(px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
@@ -718,7 +744,20 @@ impl HostEditor {
                     )
                 })
         };
-        let link = || div().flex_1().h(px(2.)).mt(px(20.)).bg(t.track);
+        // Stops narrow on a long route, but the lines between them stay.
+        let link = || {
+            div()
+                .flex_1()
+                .min_w(px(14.))
+                .h(px(2.))
+                .mt(px(20.))
+                .bg(t.track)
+        };
+        let stops: Vec<Option<String>> = if hops.is_empty() {
+            vec![None]
+        } else {
+            hops.into_iter().map(Some).collect()
+        };
         let typed = self.name.read(cx).value();
         let this_host: SharedString = if typed.trim().is_empty() {
             "New host".into()
@@ -734,8 +773,12 @@ impl HostEditor {
             .rounded(px(16.))
             .bg(t.card2)
             .child(node(IconName::Laptop, None, false))
-            .child(link())
-            .child(node(IconName::Shield, via.map(Into::into), false))
+            .children(stops.into_iter().flat_map(|hop| {
+                [
+                    link().into_any_element(),
+                    node(IconName::Shield, hop.map(Into::into), false).into_any_element(),
+                ]
+            }))
             .child(link())
             .child(node(IconName::Server, Some(this_host), true))
     }

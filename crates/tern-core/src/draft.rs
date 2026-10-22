@@ -128,15 +128,21 @@ impl HostDraft {
                     problem(Field::Jump, "A host can't go through itself")
                 }
                 None => problem(Field::Jump, "No saved host by that name"),
-                Some(via) if via.jump.is_some() => problem(
-                    Field::Jump,
-                    "That host goes through another one, and only one jump is supported",
-                ),
+                Some(via)
+                    if vault.goes_through(via, name)
+                        || replacing.is_some_and(|old| vault.goes_through(via, old)) =>
+                {
+                    problem(Field::Jump, "That host goes through this one")
+                }
                 Some(via) if via.auth == Auth::Password => problem(
                     Field::Jump,
                     "That host signs in with a password, which a jump host can't use yet",
                 ),
-                Some(_) => {}
+                Some(via) => {
+                    if let Err(error) = vault.jumps(via) {
+                        problem(Field::Jump, &error);
+                    }
+                }
             }
         }
         if !problems.is_empty() {
@@ -267,6 +273,24 @@ mod tests {
         );
         draft.jump = Some("bastion".into());
         assert_eq!(jump_problem(&draft, &vault), None);
+
+        // A chain is fine, as long as it doesn't come back here.
+        let mut web = vault.find("prod-web-01").unwrap().clone();
+        web.jump = Some("bastion".into());
+        vault.save(Some("prod-web-01"), web, "Production");
+        draft.jump = Some("prod-web-01".into());
+        assert_eq!(jump_problem(&draft, &vault), None);
+        let mut bastion = vault.find("bastion").unwrap().clone();
+        bastion.jump = Some("prod-db-01".into());
+        vault.save(Some("bastion"), bastion, "Production");
+        assert_eq!(
+            jump_problem(&draft, &vault).as_deref(),
+            Some("That host goes through this one")
+        );
+        let mut bastion = vault.find("bastion").unwrap().clone();
+        bastion.jump = None;
+        vault.save(Some("bastion"), bastion, "Production");
+        draft.jump = Some("bastion".into());
 
         let mut bastion = vault.find("bastion").unwrap().clone();
         bastion.auth = Auth::Password;

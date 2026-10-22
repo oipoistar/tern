@@ -14,7 +14,7 @@ What's built and what comes next: [ROADMAP.md](ROADMAP.md).
 
 | Crate | What it is |
 | --- | --- |
-| `crates/tern-core` | UI-free core: hosts and the vault, SSH sessions (direct or through a jump host), host-key checks |
+| `crates/tern-core` | UI-free core: hosts and the vault, SSH sessions (direct or through jump hosts), host-key checks |
 | `crates/tern-app` | The desktop app (`tern`) |
 | `crates/tern-devserver` | Local SSH server with a real shell, for development |
 

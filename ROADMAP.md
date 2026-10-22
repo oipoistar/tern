@@ -17,7 +17,8 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] SSH sessions in tabs: host-key trust (Tern's own known_hosts; OpenSSH's
       is read only), key / agent (OpenSSH agent, Pageant) / password sign-in
 - [x] Host editor: add, edit, delete, groups, tags, test connection
-- [x] Jump hosts (one hop, `ssh -J` style), keep-alive, command after login
+- [x] Jump hosts (`ssh -J` style, chains of any length: a jump host can
+      go through another), keep-alive, command after login
 - [x] Import from PuTTY (registry on Windows, `~/.putty/sessions` elsewhere)
 - [x] Light and dark themes; `tern --connect`, `tern --edit`, `--bench`
 - [x] `tern-devserver`: local SSH server with a real shell that also works as
@@ -114,7 +115,6 @@ claude.ai account). Each item below names the artboard it comes from.
 - No Tern servers and no accounts, ever.
 
 ### 18. More SSH
-- Jump chains (more than one hop; the editor refuses them today).
 - OpenSSH host and user certificates (refused today with "host certificates
   aren't supported yet").
 - Reconnect automatically after a dropped connection.

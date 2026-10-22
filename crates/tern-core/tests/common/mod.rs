@@ -315,7 +315,7 @@ pub fn request(
             user: USER.into(),
         },
         credentials,
-        jump: None,
+        jumps: Vec::new(),
         size: TermSize { cols: 80, rows: 24 },
         trust,
         keep_alive: true,

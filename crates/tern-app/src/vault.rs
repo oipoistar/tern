@@ -2451,9 +2451,38 @@ mod tests {
         click(cx, "save-host");
         assert!(!editor_open(cx));
         click(cx, "connect-prod-db-01");
-        let connection = connects.borrow().last().cloned().expect("a connect event");
-        let jump = connection.jump.expect("connects through the jump host");
-        assert_eq!(jump.target.host, "bastion.example.com");
+        let hops = |connects: &Rc<RefCell<Vec<Connection>>>| -> Vec<String> {
+            let connection = connects.borrow().last().cloned().expect("a connect event");
+            connection
+                .jumps
+                .into_iter()
+                .map(|jump| jump.target.host)
+                .collect()
+        };
+        assert_eq!(hops(&connects), ["bastion.example.com"]);
+
+        // A chain: prod-web-01 through prod-db-01, which goes through
+        // bastion. Bastion can't then go through either of them.
+        click(cx, "host-prod-web-01");
+        click(cx, "edit-host");
+        click(cx, "jump-switch");
+        click(cx, "jump-picker");
+        click(cx, "jump-picker-prod-db-01");
+        click(cx, "save-host");
+        click(cx, "connect-prod-web-01");
+        assert_eq!(hops(&connects), ["bastion.example.com", "10.0.4.21"]);
+        click(cx, "host-bastion");
+        click(cx, "edit-host");
+        click(cx, "jump-switch");
+        click(cx, "jump-picker");
+        assert!(cx.debug_bounds("jump-picker-prod-db-01").is_none());
+        assert!(cx.debug_bounds("jump-picker-prod-web-01").is_none());
+        assert!(cx.debug_bounds("jump-picker-pi-homelab").is_some());
+        cx.simulate_keystrokes("escape");
+        if editor_open(cx) {
+            cx.simulate_keystrokes("escape");
+        }
+        assert!(!editor_open(cx));
 
         // Deleting a host others go through is refused; Escape closes.
         click(cx, "host-bastion");

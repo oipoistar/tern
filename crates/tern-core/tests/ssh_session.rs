@@ -61,24 +61,27 @@ async fn session_lifecycle() {
         }
     }
 
-    // Through a jump host (the same server, forwarding to itself): sign in
-    // there, then reach the target over the forwarded channel.
-    let mut through = request(port, password(), None);
-    through.jump = Some((through.target.clone(), password()));
-    let mut session = Session::open(through);
-    let event = next(&mut session).await;
-    assert!(matches!(event, Event::Connected), "{event:?}");
-    expect_output(&mut session, "ready").await;
-    session.write(b"via jump".to_vec());
-    expect_output(&mut session, "echo:via jump").await;
-    drop(session);
+    // Through one jump host and through a chain of two (the same server,
+    // forwarding to itself): sign in at each hop, then reach the next over
+    // a forwarded channel.
+    for hops in [1, 2] {
+        let mut through = request(port, password(), None);
+        through.jumps = vec![(through.target.clone(), password()); hops];
+        let mut session = Session::open(through);
+        let event = next(&mut session).await;
+        assert!(matches!(event, Event::Connected), "{event:?}");
+        expect_output(&mut session, "ready").await;
+        session.write(b"via jump".to_vec());
+        expect_output(&mut session, "echo:via jump").await;
+        drop(session);
+    }
 
     // A jump host that refuses the sign-in is named in the error.
     let mut through = request(port, password(), None);
-    through.jump = Some((
+    through.jumps = vec![(
         through.target.clone(),
         vec![Credential::Password("wrong".into())],
-    ));
+    )];
     let mut session = Session::open(through);
     match next(&mut session).await {
         Event::Failed(ConnectError::Other(message)) => {
