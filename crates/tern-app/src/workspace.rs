@@ -1,6 +1,6 @@
-//! The window's root: a header with tabs, the active screen (vault or a
-//! terminal session, with its snippet bar), and the live layer painted over
-//! it.
+//! The window's root: a header with tabs, the active screen (the vault, or a
+//! session tab of one to four terminal panes with a toolbar and a snippet
+//! bar), and the live layer painted over it.
 //!
 //! Screens are cached views; only this thin root re-renders each animation
 //! frame, so the latency traces can move without redrawing the screens.
@@ -10,26 +10,53 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::HostStatus;
 use tern_core::ssh::{Connection, parse_command};
 
 use crate::bench;
 use crate::live::{LiveSlots, live_layer};
+use crate::marks;
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
-use crate::theme::{self, Theme};
+use crate::theme::{self, MONO, Theme};
 use crate::ui::{button, icon, status_dot, tern_mark};
 use crate::vault::{VaultContent, VaultEvent};
 
 /// Latency traces scroll slowly, so 20 fps is plenty; nothing else animates.
 const FRAME: Duration = Duration::from_millis(50);
+/// Panes a tab holds at most: the grid of four.
+const MAX_PANES: usize = 4;
+
+/// Makes a terminal pane for a connection: [`TerminalView::new`], or one
+/// that doesn't connect, in tests.
+type NewTerminal = fn(Connection, &mut Context<TerminalView>) -> TerminalView;
+
+/// A session tab: one to four panes, laid out by how many there are
+/// (single, side by side, main plus stack, grid of four).
+struct Tab {
+    panes: Vec<Entity<TerminalView>>,
+    /// The pane typing goes to.
+    focused: usize,
+    /// One pane filling the tab while the others keep running behind it.
+    maximized: Option<usize>,
+    /// Typing in any pane goes to every pane.
+    broadcast: bool,
+}
+
+impl Tab {
+    fn focused(&self) -> &Entity<TerminalView> {
+        &self.panes[self.focused]
+    }
+}
 
 pub struct Workspace {
     vault: Entity<VaultContent>,
-    sessions: Vec<Entity<TerminalView>>,
-    /// `None` shows the vault; `Some(i)` the i-th session.
+    tabs: Vec<Tab>,
+    /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
     /// Moving marks on the vault screen, re-registered whenever it renders.
     live: LiveSlots,
     started: Instant,
+    new_terminal: NewTerminal,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -38,7 +65,7 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let live = LiveSlots::default();
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
-        let mut workspace = Self::with(vault, live, window, cx);
+        let mut workspace = Self::with(vault, live, TerminalView::new, window, cx);
         // `tern --connect "ssh -p 2222 user@host"` opens a session at startup.
         let mut args = std::env::args()
             .skip_while(|arg| arg != "--connect")
@@ -63,10 +90,12 @@ impl Workspace {
         workspace
     }
 
-    /// A window around `vault`, whose live marks register in `live`.
+    /// A window around `vault`, whose live marks register in `live`, making
+    /// panes with `new_terminal`.
     fn with(
         vault: Entity<VaultContent>,
         live: LiveSlots,
+        new_terminal: NewTerminal,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -79,8 +108,8 @@ impl Workspace {
                         this.open_session(connection.clone(), window, cx)
                     }
                     VaultEvent::Forward { host, forward, on } => {
-                        for session in &this.sessions {
-                            let terminal = session.read(cx);
+                        for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
+                            let terminal = pane.read(cx);
                             if terminal.is_live() && terminal.host() == Some(host.as_str()) {
                                 terminal.set_forward(forward.clone(), *on);
                             }
@@ -107,10 +136,11 @@ impl Workspace {
         });
         Self {
             vault,
-            sessions: Vec::new(),
+            tabs: Vec::new(),
             active: None,
             live,
             started: Instant::now(),
+            new_terminal,
             _ticker: ticker,
             _subscriptions: vec![connect],
         }
@@ -122,7 +152,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let terminal = cx.new(|cx| TerminalView::new(connection, cx));
+        let new_terminal = self.new_terminal;
+        let terminal = cx.new(|cx| new_terminal(connection, cx));
         self.add_session(terminal, window, cx);
     }
 
@@ -133,37 +164,61 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Tabs show each session's state and title.
+        self.watch(&terminal, cx);
+        self.tabs.push(Tab {
+            panes: vec![terminal],
+            focused: 0,
+            maximized: None,
+            broadcast: false,
+        });
+        self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// Follows a pane: its state and title for the tab, its endings for
+    /// History, its rules for Port forwarding, and its typing for
+    /// broadcast.
+    fn watch(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
         self._subscriptions
-            .push(cx.observe(&terminal, |_, _, cx| cx.notify()));
-        self._subscriptions.push(
-            cx.subscribe(
-                &terminal,
-                |this, _, event: &TerminalEvent, cx| match event {
-                    TerminalEvent::Finished(visit) => {
-                        let visit = visit.clone();
-                        this.vault.update(cx, |vault, cx| {
-                            if let Some(host) = &visit.host {
-                                vault.clear_forward_states(host, cx);
-                            }
-                            vault.record_visit(visit, cx);
-                        });
-                    }
-                    TerminalEvent::Forwarding {
-                        host,
-                        forward,
-                        state,
-                    } => {
-                        let (host, forward, state) = (host.clone(), forward.clone(), state.clone());
-                        this.vault.update(cx, |vault, cx| {
-                            vault.set_forward_state(host, &forward, state, cx)
-                        });
-                    }
-                },
-            ),
-        );
-        self.sessions.push(terminal);
-        self.activate(Some(self.sessions.len() - 1), window, cx);
+            .push(cx.observe(terminal, |_, _, cx| cx.notify()));
+        self._subscriptions.push(cx.subscribe(
+            terminal,
+            |this, terminal, event: &TerminalEvent, cx| match event {
+                TerminalEvent::Finished(visit) => {
+                    let visit = visit.clone();
+                    this.vault.update(cx, |vault, cx| {
+                        if let Some(host) = &visit.host {
+                            vault.clear_forward_states(host, cx);
+                        }
+                        vault.record_visit(visit, cx);
+                    });
+                }
+                TerminalEvent::Forwarding {
+                    host,
+                    forward,
+                    state,
+                } => {
+                    let (host, forward, state) = (host.clone(), forward.clone(), state.clone());
+                    this.vault.update(cx, |vault, cx| {
+                        vault.set_forward_state(host, &forward, state, cx)
+                    });
+                }
+                TerminalEvent::Typed(bytes) => this.broadcast(&terminal, bytes, cx),
+            },
+        ));
+    }
+
+    /// Sends what was typed in `from` to the other panes of its tab, while
+    /// that tab broadcasts.
+    fn broadcast(&mut self, from: &Entity<TerminalView>, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.panes.contains(from)) else {
+            return;
+        };
+        if !tab.broadcast {
+            return;
+        }
+        for pane in tab.panes.iter().filter(|pane| *pane != from) {
+            pane.update(cx, |terminal, cx| terminal.type_text(bytes.to_vec(), cx));
+        }
     }
 
     fn activate(&mut self, tab: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,14 +234,108 @@ impl Workspace {
                 vault.refresh_keys();
                 cx.notify();
             }),
-            Some(index) => {
-                self.sessions[index].update(cx, |terminal, cx| terminal.focus(window, cx))
-            }
+            Some(index) => self.tabs[index]
+                .focused()
+                .update(cx, |terminal, cx| terminal.focus(window, cx)),
         }
         cx.notify();
     }
 
-    /// Types a saved snippet into the session on screen.
+    /// Lays the active tab out for `count` panes, opening new ones to the
+    /// focused pane's host. Fewer than are open does nothing: panes close
+    /// only by hand.
+    fn set_panes(&mut self, count: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let mut connection = self.tabs[index].focused().read(cx).connection().clone();
+        // The first pane already runs the host's rules.
+        connection.forwards.clear();
+        let new_terminal = self.new_terminal;
+        while self.tabs[index].panes.len() < count.min(MAX_PANES) {
+            let terminal = cx.new(|cx| new_terminal(connection.clone(), cx));
+            self.watch(&terminal, cx);
+            let tab = &mut self.tabs[index];
+            tab.panes.push(terminal);
+            tab.focused = tab.panes.len() - 1;
+        }
+        self.tabs[index].maximized = None;
+        self.activate(Some(index), window, cx);
+    }
+
+    fn toggle_broadcast(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.active {
+            let tab = &mut self.tabs[index];
+            tab.broadcast = !tab.broadcast;
+            cx.notify();
+        }
+    }
+
+    fn toggle_maximized(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        tab.maximized = match tab.maximized {
+            Some(_) => None,
+            None => Some(pane),
+        };
+        tab.focused = pane;
+        self.activate(Some(index), window, cx);
+    }
+
+    /// Records a live pane in History as closed by hand.
+    fn record_closed(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        let terminal = terminal.read(cx);
+        if terminal.is_live() {
+            let visit = terminal.visit("Closed");
+            self.vault.update(cx, |vault, cx| {
+                if let Some(host) = &visit.host {
+                    vault.clear_forward_states(host, cx);
+                }
+                vault.record_visit(visit, cx);
+            });
+        }
+    }
+
+    /// Closes one pane of the active tab; the last one closes the tab.
+    fn close_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        if self.tabs[index].panes.len() == 1 {
+            return self.close_tab(index, window, cx);
+        }
+        let closing = self.tabs[index].panes[pane].clone();
+        self.record_closed(&closing, cx);
+        // Dropping the view drops the session's input, which disconnects.
+        let tab = &mut self.tabs[index];
+        tab.panes.remove(pane);
+        tab.maximized = None;
+        if tab.focused >= pane && tab.focused > 0 {
+            tab.focused -= 1;
+        }
+        self.activate(Some(index), window, cx);
+    }
+
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Live sessions closed by hand still go into History.
+        for pane in self.tabs[index].panes.clone() {
+            self.record_closed(&pane, cx);
+        }
+        self.tabs.remove(index);
+        let next = match self.active {
+            Some(active) if active == index => {
+                (!self.tabs.is_empty()).then(|| index.min(self.tabs.len() - 1))
+            }
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+        self.activate(next, window, cx);
+    }
+
+    /// Types a saved snippet into the focused pane, or every pane while
+    /// broadcasting.
     fn run_snippet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(active), Some(snippet)) = (
             self.active,
@@ -194,10 +343,20 @@ impl Workspace {
         ) else {
             return;
         };
-        self.sessions[active].update(cx, |terminal, cx| {
-            terminal.type_text(snippet.keystrokes(), cx);
-            terminal.focus(window, cx);
-        });
+        let tab = &self.tabs[active];
+        let panes = if tab.broadcast {
+            tab.panes.clone()
+        } else {
+            vec![tab.focused().clone()]
+        };
+        for pane in panes {
+            pane.update(cx, |terminal, cx| {
+                terminal.type_text(snippet.keystrokes(), cx)
+            });
+        }
+        self.tabs[active]
+            .focused()
+            .update(cx, |terminal, cx| terminal.focus(window, cx));
     }
 
     /// Goes to the vault's Snippets screen with a new snippet's form open.
@@ -207,7 +366,236 @@ impl Workspace {
             .update(cx, |vault, cx| vault.new_snippet(window, cx));
     }
 
-    /// Under the terminal: a chip per snippet, then a dashed one to add
+    /// Over the panes: the focused host with its latency trace, the layout
+    /// and Broadcast.
+    fn toolbar(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let focused = tab.focused().read(cx);
+        let host = focused.host().map(str::to_string);
+        let target = focused.connection().target.clone();
+        let trace = host
+            .as_deref()
+            .and_then(|name| self.vault.read(cx).host_trace(name));
+        let latency = match trace.as_ref().map(|trace| trace.status) {
+            Some(HostStatus::Online {
+                latency_ms: Some(ms),
+            }) => format!("{ms} ms"),
+            _ => String::new(),
+        };
+        let layouts = [
+            (1, IconName::Square),
+            (2, IconName::Columns2),
+            (3, IconName::PanelLeft),
+            (4, IconName::LayoutGrid),
+        ];
+        let open = tab.panes.len();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(host.clone().unwrap_or_else(|| target.host.clone())),
+            )
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .text_color(theme.text2)
+                    .child(format!("{}@{}:{}", target.user, target.host, target.port)),
+            )
+            .when_some(trace, |d, trace| {
+                let (ink, faint, seed) = (theme.text, theme.text3, marks::seed(&target.host));
+                d.child(
+                    // Drawn once per render: a terminal tab doesn't tick.
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            marks::paint_trace(bounds, &trace, seed, 0., ink, faint, window)
+                        },
+                    )
+                    .w(px(120.))
+                    .h(px(18.)),
+                )
+                .child(div().font_family(MONO).text_size(px(12.)).child(latency))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .gap(px(4.))
+                    .p(px(4.))
+                    .rounded(px(14.))
+                    .bg(theme.card2)
+                    .children(layouts.into_iter().map(|(count, glyph)| {
+                        let id = format!("layout-{count}");
+                        let (on, usable) = (count == open, count >= open);
+                        let fg = if on {
+                            theme.text
+                        } else if usable {
+                            theme.text2
+                        } else {
+                            theme.text3.opacity(0.4)
+                        };
+                        div()
+                            .id(SharedString::from(id.clone()))
+                            .debug_selector(move || id)
+                            .size(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(10.))
+                            .when(on, |d| d.bg(theme.card).shadow(theme.shadow_sm()))
+                            .child(icon(glyph, 16., fg))
+                            .when(usable && !on, |d| {
+                                d.cursor_pointer().on_click(cx.listener(
+                                    move |this, _, window, cx| this.set_panes(count, window, cx),
+                                ))
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .id("broadcast")
+                    .debug_selector(|| "broadcast".into())
+                    .h(px(40.))
+                    .px(px(14.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(13.))
+                    .border_1()
+                    .border_color(if tab.broadcast {
+                        theme.text
+                    } else {
+                        theme.line
+                    })
+                    .bg(if tab.broadcast {
+                        theme.text
+                    } else {
+                        theme.card
+                    })
+                    .text_color(if tab.broadcast {
+                        theme.card
+                    } else {
+                        theme.text
+                    })
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .child(icon(
+                        IconName::RadioTower,
+                        15.,
+                        if tab.broadcast {
+                            theme.card
+                        } else {
+                            theme.text
+                        },
+                    ))
+                    .child("Broadcast")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_broadcast(cx))),
+            )
+    }
+
+    /// The panes, laid out by how many there are, or the maximized one.
+    fn panes(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let pane = |index: usize| self.pane(tab, index, theme, cx);
+        let row = || div().flex_1().min_h_0().flex().gap(px(12.));
+        let column = || div().flex_1().min_w_0().flex().flex_col().gap(px(12.));
+        if let Some(index) = tab.maximized {
+            return row().child(pane(index)).into_any_element();
+        }
+        match tab.panes.len() {
+            1 => row().child(pane(0)).into_any_element(),
+            2 => row().child(pane(0)).child(pane(1)).into_any_element(),
+            3 => row()
+                .child(pane(0))
+                .child(column().child(pane(1)).child(pane(2)))
+                .into_any_element(),
+            _ => column()
+                .child(row().child(pane(0)).child(pane(1)))
+                .child(row().child(pane(2)).child(pane(3)))
+                .into_any_element(),
+        }
+    }
+
+    /// A pane: an ink ring while focused (every pane while broadcasting),
+    /// and with others beside it a header with its host, Maximize and
+    /// Close.
+    fn pane(&self, tab: &Tab, index: usize, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let terminal = &tab.panes[index];
+        let ringed = tab.broadcast || (tab.focused == index && tab.panes.len() > 1);
+        let id = format!("pane-{index}");
+        let (maximize, close) = (
+            format!("pane-maximize-{index}"),
+            format!("pane-close-{index}"),
+        );
+        div()
+            .id(SharedString::from(id.clone()))
+            .debug_selector(move || id)
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .rounded(px(20.))
+            .border_2()
+            .border_color(if ringed {
+                theme.text
+            } else {
+                transparent_black()
+            })
+            .when(tab.panes.len() > 1, |d| {
+                let maximized = tab.maximized.is_some();
+                d.child(
+                    div()
+                        .h(px(32.))
+                        .pl(px(12.))
+                        .pr(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(12.))
+                        .child(phase_glyph(&terminal.read(cx).phase, theme))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(terminal.read(cx).label()),
+                        )
+                        .child(
+                            pane_button(
+                                maximize,
+                                if maximized {
+                                    IconName::Minimize2
+                                } else {
+                                    IconName::Maximize2
+                                },
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| this.toggle_maximized(index, window, cx),
+                            )),
+                        )
+                        .child(
+                            pane_button(close, IconName::Close, theme).on_click(cx.listener(
+                                move |this, _, window, cx| this.close_pane(index, window, cx),
+                            )),
+                        ),
+                )
+            })
+            .child(
+                div().flex_1().min_h_0().child(
+                    terminal
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                ),
+            )
+    }
+
+    /// Under the panes: a chip per snippet, then a dashed one to add
     /// another.
     fn snippet_bar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let names: Vec<String> = self
@@ -218,7 +606,6 @@ impl Workspace {
             .map(|snippet| snippet.name.clone())
             .collect();
         div()
-            .pt(px(12.))
             .flex()
             .flex_wrap()
             .gap(px(8.))
@@ -247,30 +634,6 @@ impl Workspace {
                     .child("New snippet")
                     .on_click(cx.listener(|this, _, window, cx| this.new_snippet(window, cx))),
             )
-    }
-
-    fn close_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // A live session closed by hand still goes into History.
-        let terminal = self.sessions[index].read(cx);
-        if terminal.is_live() {
-            let visit = terminal.visit("Closed");
-            self.vault.update(cx, |vault, cx| {
-                if let Some(host) = &visit.host {
-                    vault.clear_forward_states(host, cx);
-                }
-                vault.record_visit(visit, cx);
-            });
-        }
-        // Dropping the view drops the session's input, which disconnects.
-        self.sessions.remove(index);
-        let next = match self.active {
-            Some(active) if active == index => {
-                (!self.sessions.is_empty()).then(|| index.min(self.sessions.len() - 1))
-            }
-            Some(active) if active > index => Some(active - 1),
-            other => other,
-        };
-        self.activate(next, window, cx);
     }
 
     fn header(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
@@ -381,28 +744,19 @@ impl Workspace {
                     .child("Vault")
                     .on_click(cx.listener(|this, _, window, cx| this.activate(None, window, cx))),
             )
-            .children(self.sessions.iter().enumerate().map(|(index, session)| {
-                let terminal = session.read(cx);
-                let glyph = match terminal.phase {
-                    Phase::Live => status_dot(theme).into_any_element(),
-                    Phase::Ended(_) => div()
-                        .size(px(7.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.text3)
-                        .into_any_element(),
-                    _ => icon(IconName::LoaderCircle, 12., theme.text2).into_any_element(),
-                };
+            .children(self.tabs.iter().enumerate().map(|(index, session)| {
+                let focused = session.focused();
+                let terminal = focused.read(cx);
                 tab(
-                    SharedString::from(format!("tab-{}", session.entity_id())),
+                    SharedString::from(format!("tab-{}", focused.entity_id())),
                     self.active == Some(index),
                 )
                 .pr(px(4.))
-                .child(glyph)
+                .child(phase_glyph(&terminal.phase, theme))
                 .child(div().max_w(px(180.)).truncate().child(terminal.title()))
                 .child(
                     div()
-                        .id(SharedString::from(format!("close-{}", session.entity_id())))
+                        .id(SharedString::from(format!("close-{index}")))
                         .size(px(24.))
                         .flex()
                         .items_center()
@@ -412,7 +766,7 @@ impl Workspace {
                         .child(icon(IconName::Close, 12., theme.text3))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.close_session(index, window, cx);
+                            this.close_tab(index, window, cx);
                         })),
                 )
                 .on_click(
@@ -422,32 +776,77 @@ impl Workspace {
     }
 }
 
+/// A session's state as a glyph: a solid dot while live, a ring once
+/// ended, a spinner on the way.
+fn phase_glyph(phase: &Phase, theme: &Theme) -> AnyElement {
+    match phase {
+        Phase::Live => status_dot(theme).into_any_element(),
+        Phase::Ended(_) => div()
+            .size(px(7.))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.text3)
+            .into_any_element(),
+        _ => icon(IconName::LoaderCircle, 12., theme.text2).into_any_element(),
+    }
+}
+
+fn pane_button(id: String, glyph: IconName, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id)
+        .size(px(26.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .cursor_pointer()
+        .child(icon(glyph, 13., theme.text2))
+}
+
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         bench::frame_start();
         let time = if cx.reduce_motion() && !bench::enabled() {
             0.
         } else {
             self.started.elapsed().as_secs_f32()
         };
+        // The focused pane is the one holding keyboard focus.
+        if let Some(index) = self.active {
+            let tab = &mut self.tabs[index];
+            if let Some(focused) = tab
+                .panes
+                .iter()
+                .position(|pane| pane.read(cx).is_focused(window))
+            {
+                tab.focused = focused;
+            }
+        }
         let theme = theme::current(cx);
         let cached = StyleRefinement::default().size_full();
         let body = match self.active {
             None if bench::uncached() => self.vault.clone().into_any_element(),
             None => self.vault.clone().cached(cached).into_any_element(),
-            Some(index) => div()
-                .size_full()
-                .p(px(16.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.sessions[index].clone().cached(cached)),
-                )
-                .child(self.snippet_bar(&theme, cx))
-                .into_any_element(),
+            Some(index) => {
+                let tab = &self.tabs[index];
+                div()
+                    .size_full()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(self.toolbar(tab, &theme, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(self.panes(tab, &theme, cx)),
+                    )
+                    .child(self.snippet_bar(&theme, cx))
+                    .into_any_element()
+            }
         };
         div()
             .size_full()
@@ -467,13 +866,35 @@ impl Render for Workspace {
 mod tests {
     // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use gpui_kit::AppContext as _;
+    use gpui_kit::{AppContext as _, Context, Entity};
     use tern_core::Vault;
+    use tern_core::ssh::Connection;
 
     use super::Workspace;
     use crate::live::LiveSlots;
     use crate::terminal::TerminalView;
     use crate::vault::VaultContent;
+
+    /// Panes that don't connect.
+    fn offline(_: Connection, cx: &mut Context<TerminalView>) -> TerminalView {
+        TerminalView::offline(cx)
+    }
+
+    /// A window with the sample vault and one session tab.
+    fn open_workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let live = LiveSlots::default();
+            let vault =
+                cx.new(|cx| VaultContent::new(Vault::sample(), None, live.clone(), window, cx));
+            let mut workspace = Workspace::with(vault, live, offline, window, cx);
+            let terminal = cx.new(TerminalView::offline);
+            workspace.add_session(terminal, window, cx);
+            workspace
+        });
+        cx.run_until_parked();
+        (workspace, cx)
+    }
 
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
         cx.run_until_parked();
@@ -484,28 +905,66 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// What each pane of the first tab has sent, then forgets it.
+    fn sent(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Vec<u8>> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.tabs[0]
+                .panes
+                .iter()
+                .map(|pane| pane.read(cx).sent.take())
+                .collect()
+        })
+    }
+
     #[gpui::test]
     fn the_snippet_bar_types_into_the_session(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let (workspace, cx) = cx.add_window_view(|window, cx| {
-            let live = LiveSlots::default();
-            let vault =
-                cx.new(|cx| VaultContent::new(Vault::sample(), None, live.clone(), window, cx));
-            let mut workspace = Workspace::with(vault, live, window, cx);
-            let terminal = cx.new(TerminalView::offline);
-            workspace.add_session(terminal, window, cx);
-            workspace
-        });
-
+        let (workspace, cx) = open_workspace(cx);
         click(cx, "snippet-0");
-        let sent = workspace.read_with(cx, |workspace, cx| {
-            workspace.sessions[0].read(cx).sent.borrow().clone()
-        });
-        assert_eq!(sent, b"df -h\r");
+        assert_eq!(sent(&workspace, cx), [b"df -h\r".to_vec()]);
 
         // New snippet goes to the vault's Snippets screen, form open.
         click(cx, "new-snippet");
         workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
         assert!(cx.debug_bounds("save-snippet").is_some());
+    }
+
+    #[gpui::test]
+    fn splits_into_panes_and_broadcasts(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let panes = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.tabs[0].panes.len())
+        };
+
+        // The grid of four opens three more panes to the same host.
+        click(cx, "layout-4");
+        assert_eq!(panes(cx), 4);
+        for pane in ["pane-0", "pane-1", "pane-2", "pane-3"] {
+            assert!(cx.debug_bounds(pane).is_some(), "{pane} shows");
+        }
+        // Fewer panes than are open isn't offered.
+        click(cx, "layout-2");
+        assert_eq!(panes(cx), 4);
+
+        // Typing goes to the focused pane only, until broadcasting.
+        sent(&workspace, cx);
+        click(cx, "pane-1");
+        cx.simulate_input("ls");
+        assert_eq!(
+            sent(&workspace, cx),
+            [vec![], b"ls".to_vec(), vec![], vec![]]
+        );
+        click(cx, "broadcast");
+        cx.simulate_input("uptime");
+        assert_eq!(sent(&workspace, cx), vec![b"uptime".to_vec(); 4]);
+        click(cx, "snippet-0");
+        assert_eq!(sent(&workspace, cx), vec![b"df -h\r".to_vec(); 4]);
+
+        // Maximize shows one pane; closing one goes to main plus stack.
+        click(cx, "pane-maximize-2");
+        assert!(cx.debug_bounds("pane-0").is_none());
+        click(cx, "pane-maximize-2");
+        click(cx, "pane-close-3");
+        assert_eq!(panes(cx), 3);
+        assert!(cx.debug_bounds("pane-3").is_none());
     }
 }

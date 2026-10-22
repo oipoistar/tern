@@ -51,6 +51,11 @@ claude.ai account). Each item below names the artboard it comes from.
       in the vault file (version 3), started with a session when switched
       on and switched live while one is open; the screen shows a dot while
       a rule runs and the reason when it can't
+- [x] Split panes and broadcast (item 9): one to four panes per tab (single,
+      side by side, main plus stack, grid), each with its host, Maximize
+      and Close; an ink ring on the focused pane, on all of them while
+      Broadcast types (and runs snippets) into every pane; a toolbar with
+      the focused host and its latency trace
 
 ## Known gaps in what's built
 
@@ -64,14 +69,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 9. Split panes and broadcast (Terminal artboard)
-- Layouts: single, side by side, main plus stack, grid of four.
-- Focused pane: 2 px ink ring. Each pane header shows the host plus Maximize
-  and Close.
-- Broadcast button (ink while on) types into every pane; then every pane gets
-  the ring. Snippet chips go to every pane too while broadcasting.
-- The toolbar shows the focused host with its latency trace.
 
 ### 10. SFTP panel (Terminal artboard)
 - Uses the `russh-sftp` crate. A Remote / This computer switch; a path bar

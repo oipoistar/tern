@@ -63,6 +63,9 @@ pub enum TerminalEvent {
         forward: Forward,
         state: ForwardState,
     },
+    /// The user typed or pasted this into the shell, for broadcasting to
+    /// other panes.
+    Typed(Vec<u8>),
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -210,6 +213,33 @@ impl TerminalView {
     /// The saved host this session is, if it is one.
     pub fn host(&self) -> Option<&str> {
         self.connection.host.as_deref()
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// The saved host's name, or `user@host` for a typed destination.
+    pub fn label(&self) -> SharedString {
+        match &self.connection.host {
+            Some(host) => host.clone().into(),
+            None => {
+                let target = &self.connection.target;
+                format!("{}@{}", target.user, target.host).into()
+            }
+        }
+    }
+
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
+    /// Sends input the user gave this pane, and reports it for broadcast.
+    fn send_typed(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
+        self.send(bytes.clone());
+        cx.emit(TerminalEvent::Typed(bytes));
     }
 
     /// Starts or stops a port forwarding rule in the open session.
@@ -410,9 +440,7 @@ impl TerminalView {
                 if is_paste(keystroke) {
                     self.paste(cx);
                 } else if let Some(bytes) = encode_key(keystroke, *self.term.mode()) {
-                    self.term.scroll_display(Scroll::Bottom);
-                    self.term.selection = None;
-                    self.send(bytes);
+                    self.send_typed(bytes, cx);
                 } else {
                     return;
                 }
@@ -444,11 +472,7 @@ impl TerminalView {
     /// Text from the keyboard or an input method.
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         match &mut self.phase {
-            Phase::Live => {
-                self.term.scroll_display(Scroll::Bottom);
-                self.term.selection = None;
-                self.send(text.as_bytes().to_vec());
-            }
+            Phase::Live => self.send_typed(text.as_bytes().to_vec(), cx),
             Phase::Password { typed, .. } => typed.push_str(text),
             _ => return,
         }
@@ -467,9 +491,7 @@ impl TerminalView {
         } else {
             text
         };
-        self.term.scroll_display(Scroll::Bottom);
-        self.term.selection = None;
-        self.send(bytes.into_bytes());
+        self.send_typed(bytes.into_bytes(), cx);
     }
 
     /// The cell under `position` in the window, and which half of it.

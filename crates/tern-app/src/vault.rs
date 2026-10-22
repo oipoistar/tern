@@ -288,6 +288,11 @@ impl VaultContent {
         cx.notify();
     }
 
+    /// The trace of the saved host called `name`, for a session's toolbar.
+    pub fn host_trace(&self, name: &str) -> Option<Trace> {
+        self.vault.find(name).map(|host| self.trace(host))
+    }
+
     /// The trace for `host`, from the checks of its first hop.
     fn trace(&self, host: &Host) -> Trace {
         let place = self.vault.first_hop(host);
