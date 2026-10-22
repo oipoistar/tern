@@ -5,6 +5,7 @@ mod keychain;
 mod known_hosts;
 mod live;
 mod marks;
+mod snippets;
 mod terminal;
 mod theme;
 mod ui;

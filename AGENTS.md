@@ -46,10 +46,10 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
-key pairs (`keys.rs`), reading PuTTY's saved sessions (`putty.rs`) and
+key pairs (`keys.rs`), snippets (`snippet.rs`), reading PuTTY's saved sessions (`putty.rs`) and
 paths. `tern-app` is GPUI: `workspace.rs` is the window root (header, tabs,
 live layer), `vault.rs` is the vault tab (sidebar and the hosts screen),
-`keychain.rs` and `known_hosts.rs` are its other screens, `terminal.rs` is
+`keychain.rs`, `snippets.rs` and `known_hosts.rs` are its other screens, `terminal.rs` is
 a session, `host_editor.rs` is the dialog the vault opens over itself, and
 `marks.rs` draws the art and traces.
 `tern-devserver` is a local SSH server with a real shell for manual testing.

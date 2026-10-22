@@ -83,6 +83,7 @@ pub fn vault() -> Vault {
                 ],
             ),
         ],
+        snippets: Vec::new(),
     }
 }
 

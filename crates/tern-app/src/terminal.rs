@@ -67,6 +67,9 @@ pub struct TerminalView {
     grid: Rc<Cell<GridGeometry>>,
     /// A drag is extending the selection.
     selecting: bool,
+    /// Everything sent to the session, for tests to look at.
+    #[cfg(test)]
+    pub sent: RefCell<Vec<u8>>,
 }
 
 /// Where the grid sits in the window, as of the last paint.
@@ -108,6 +111,30 @@ impl TerminalView {
         view
     }
 
+    /// A live pane with no connection behind it, for tests.
+    #[cfg(test)]
+    pub fn offline(cx: &mut Context<Self>) -> Self {
+        let target = tern_core::ssh::Target {
+            host: "example".into(),
+            port: 22,
+            user: "me".into(),
+        };
+        let mut view = Self::idle(Connection::typed(target, None), cx);
+        view.on_session_event(Event::Connected, cx);
+        view
+    }
+
+    /// Types `bytes` into the shell, as if from the keyboard. Ignored
+    /// until the session is live.
+    pub fn type_text(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if let Phase::Live = self.phase {
+            self.term.scroll_display(Scroll::Bottom);
+            self.term.selection = None;
+            self.send(bytes);
+            cx.notify();
+        }
+    }
+
     /// A pane for `connection` that hasn't started connecting.
     fn idle(connection: Connection, cx: &mut Context<Self>) -> Self {
         let size = TermSize {
@@ -134,6 +161,8 @@ impl TerminalView {
             focus: cx.focus_handle(),
             grid: Rc::default(),
             selecting: false,
+            #[cfg(test)]
+            sent: RefCell::default(),
         }
     }
 
@@ -258,6 +287,8 @@ impl TerminalView {
     }
 
     fn send(&self, bytes: Vec<u8>) {
+        #[cfg(test)]
+        self.sent.borrow_mut().extend_from_slice(&bytes);
         if let Some(input) = &self.input {
             input.write(bytes);
         }

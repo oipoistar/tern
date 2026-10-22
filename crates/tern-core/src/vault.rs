@@ -1,4 +1,5 @@
-//! The saved hosts, in groups, and `vault.json`, the file they're kept in.
+//! The saved hosts, in groups, and snippets, and `vault.json`, the file
+//! they're kept in.
 //!
 //! The file holds no secrets (names, addresses, users and key-file paths,
 //! like `~/.ssh/config`); encrypting it belongs to sync. What checks observe
@@ -12,20 +13,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, HostGroup};
 use crate::reach::Place;
+use crate::snippet::{self, Snippet};
 use crate::ssh::{Connection, Jump};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Vault {
     pub groups: Vec<HostGroup>,
+    pub snippets: Vec<Snippet>,
 }
 
 impl Vault {
-    /// Sample hosts, for tests and screenshots.
+    /// Sample hosts and snippets, for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn sample() -> Self {
+        let snippet = |name: &str, command: &str| Snippet {
+            name: name.into(),
+            command: command.into(),
+        };
         Self {
             groups: crate::host::sample_groups(),
+            snippets: vec![
+                snippet("Disk space", "df -h"),
+                snippet("Follow syslog", "tail -f /var/log/syslog"),
+            ],
         }
+    }
+
+    /// Saves a snippet, replacing the one called `replacing` in place, after
+    /// the checks in [`snippet::check`].
+    pub fn save_snippet(&mut self, replacing: Option<&str>, typed: &Snippet) -> Result<(), String> {
+        let snippet = snippet::check(&self.snippets, replacing, typed)?;
+        match replacing.and_then(|old| self.snippets.iter().position(|s| s.name == old)) {
+            Some(index) => self.snippets[index] = snippet,
+            None => self.snippets.push(snippet),
+        }
+        Ok(())
+    }
+
+    pub fn delete_snippet(&mut self, name: &str) {
+        self.snippets.retain(|snippet| snippet.name != name);
     }
 
     pub fn hosts(&self) -> impl Iterator<Item = &Host> {
@@ -167,6 +193,7 @@ impl Vault {
         let mut json = serde_json::to_string_pretty(&FileOut {
             version: FILE_VERSION,
             groups: &self.groups,
+            snippets: &self.snippets,
         })?;
         json.push('\n');
         let mut temp = path.as_os_str().to_owned();
@@ -181,21 +208,25 @@ impl Vault {
 }
 
 /// The vault file's shape. Bump it when a change would make an older Tern
-/// misread the file; older versions then leave it alone instead of guessing.
-pub const FILE_VERSION: u32 = 1;
+/// misread the file (dropping something it doesn't know when it saves);
+/// older versions then leave it alone instead. 2 added snippets.
+pub const FILE_VERSION: u32 = 2;
 
 /// The vault file as written.
 #[derive(Serialize)]
 struct FileOut<'a> {
     version: u32,
     groups: &'a [HostGroup],
+    snippets: &'a [Snippet],
 }
 
-/// The vault file as read.
+/// The vault file as read, from any version up to [`FILE_VERSION`].
 #[derive(Deserialize)]
 struct FileIn {
     #[serde(default)]
     groups: Vec<HostGroup>,
+    #[serde(default)]
+    snippets: Vec<Snippet>,
 }
 
 /// Just the version, read first so a newer file isn't misread.
@@ -274,6 +305,7 @@ fn parse(text: &str) -> Result<Vault, Unusable> {
     let file: FileIn = serde_json::from_str(text).map_err(broken)?;
     Ok(Vault {
         groups: file.groups,
+        snippets: file.snippets,
     })
 }
 
@@ -448,7 +480,8 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());
 
@@ -467,6 +500,40 @@ mod tests {
         std::fs::write(&path, format!("\u{feff}{text}")).unwrap();
         let opened = open(&path);
         assert!(opened.notice.is_none() && opened.vault.find("bastion").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saves_and_deletes_snippets() {
+        let mut vault = Vault::sample();
+        let typed = |name: &str, command: &str| Snippet {
+            name: name.into(),
+            command: command.into(),
+        };
+        vault
+            .save_snippet(None, &typed(" Load ", "uptime"))
+            .unwrap();
+        assert_eq!(vault.snippets.last(), Some(&typed("Load", "uptime")));
+        assert!(vault.save_snippet(None, &typed("load", "w")).is_err());
+        vault
+            .save_snippet(Some("Disk space"), &typed("Disk", "df -h /"))
+            .unwrap();
+        assert_eq!(vault.snippets[0], typed("Disk", "df -h /"));
+        vault.delete_snippet("Disk");
+        assert_eq!(vault.snippets.len(), 2);
+    }
+
+    #[test]
+    fn a_version_1_file_still_opens() {
+        let dir = scratch("version-1");
+        let path = dir.join("vault.json");
+        let old = r#"{"version": 1, "groups": [{"name": "Lab", "hosts": [
+            {"name": "pi", "user": "pi", "address": "10.0.0.2", "port": 22}]}]}"#;
+        std::fs::write(&path, old).unwrap();
+        let opened = open(&path);
+        assert!(opened.notice.is_none());
+        assert_eq!(opened.vault.find("pi").map(|pi| pi.keep_alive), Some(true));
+        assert!(opened.vault.snippets.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

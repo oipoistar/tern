@@ -15,6 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
+use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 use tern_core::{keys, known_hosts};
@@ -25,6 +26,7 @@ use crate::keychain::{KeychainEvent, KeychainView};
 use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
+use crate::snippets::{SnippetEvent, SnippetsView};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{Ui, art_tile, button, group_heading, icon, search_field};
 
@@ -44,6 +46,7 @@ pub enum VaultEvent {
 pub enum Section {
     Hosts,
     Keychain,
+    Snippets,
     KnownHosts,
 }
 
@@ -53,7 +56,7 @@ impl Section {
     const SIDEBAR: [(IconName, &'static str, Option<Section>); 6] = [
         (IconName::Server, "Hosts", Some(Section::Hosts)),
         (IconName::KeyRound, "Keychain", Some(Section::Keychain)),
-        (IconName::CodeXml, "Snippets", None),
+        (IconName::CodeXml, "Snippets", Some(Section::Snippets)),
         (IconName::ArrowLeftRight, "Port forwarding", None),
         (
             IconName::ShieldCheck,
@@ -72,6 +75,7 @@ pub struct VaultContent {
     section: Section,
     /// Screens, made when first shown.
     keychain: Option<Entity<KeychainView>>,
+    snippets: Option<Entity<SnippetsView>>,
     known_hosts: Option<Entity<KnownHostsView>>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
@@ -154,6 +158,18 @@ impl VaultContent {
                     self.keychain = Some(view);
                 }
             },
+            Section::Snippets => {
+                if self.snippets.is_none() {
+                    let saved = self.vault.snippets.clone();
+                    let view = cx.new(|cx| SnippetsView::new(saved, window, cx));
+                    self._screen_events.push(cx.subscribe_in(
+                        &view,
+                        window,
+                        Self::on_snippet_event,
+                    ));
+                    self.snippets = Some(view);
+                }
+            }
             Section::KnownHosts => match &self.known_hosts {
                 Some(view) => view.update(cx, |view, cx| view.refresh(cx)),
                 None => {
@@ -261,6 +277,7 @@ impl VaultContent {
         let mut content = Self {
             section: Section::Hosts,
             keychain: None,
+            snippets: None,
             known_hosts: None,
             vault,
             file,
@@ -344,6 +361,44 @@ impl VaultContent {
         self.search
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.emit(VaultEvent::Connect(connection));
+    }
+
+    /// The saved snippets, for a session's snippet bar.
+    pub fn snippets(&self) -> &[Snippet] {
+        &self.vault.snippets
+    }
+
+    /// Shows the Snippets screen with the form open on a new snippet.
+    pub fn new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(Section::Snippets, window, cx);
+        if let Some(view) = &self.snippets {
+            view.update(cx, |view, cx| view.open_form(None, window, cx));
+        }
+    }
+
+    fn on_snippet_event(
+        &mut self,
+        view: &Entity<SnippetsView>,
+        event: &SnippetEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SnippetEvent::Save { replacing, snippet } => {
+                if self
+                    .vault
+                    .save_snippet(replacing.as_deref(), snippet)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            SnippetEvent::Delete(name) => self.vault.delete_snippet(name),
+        }
+        self.persist();
+        let saved = self.vault.snippets.clone();
+        view.update(cx, |view, cx| view.refresh(saved, cx));
+        cx.notify();
     }
 
     /// Opens a session on `host` that adds `public` to its
@@ -701,6 +756,7 @@ impl Render for VaultContent {
         let screen: Option<AnyView> = match self.section {
             Section::Hosts => None,
             Section::Keychain => self.keychain.clone().map(Into::into),
+            Section::Snippets => self.snippets.clone().map(Into::into),
             Section::KnownHosts => self.known_hosts.clone().map(Into::into),
         };
         div()
@@ -1011,11 +1067,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_snippets_screen_adds_edits_and_deletes(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        let type_into = |cx: &mut VisualTestContext, first: bool, text: &str| {
+            cx.update(|window, cx| {
+                let view = vault.read(cx).snippets.clone().expect("the screen is open");
+                let input = view.read(cx).input(first);
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            });
+            cx.simulate_input(text);
+        };
+        let names = |cx: &mut VisualTestContext| {
+            vault.read_with(cx, |vault, _| {
+                vault
+                    .snippets()
+                    .iter()
+                    .map(|snippet| snippet.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        click(cx, "nav-snippets");
+        click(cx, "new-snippet-screen");
+        type_into(cx, true, "Load");
+        type_into(cx, false, "uptime");
+        click(cx, "save-snippet");
+        assert_eq!(names(cx), ["Disk space", "Follow syslog", "Load"]);
+
+        // A clashing name keeps the form open.
+        click(cx, "snippet-row-2");
+        type_into(cx, true, "disk space");
+        click(cx, "save-snippet");
+        assert_eq!(names(cx), ["Disk space", "Follow syslog", "Load"]);
+        type_into(cx, true, "Uptime");
+        click(cx, "save-snippet");
+        assert_eq!(names(cx), ["Disk space", "Follow syslog", "Uptime"]);
+
+        click(cx, "snippet-row-0");
+        click(cx, "delete-snippet");
+        assert_eq!(names(cx), ["Follow syslog", "Uptime"]);
+    }
+
+    #[gpui::test]
     fn the_sidebar_switches_screens(cx: &mut TestAppContext) {
         let (_, cx, _) = open_vault(cx);
         assert!(cx.debug_bounds("host-bastion").is_some());
         // Screens not built yet do nothing.
-        click(cx, "nav-history");
+        click(cx, "nav-port-forwarding");
         assert!(cx.debug_bounds("host-bastion").is_some());
 
         click(cx, "nav-known-hosts");

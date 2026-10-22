@@ -1,5 +1,6 @@
 //! The window's root: a header with tabs, the active screen (vault or a
-//! terminal session), and the live layer painted over it.
+//! terminal session, with its snippet bar), and the live layer painted over
+//! it.
 //!
 //! Screens are cached views; only this thin root re-renders each animation
 //! frame, so the latency traces can move without redrawing the screens.
@@ -15,7 +16,7 @@ use crate::bench;
 use crate::live::{LiveSlots, live_layer};
 use crate::terminal::{Phase, TerminalView};
 use crate::theme::{self, Theme};
-use crate::ui::{icon, status_dot, tern_mark};
+use crate::ui::{button, icon, status_dot, tern_mark};
 use crate::vault::{VaultContent, VaultEvent};
 
 /// Latency traces scroll slowly, so 20 fps is plenty; nothing else animates.
@@ -37,6 +38,38 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let live = LiveSlots::default();
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
+        let mut workspace = Self::with(vault, live, window, cx);
+        // `tern --connect "ssh -p 2222 user@host"` opens a session at startup.
+        let mut args = std::env::args()
+            .skip_while(|arg| arg != "--connect")
+            .skip(1);
+        if let Some(command) = args.next() {
+            match parse_command(&command) {
+                Ok((target, identity)) => {
+                    workspace.open_session(Connection::typed(target, identity), window, cx)
+                }
+                Err(error) => eprintln!("--connect: {error}"),
+            }
+        }
+        // `tern --edit [host]` opens the host editor (a new host without a
+        // name), for screenshots and checks.
+        let mut args = std::env::args().skip_while(|arg| arg != "--edit");
+        if args.next().is_some() {
+            let host = args.next().filter(|arg| !arg.starts_with("--"));
+            workspace
+                .vault
+                .update(cx, |vault, cx| vault.open_editor(host, window, cx));
+        }
+        workspace
+    }
+
+    /// A window around `vault`, whose live marks register in `live`.
+    fn with(
+        vault: Entity<VaultContent>,
+        live: LiveSlots,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let connect =
             cx.subscribe_in(
                 &vault,
@@ -64,7 +97,7 @@ impl Workspace {
                 }
             }
         });
-        let mut workspace = Self {
+        Self {
             vault,
             sessions: Vec::new(),
             active: None,
@@ -72,29 +105,7 @@ impl Workspace {
             started: Instant::now(),
             _ticker: ticker,
             _subscriptions: vec![connect],
-        };
-        // `tern --connect "ssh -p 2222 user@host"` opens a session at startup.
-        let mut args = std::env::args()
-            .skip_while(|arg| arg != "--connect")
-            .skip(1);
-        if let Some(command) = args.next() {
-            match parse_command(&command) {
-                Ok((target, identity)) => {
-                    workspace.open_session(Connection::typed(target, identity), window, cx)
-                }
-                Err(error) => eprintln!("--connect: {error}"),
-            }
         }
-        // `tern --edit [host]` opens the host editor (a new host without a
-        // name), for screenshots and checks.
-        let mut args = std::env::args().skip_while(|arg| arg != "--edit");
-        if args.next().is_some() {
-            let host = args.next().filter(|arg| !arg.starts_with("--"));
-            workspace
-                .vault
-                .update(cx, |vault, cx| vault.open_editor(host, window, cx));
-        }
-        workspace
     }
 
     fn open_session(
@@ -104,6 +115,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let terminal = cx.new(|cx| TerminalView::new(connection, cx));
+        self.add_session(terminal, window, cx);
+    }
+
+    /// Adds a tab for `terminal` and shows it.
+    fn add_session(
+        &mut self,
+        terminal: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Tabs show each session's state and title.
         self._subscriptions
             .push(cx.observe(&terminal, |_, _, cx| cx.notify()));
@@ -129,6 +150,69 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// Types a saved snippet into the session on screen.
+    fn run_snippet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(active), Some(snippet)) = (
+            self.active,
+            self.vault.read(cx).snippets().get(index).cloned(),
+        ) else {
+            return;
+        };
+        self.sessions[active].update(cx, |terminal, cx| {
+            terminal.type_text(snippet.keystrokes(), cx);
+            terminal.focus(window, cx);
+        });
+    }
+
+    /// Goes to the vault's Snippets screen with a new snippet's form open.
+    fn new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(None, window, cx);
+        self.vault
+            .update(cx, |vault, cx| vault.new_snippet(window, cx));
+    }
+
+    /// Under the terminal: a chip per snippet, then a dashed one to add
+    /// another.
+    fn snippet_bar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let names: Vec<String> = self
+            .vault
+            .read(cx)
+            .snippets()
+            .iter()
+            .map(|snippet| snippet.name.clone())
+            .collect();
+        div()
+            .pt(px(12.))
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .children(names.into_iter().enumerate().map(|(index, name)| {
+                let id = format!("snippet-{index}");
+                button(SharedString::from(id.clone()), theme)
+                    .debug_selector(move || id)
+                    .h(px(32.))
+                    .rounded(px(10.))
+                    .child(name)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.run_snippet(index, window, cx)),
+                    )
+            }))
+            .child(
+                button("new-snippet", theme)
+                    .debug_selector(|| "new-snippet".into())
+                    .h(px(32.))
+                    .rounded(px(10.))
+                    .border_dashed()
+                    .border_color(theme.text3.opacity(0.5))
+                    .bg(transparent_black())
+                    .shadow(Vec::new())
+                    .text_color(theme.text2)
+                    .child(icon(IconName::Plus, 13., theme.text2))
+                    .child("New snippet")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_snippet(window, cx))),
+            )
     }
 
     fn close_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -309,7 +393,15 @@ impl Render for Workspace {
             Some(index) => div()
                 .size_full()
                 .p(px(16.))
-                .child(self.sessions[index].clone().cached(cached))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.sessions[index].clone().cached(cached)),
+                )
+                .child(self.snippet_bar(&theme, cx))
                 .into_any_element(),
         };
         div()
@@ -323,5 +415,52 @@ impl Render for Workspace {
             .child(self.header(&theme, cx))
             .child(div().flex_1().min_h_0().child(body))
             .child(live_layer(&self.live, time))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::AppContext as _;
+    use tern_core::Vault;
+
+    use super::Workspace;
+    use crate::live::LiveSlots;
+    use crate::terminal::TerminalView;
+    use crate::vault::VaultContent;
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("nothing on screen is tagged {selector}"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_snippet_bar_types_into_the_session(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let live = LiveSlots::default();
+            let vault =
+                cx.new(|cx| VaultContent::new(Vault::sample(), None, live.clone(), window, cx));
+            let mut workspace = Workspace::with(vault, live, window, cx);
+            let terminal = cx.new(TerminalView::offline);
+            workspace.add_session(terminal, window, cx);
+            workspace
+        });
+
+        click(cx, "snippet-0");
+        let sent = workspace.read_with(cx, |workspace, cx| {
+            workspace.sessions[0].read(cx).sent.borrow().clone()
+        });
+        assert_eq!(sent, b"df -h\r");
+
+        // New snippet goes to the vault's Snippets screen, form open.
+        click(cx, "new-snippet");
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
+        assert!(cx.debug_bounds("save-snippet").is_some());
     }
 }

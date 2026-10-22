@@ -9,6 +9,7 @@ pub mod paths;
 pub mod putty;
 pub mod randomart;
 pub mod reach;
+pub mod snippet;
 pub mod ssh;
 pub mod vault;
 

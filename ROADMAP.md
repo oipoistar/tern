@@ -41,6 +41,9 @@ claude.ai account). Each item below names the artboard it comes from.
       public key and Copy, fingerprint and the hosts that use it; Generate
       (Ed25519, optional passphrase), Import, Export, Delete (Tern's keys,
       two clicks) and Install on a host (`ssh-copy-id` in a session)
+- [x] Snippets (item 6): saved commands in the vault file (version 2), a
+      screen to add, edit and delete them, and a bar under each session
+      whose chips type a command and Enter, with a dashed New snippet
 
 ## Known gaps in what's built
 
@@ -54,14 +57,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 6. Snippets (sidebar "Snippets"; Terminal artboard bar)
-- Saved commands: a name and the command. A screen to add, edit and delete
-  them.
-- In a session, a bar under the terminal: snippet chips plus a dashed
-  "New snippet". Clicking sends the command and Enter to the focused pane, or
-  to every pane while broadcasting (item 9).
-- Saved in the vault file. They sync with item 14.
 
 ### 7. History (sidebar "History")
 - Recent connections: host, when, how long, how it ended. Reconnect in one
@@ -80,7 +75,7 @@ claude.ai account). Each item below names the artboard it comes from.
 - Focused pane: 2 px ink ring. Each pane header shows the host plus Maximize
   and Close.
 - Broadcast button (ink while on) types into every pane; then every pane gets
-  the ring.
+  the ring. Snippet chips go to every pane too while broadcasting.
 - The toolbar shows the focused host with its latency trace.
 
 ### 10. SFTP panel (Terminal artboard)
