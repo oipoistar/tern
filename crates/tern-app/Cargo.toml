@@ -12,3 +12,10 @@ path = "src/main.rs"
 tern-core.workspace = true
 gpui-kit.workspace = true
 alacritty_terminal = "0.26"
+
+[dev-dependencies]
+# Headless UI tests use GPUI's own test support, from the exact GPUI build
+# gpui-kit pins. (gpui-kit's `test-support` also pulls the separate GPUI Fast
+# stack, whose version pins conflict with this one.) Named `gpui` because
+# GPUI's test macro expands to `gpui::` paths.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }

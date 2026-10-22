@@ -40,6 +40,23 @@ impl Host {
         }
     }
 
+    /// Whether a search query matches this host. Each whitespace-separated
+    /// term must appear (case-insensitively) in the name, `user@address` or
+    /// a tag; an empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let haystack = format!(
+            "{} {}@{} {}",
+            self.name,
+            self.user,
+            self.address,
+            self.tags.join(" ")
+        )
+        .to_lowercase();
+        query
+            .split_whitespace()
+            .all(|term| haystack.contains(&term.to_lowercase()))
+    }
+
     /// Two-letter monogram for the host tile, taken from the name's parts.
     pub fn monogram(&self) -> String {
         let pick = self
@@ -175,5 +192,16 @@ mod tests {
         assert_eq!(host("prod-db-01", 22).monogram(), "DB");
         assert_eq!(host("bastion", 22).monogram(), "BA");
         assert_eq!(host("pi-homelab", 22).monogram(), "HO");
+    }
+
+    #[test]
+    fn matches_every_term_anywhere() {
+        let mut db = host("prod-db-01", 22);
+        db.tags = vec!["postgres".into(), "eu-west".into()];
+        assert!(db.matches(""));
+        assert!(db.matches("DB"));
+        assert!(db.matches("deploy@10.0"));
+        assert!(db.matches("postgres eu"));
+        assert!(!db.matches("postgres us"));
     }
 }

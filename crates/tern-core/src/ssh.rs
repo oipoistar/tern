@@ -483,6 +483,16 @@ pub fn default_credentials() -> Vec<Credential> {
     credentials
 }
 
+/// The destination in text typed into search, if it is one: an `ssh …`
+/// command or anything with `user@`. Plain words stay searches.
+pub fn quick_destination(input: &str) -> Option<(Target, Option<PathBuf>)> {
+    let input = input.trim();
+    if !(input.starts_with("ssh ") || input.contains('@')) {
+        return None;
+    }
+    parse_command(input).ok()
+}
+
 /// Parses a pasted `ssh` command or bare `user@host[:port]`. Understands
 /// `-p port`, `-l user` and `-i keyfile`; ignores other flags.
 pub fn parse_command(input: &str) -> Result<(Target, Option<PathBuf>)> {
@@ -529,12 +539,15 @@ pub fn parse_command(input: &str) -> Result<(Target, Option<PathBuf>)> {
     let user = user
         .or(login)
         .or_else(|| std::env::var("USER").ok())
-        .or_else(|| std::env::var("USERNAME").ok());
+        .or_else(|| std::env::var("USERNAME").ok())
+        .filter(|user| !user.is_empty())
+        .context("no user given")?;
+    anyhow::ensure!(!host.is_empty(), "no host given");
     Ok((
         Target {
             host,
             port: port.or(inline_port).unwrap_or(22),
-            user: user.context("no user given")?,
+            user,
         },
         key,
     ))
@@ -589,5 +602,20 @@ mod tests {
     #[test]
     fn rejects_remote_commands() {
         assert!(parse_command("ssh host uptime").is_err());
+    }
+
+    #[test]
+    fn quick_destination_only_for_destinations() {
+        assert!(quick_destination("prod").is_none());
+        assert!(quick_destination("postgres eu-west").is_none());
+        assert!(quick_destination("deploy@").is_none());
+        let (target, _) = quick_destination(" deploy@10.0.4.21:2200 ").unwrap();
+        assert_eq!((target.user.as_str(), target.port), ("deploy", 2200));
+        let (target, key) = quick_destination("ssh -i k -l pi homelab").unwrap();
+        assert_eq!(
+            (target.user.as_str(), target.host.as_str()),
+            ("pi", "homelab")
+        );
+        assert_eq!(key, Some(PathBuf::from("k")));
     }
 }

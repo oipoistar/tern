@@ -9,7 +9,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::host::sample_groups;
-use tern_core::ssh::{Target, parse_command};
+use tern_core::ssh::{Target, quick_destination};
 use tern_core::{Host, HostGroup, HostStatus};
 
 use crate::glass::GlassSlots;
@@ -33,30 +33,37 @@ pub struct VaultContent {
     groups: Vec<HostGroup>,
     selected: String,
     slots: GlassSlots,
-    quick: Entity<InputState>,
-    quick_error: Option<SharedString>,
+    search: Entity<InputState>,
+    query: SharedString,
+    /// Set when the search text is itself an SSH destination.
+    destination: Option<(Target, Option<PathBuf>)>,
     _subscription: Subscription,
 }
 
 impl VaultContent {
     pub fn new(slots: GlassSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let quick = cx.new(|cx| InputState::new(window, cx).placeholder("Search or ssh user@host"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe_in(
-            &quick,
+            &search,
             window,
-            |this, quick, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = event {
-                    let text = quick.read(cx).value();
-                    match parse_command(&text) {
-                        Ok((target, identity)) => {
-                            this.quick_error = None;
-                            quick.update(cx, |state, cx| state.set_value("", window, cx));
-                            cx.emit(VaultEvent::Connect { target, identity });
-                        }
-                        Err(error) => this.quick_error = Some(error.to_string().into()),
-                    }
+            |this, search, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.query = search.read(cx).value();
+                    this.destination = quick_destination(&this.query);
                     cx.notify();
                 }
+                // A typed destination wins; otherwise open the first match.
+                InputEvent::PressEnter { .. } => {
+                    let next = this.destination.clone().or_else(|| {
+                        this.matching_hosts()
+                            .next()
+                            .map(|host| (host.ssh_target(), host.identity.clone()))
+                    });
+                    if let Some((target, identity)) = next {
+                        this.connect(target, identity, window, cx);
+                    }
+                }
+                _ => {}
             },
         );
 
@@ -69,10 +76,33 @@ impl VaultContent {
             groups,
             selected,
             slots,
-            quick,
-            quick_error: None,
+            search,
+            query: SharedString::default(),
+            destination: None,
             _subscription: subscription,
         }
+    }
+
+    /// Hosts the search matches, in vault order; none while search is empty,
+    /// so Enter on an empty field does nothing.
+    fn matching_hosts(&self) -> impl Iterator<Item = &Host> {
+        let searching = !self.query.trim().is_empty();
+        self.groups
+            .iter()
+            .flat_map(|group| &group.hosts)
+            .filter(move |host| searching && host.matches(&self.query))
+    }
+
+    fn connect(
+        &mut self,
+        target: Target,
+        identity: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.emit(VaultEvent::Connect { target, identity });
     }
 
     fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
@@ -87,106 +117,154 @@ impl VaultContent {
             .flex_col()
             .gap(px(22.))
             .child(self.toolbar(ui))
-            .children(self.groups.iter().map(|group| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .px(px(4.))
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(group.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(14.))
-                            .children(group.hosts.iter().map(|host| {
+            .when_some(self.destination.clone(), |d, (target, identity)| {
+                d.child(self.destination_card(target, identity, ui, cx))
+            })
+            .children(self.groups.iter().filter_map(|group| {
+                let hosts: Vec<&Host> = group
+                    .hosts
+                    .iter()
+                    .filter(|host| host.matches(&self.query))
+                    .collect();
+                if hosts.is_empty() {
+                    return None;
+                }
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .px(px(4.))
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(group.name.clone()),
+                        )
+                        .child(div().flex().flex_wrap().gap(px(14.)).children(
+                            hosts.into_iter().map(|host| {
                                 seed += 1.37;
                                 self.host_card(host, ui, seed, cx)
-                            })),
-                    )
+                            }),
+                        )),
+                )
             }))
+    }
+
+    /// The typed destination, shaped like a host card so it reads as one.
+    fn destination_card(
+        &self,
+        target: Target,
+        identity: Option<PathBuf>,
+        ui: &Ui,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = ui.theme;
+        let label = format!("{}@{}:{}", target.user, target.host, target.port);
+        div()
+            .id("destination")
+            .w(px(268.))
+            .p(px(14.))
+            .rounded(px(22.))
+            .bg(theme.card)
+            .shadow(theme.selected_shadow())
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.connect(target.clone(), identity.clone(), window, cx);
+            }))
+            .child(ui.glass(
+                "destination-tile",
+                Tone::Brand,
+                Milk::Regular,
+                14.,
+                theme.card,
+                1.9,
+                {
+                    let color = theme.glass_text;
+                    move || {
+                        div()
+                            .size(px(44.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(IconName::SquareTerminal, 20., color))
+                    }
+                },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family(MONO)
+                    .text_size(px(13.))
+                    .truncate()
+                    .child(label),
+            )
     }
 
     fn toolbar(&self, ui: &Ui) -> impl IntoElement {
         let theme = ui.theme;
         div()
             .flex()
-            .flex_col()
-            .gap(px(6.))
+            .items_center()
+            .gap(px(12.))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(46.))
+                    .pl(px(10.))
+                    .pr(px(4.))
                     .flex()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(px(10.))
+                    .rounded(px(16.))
+                    .bg(theme.card2)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .h(px(46.))
-                            .pl(px(10.))
-                            .pr(px(4.))
+                            .child(Input::new(&self.search).id("search").appearance(false)),
+                    )
+                    .child(
+                        div()
+                            .size(px(38.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme.card)
+                            .shadow(theme.shadow_sm())
                             .flex()
                             .items_center()
-                            .gap(px(10.))
-                            .rounded(px(16.))
-                            .bg(theme.card2)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&self.quick).appearance(false)),
-                            )
-                            .child(
-                                div()
-                                    .size(px(38.))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .bg(theme.card)
-                                    .shadow(theme.shadow_sm())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(icon(IconName::Search, 17., theme.text2)),
-                            ),
-                    )
-                    .child(ui.glass(
-                        "new-host",
-                        Tone::Brand,
-                        Milk::Regular,
-                        16.,
-                        theme.win,
-                        0.7,
-                        {
-                            let color = theme.glass_text;
-                            move || {
-                                div()
-                                    .h(px(46.))
-                                    .px(px(20.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(icon(IconName::Plus, 16., color))
-                                    .child("New host")
-                            }
-                        },
-                    )),
+                            .justify_center()
+                            .child(icon(IconName::Search, 17., theme.text2)),
+                    ),
             )
-            .when_some(self.quick_error.clone(), |d, error| {
-                d.child(
-                    div()
-                        .px(px(12.))
-                        .text_size(px(12.))
-                        .text_color(theme.danger)
-                        .child(error),
-                )
-            })
+            .child(ui.glass(
+                "new-host",
+                Tone::Brand,
+                Milk::Regular,
+                16.,
+                theme.win,
+                0.7,
+                {
+                    let color = theme.glass_text;
+                    move || {
+                        div()
+                            .h(px(46.))
+                            .px(px(20.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(icon(IconName::Plus, 16., color))
+                            .child("New host")
+                    }
+                },
+            ))
     }
 
     fn host_card(&self, host: &Host, ui: &Ui, seed: f32, cx: &Context<Self>) -> impl IntoElement {
@@ -456,5 +534,70 @@ fn status_chip(ui: &Ui, id: String, status: HostStatus, seed: f32) -> AnyElement
         .bg(theme.card2)
         .text_color(theme.text2)
         .into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+    use tern_core::ssh::Target;
+
+    use super::{VaultContent, VaultEvent};
+    use crate::glass::GlassSlots;
+
+    #[gpui::test]
+    fn search_filters_hosts_and_connects_to_a_typed_destination(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (vault, cx) =
+            cx.add_window_view(|window, cx| VaultContent::new(GlassSlots::default(), window, cx));
+        let connects: Rc<RefCell<Vec<Target>>> = Rc::default();
+        let _subscription = cx.update(|_, cx| {
+            let connects = connects.clone();
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                let VaultEvent::Connect { target, .. } = event;
+                connects.borrow_mut().push(target.clone());
+            })
+        });
+        let focus_search = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let search = vault.read(cx).search.clone();
+                search.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+        };
+
+        // Words filter the hosts; nothing to connect to yet.
+        focus_search(cx);
+        cx.simulate_input("postgres");
+        vault.read_with(cx, |vault, _| {
+            let names: Vec<&str> = vault
+                .matching_hosts()
+                .map(|host| host.name.as_str())
+                .collect();
+            assert_eq!(names, ["prod-db-01"]);
+            assert!(vault.destination.is_none());
+        });
+
+        // Enter opens the first match.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            connects.borrow().last().map(|target| target.host.clone()),
+            Some("10.0.4.21".into())
+        );
+
+        // A destination is offered as it is, and Enter connects to it.
+        focus_search(cx);
+        cx.simulate_input("deploy@10.0.4.21:2200");
+        vault.read_with(cx, |vault, _| assert!(vault.destination.is_some()));
+        cx.simulate_keystrokes("enter");
+        let target = connects.borrow().last().cloned().expect("a connect event");
+        assert_eq!((target.user.as_str(), target.port), ("deploy", 2200));
+        vault.read_with(cx, |vault, cx| {
+            assert!(vault.search.read(cx).value().is_empty())
+        });
     }
 }
