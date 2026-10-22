@@ -36,6 +36,11 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Known hosts screen (item 4): every trusted key with its art, hosts,
       type and fingerprint, searchable; hashed OpenSSH names show as hashed;
       Tern's keys can be forgotten, OpenSSH's are read only
+- [x] Keychain screen (item 5): key cards from `~/.ssh` (read only) and
+      Tern's own folder, weak and hardware keys marked; details with the
+      public key and Copy, fingerprint and the hosts that use it; Generate
+      (Ed25519, optional passphrase), Import, Export, Delete (Tern's keys,
+      two clicks) and Install on a host (`ssh-copy-id` in a session)
 
 ## Known gaps in what's built
 
@@ -44,23 +49,11 @@ claude.ai account). Each item below names the artboard it comes from.
 
 ## Next, in order
 
-### 5. Keychain screen (sidebar "Keychain"; Keychain artboard)
-- Key cards: art, name, type. The selected card is inverted. A "Hardware key"
-  glyph for `sk-*` keys; "Weak, replace" in `danger` for RSA under 3072 bits
-  and DSA.
-- Details panel:
-  - art, name, type;
-  - the public key in a terminal-ink block, with Copy;
-  - fingerprint;
-  - hosts that use the key, from `Auth::Key`, as mono text joined by " / ";
-  - "Include in encrypted sync" switch (item 14);
-  - Install on a host (append to `authorized_keys` over a session, like
-    `ssh-copy-id`), Export, Delete key.
-- Toolbar: search, a Keys / Identities switch, Import (dashed), and an ink
-  Generate key button that makes Ed25519 keys with an optional passphrase.
-- Sources: the keys in `~/.ssh` (read; never moved), plus keys Tern generates
-  in its data folder.
-- Identities (a user plus a key, reused by hosts) can come later.
+### 5b. Keychain, later
+- Identities (a user plus a key, reused by hosts), with a Keys / Identities
+  switch in the Keychain toolbar.
+- The "Include in encrypted sync" switch in a key's details comes with sync
+  (item 14).
 
 ### 6. Snippets (sidebar "Snippets"; Terminal artboard bar)
 - Saved commands: a name and the command. A screen to add, edit and delete

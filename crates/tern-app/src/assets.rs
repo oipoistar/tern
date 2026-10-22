@@ -12,6 +12,7 @@ gpui_kit::assets::icon_assets!(
         Clock,
         Cloud,
         CodeXml,
+        Download,
         Funnel,
         Import,
         KeyRound,
@@ -24,6 +25,8 @@ gpui_kit::assets::icon_assets!(
         Shield,
         ShieldCheck,
         Trash,
+        Upload,
+        Usb,
         Zap
     ]
 );

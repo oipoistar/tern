@@ -29,10 +29,24 @@ pub fn vault() -> PathBuf {
     data_dir().join("vault.json")
 }
 
+/// Key pairs Tern generated or imported.
+pub fn keys() -> PathBuf {
+    data_dir().join("keys")
+}
+
 /// Host keys the user accepted in Tern. Kept apart from `~/.ssh/known_hosts`,
 /// which Tern reads but never writes.
 pub fn known_hosts() -> PathBuf {
     data_dir().join("known_hosts")
+}
+
+/// OpenSSH's per-user folder, `~/.ssh`, whose keys the Keychain lists.
+/// `TERN_SSH_DIR` overrides it so checks never show the developer's keys.
+pub fn ssh_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TERN_SSH_DIR") {
+        return Some(dir.into());
+    }
+    std::env::home_dir().map(|home| home.join(".ssh"))
 }
 
 /// OpenSSH's per-user known hosts file. `TERN_SYSTEM_KNOWN_HOSTS` overrides

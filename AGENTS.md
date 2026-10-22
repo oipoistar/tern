@@ -46,11 +46,12 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
-reading PuTTY's saved sessions (`putty.rs`) and paths. `tern-app` is GPUI:
-`workspace.rs` is the window root (header, tabs, live layer), `vault.rs` is
-the vault tab (sidebar and the hosts screen) and `known_hosts.rs` another
-of its screens, `terminal.rs` is a session, `host_editor.rs` is the dialog
-the vault opens over itself, and `marks.rs` draws the art and traces.
+key pairs (`keys.rs`), reading PuTTY's saved sessions (`putty.rs`) and
+paths. `tern-app` is GPUI: `workspace.rs` is the window root (header, tabs,
+live layer), `vault.rs` is the vault tab (sidebar and the hosts screen),
+`keychain.rs` and `known_hosts.rs` are its other screens, `terminal.rs` is
+a session, `host_editor.rs` is the dialog the vault opens over itself, and
+`marks.rs` draws the art and traces.
 `tern-devserver` is a local SSH server with a real shell for manual testing.
 
 Rules live in tern-core with unit tests (what a draft needs, what a saved
@@ -88,6 +89,7 @@ at startup, for looking at it without clicking.
   showing output; a real terminal (alacritty_terminal) answers it.
 - **Host keys:** `~/.ssh/known_hosts` is read only. Trusted keys go to Tern's
   own file in its data folder. `TERN_DATA_DIR` and `TERN_SYSTEM_KNOWN_HOSTS`
-  redirect both for tests.
+  redirect both for tests, and `TERN_SSH_DIR` the `~/.ssh` the Keychain
+  lists, so a check never shows your own keys.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.

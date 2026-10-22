@@ -3,6 +3,7 @@
 
 pub mod draft;
 pub mod host;
+pub mod keys;
 pub mod known_hosts;
 pub mod paths;
 pub mod putty;

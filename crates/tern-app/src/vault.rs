@@ -13,14 +13,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tern_core::known_hosts;
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
+use tern_core::{keys, known_hosts};
 
 use crate::bench;
 use crate::host_editor::{EditorEvent, HostEditor};
+use crate::keychain::{KeychainEvent, KeychainView};
 use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
@@ -42,6 +43,7 @@ pub enum VaultEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Hosts,
+    Keychain,
     KnownHosts,
 }
 
@@ -50,7 +52,7 @@ impl Section {
     /// they open (`None` for screens not built yet).
     const SIDEBAR: [(IconName, &'static str, Option<Section>); 6] = [
         (IconName::Server, "Hosts", Some(Section::Hosts)),
-        (IconName::KeyRound, "Keychain", None),
+        (IconName::KeyRound, "Keychain", Some(Section::Keychain)),
         (IconName::CodeXml, "Snippets", None),
         (IconName::ArrowLeftRight, "Port forwarding", None),
         (
@@ -68,7 +70,8 @@ impl EventEmitter<VaultEvent> for VaultContent {}
 /// screen it picked.
 pub struct VaultContent {
     section: Section,
-    /// Made when first shown.
+    /// Screens, made when first shown.
+    keychain: Option<Entity<KeychainView>>,
     known_hosts: Option<Entity<KnownHostsView>>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
@@ -96,6 +99,7 @@ pub struct VaultContent {
     _checks: Option<Task<()>>,
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
+    _screen_events: Vec<Subscription>,
 }
 
 impl VaultContent {
@@ -130,6 +134,26 @@ impl VaultContent {
         self.section = section;
         match section {
             Section::Hosts => self.refresh_keys(),
+            Section::Keychain => match &self.keychain {
+                Some(view) => {
+                    let vault = self.vault.clone();
+                    view.update(cx, |view, cx| view.refresh(vault, cx));
+                }
+                None => {
+                    let (dirs, vault) = (keys::dirs(), self.vault.clone());
+                    let view = cx.new(|cx| KeychainView::new(dirs, vault, window, cx));
+                    self._screen_events.push(cx.subscribe_in(
+                        &view,
+                        window,
+                        |this, _, event: &KeychainEvent, window, cx| match event {
+                            KeychainEvent::Install { host, public } => {
+                                this.install_key(host, public, window, cx)
+                            }
+                        },
+                    ));
+                    self.keychain = Some(view);
+                }
+            },
             Section::KnownHosts => match &self.known_hosts {
                 Some(view) => view.update(cx, |view, cx| view.refresh(cx)),
                 None => {
@@ -236,6 +260,7 @@ impl VaultContent {
             .unwrap_or_default();
         let mut content = Self {
             section: Section::Hosts,
+            keychain: None,
             known_hosts: None,
             vault,
             file,
@@ -253,6 +278,7 @@ impl VaultContent {
             _checks: None,
             _subscription: subscription,
             _editor_events: None,
+            _screen_events: Vec::new(),
         };
         content.refresh_keys();
         content.putty = putty::importable_here(&content.vault);
@@ -318,6 +344,25 @@ impl VaultContent {
         self.search
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.emit(VaultEvent::Connect(connection));
+    }
+
+    /// Opens a session on `host` that adds `public` to its
+    /// `authorized_keys`, as `ssh-copy-id` does, so the session's own
+    /// prompts (trust, password) apply and its output shows.
+    fn install_key(
+        &mut self,
+        host: &str,
+        public: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(saved) = self.vault.find(host) else {
+            return;
+        };
+        if let Ok(mut connection) = self.vault.connection(saved) {
+            connection.on_login = Some(keys::install_command(public));
+            self.connect(connection, window, cx);
+        }
     }
 
     /// Connects to a saved host. If its settings can't work (its jump host
@@ -653,6 +698,11 @@ impl Render for VaultContent {
             theme: &theme,
             live: &self.live,
         };
+        let screen: Option<AnyView> = match self.section {
+            Section::Hosts => None,
+            Section::Keychain => self.keychain.clone().map(Into::into),
+            Section::KnownHosts => self.known_hosts.clone().map(Into::into),
+        };
         div()
             .size_full()
             .relative()
@@ -663,9 +713,9 @@ impl Render for VaultContent {
             .text_color(theme.text)
             .text_size(px(14.))
             .child(sidebar(self.section, &theme, cx))
-            .map(|d| match (self.section, &self.known_hosts) {
-                (Section::KnownHosts, Some(view)) => d.child(view.clone()),
-                _ => d.child(self.hosts(&ui, cx)),
+            .map(|d| match screen {
+                Some(view) => d.child(view),
+                None => d.child(self.hosts(&ui, cx)),
             })
             .when_some(self.editor.clone(), |d, editor| {
                 d.child(
@@ -944,6 +994,20 @@ mod tests {
             cx.debug_bounds("import-putty").is_none(),
             "nothing is left to import"
         );
+    }
+
+    #[gpui::test]
+    fn installing_a_key_runs_it_in_a_session(cx: &mut TestAppContext) {
+        let (vault, cx, connects) = open_vault(cx);
+        cx.update(|window, cx| {
+            vault.update(cx, |vault, cx| {
+                vault.install_key("bastion", "ssh-ed25519 AAAA me@laptop", window, cx)
+            })
+        });
+        let connection = connects.borrow().last().cloned().expect("a session opens");
+        assert_eq!(connection.target.host, "bastion.example.com");
+        let command = connection.on_login.expect("the install runs after login");
+        assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
     }
 
     #[gpui::test]
