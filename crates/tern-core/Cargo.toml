@@ -5,3 +5,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = "1"
+# `ring` instead of the default aws-lc backend: it builds with only the
+# platform C toolchain (no CMake/NASM on Windows).
+russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+
+[dev-dependencies]
+rand = { version = "0.10", features = ["thread_rng"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }

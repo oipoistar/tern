@@ -2,5 +2,7 @@
 //! and sync will land in this crate so any front end can reuse them.
 
 pub mod host;
+pub mod paths;
+pub mod ssh;
 
 pub use host::{Host, HostGroup, HostStatus};

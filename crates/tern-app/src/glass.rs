@@ -105,14 +105,18 @@ pub fn glass<E: IntoElement>(
 
 /// Paints every recorded glass surface at `time` seconds into the animation.
 /// Render it after (on top of) the cached static UI, filling the window.
-pub fn glass_layer(slots: &GlassSlots, time: f32) -> impl IntoElement {
-    let slots = slots.clone();
+///
+/// Each part of the window that renders on its own schedule (the header, the
+/// cached screen below it) keeps its own [`GlassSlots`], so one part clearing
+/// its surfaces never wipes another's mid-frame.
+pub fn glass_layer(layers: &[&GlassSlots], time: f32) -> impl IntoElement {
+    let layers: Vec<GlassSlots> = layers.iter().map(|&layer| layer.clone()).collect();
     canvas(
         move |_, window, cx| {
+            let slots: Vec<_> = layers.iter().map(|layer| layer.0.borrow()).collect();
             slots
-                .0
-                .borrow()
                 .iter()
+                .flat_map(|layer| layer.iter())
                 .map(|(_, slot)| {
                     let mut surface = surface(slot, time).into_any_element();
                     window.with_content_mask(Some(slot.mask), |window| {

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 /// Reachability of a saved host, as last observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostStatus {
@@ -15,9 +17,20 @@ pub struct Host {
     pub os: String,
     pub tags: Vec<String>,
     pub status: HostStatus,
+    /// Private key to log in with, before the agent and default keys.
+    pub identity: Option<PathBuf>,
 }
 
 impl Host {
+    /// Where to connect for an SSH session.
+    pub fn ssh_target(&self) -> crate::ssh::Target {
+        crate::ssh::Target {
+            host: self.address.clone(),
+            port: self.port,
+            user: self.user.clone(),
+        }
+    }
+
     /// `user@address`, with the port appended only when it isn't 22.
     pub fn target(&self) -> String {
         if self.port == 22 {
@@ -55,6 +68,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
             os: os.into(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
             status,
+            identity: None,
         };
     vec![
         HostGroup {
@@ -146,6 +160,7 @@ mod tests {
             os: String::new(),
             tags: vec![],
             status: HostStatus::Online,
+            identity: None,
         }
     }
 

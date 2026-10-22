@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 tern-core.workspace = true
 gpui-kit.workspace = true
+alacritty_terminal = "0.26"

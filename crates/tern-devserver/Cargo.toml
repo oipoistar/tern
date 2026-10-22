@@ -1,0 +1,13 @@
+[package]
+name = "tern-devserver"
+description = "Local SSH server with a real shell, for trying Tern end to end"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+portable-pty = "0.9"
+rand = { version = "0.10", features = ["thread_rng"] }
+russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }

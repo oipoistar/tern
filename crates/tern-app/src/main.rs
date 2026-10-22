@@ -1,8 +1,11 @@
 mod assets;
 mod bench;
 mod glass;
+mod terminal;
 mod theme;
+mod ui;
 mod vault;
+mod workspace;
 
 use gpui_kit::*;
 
@@ -28,7 +31,18 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| vault::Vault::new(window, cx))
+                // Start in the system's appearance; `TERN_THEME=light|dark`
+                // overrides it (handy for screenshots).
+                let dark = match std::env::var("TERN_THEME").as_deref() {
+                    Ok("dark") => true,
+                    Ok("light") => false,
+                    _ => matches!(
+                        window.appearance(),
+                        WindowAppearance::Dark | WindowAppearance::VibrantDark
+                    ),
+                };
+                theme::set_dark(dark, cx);
+                cx.new(|cx| workspace::Workspace::new(window, cx))
             })
             .expect("failed to open the Tern window");
 

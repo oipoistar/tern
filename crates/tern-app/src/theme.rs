@@ -1,6 +1,67 @@
 //! Tern's colour tokens, mirroring the mockup canvas (light and dark).
 
-use gpui_kit::{BoxShadow, Hsla, Rgba, hsla, point, px, rgb, rgba};
+use std::rc::Rc;
+
+use gpui_kit::{App, BoxShadow, Global, Hsla, Rgba, hsla, point, px, rgb, rgba};
+
+/// Light or dark, shared by every view. Change it with [`set_dark`].
+#[derive(Clone, Copy)]
+pub struct Appearance {
+    pub dark: bool,
+}
+
+impl Global for Appearance {}
+
+/// The theme for the current appearance.
+pub fn current(cx: &App) -> Rc<Theme> {
+    let dark = cx.try_global::<Appearance>().is_some_and(|a| a.dark);
+    Rc::new(if dark { Theme::dark() } else { Theme::light() })
+}
+
+pub fn set_dark(dark: bool, cx: &mut App) {
+    cx.set_global(Appearance { dark });
+    // Keep GPUI Kit's own components (the text input) in the same mode.
+    use gpui_kit::component::{Theme as KitTheme, ThemeMode};
+    KitTheme::change(
+        if dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        },
+        None,
+        cx,
+    );
+    // Cached views don't watch the global, so redraw everything once.
+    cx.refresh_windows();
+}
+
+/// Colours for terminal content. The dark-teal ground matches the mockup's
+/// terminal in both appearances.
+pub struct TermPalette {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub cursor: Hsla,
+    /// The 16 ANSI colours: normal 0–7, then bright 8–15.
+    pub ansi: [Hsla; 16],
+}
+
+impl TermPalette {
+    pub fn for_theme(theme: &Theme) -> Self {
+        let ansi = [
+            0x1B3A3B, 0xF07178, 0x7FE0B4, 0xFFCB6B, 0x82AAFF, 0xC792EA, 0x89DDFF,
+            0xD3E6E3, // normal
+            0x557774, 0xFF8A8A, 0xA6F0CD, 0xFFDD8E, 0xA6C4FF, 0xDDB3F5, 0xB2EBFF,
+            0xFFFFFF, // bright
+        ]
+        .map(|hex| c(rgb(hex)));
+        Self {
+            background: c(rgb(if theme.dark { 0x0A1A1B } else { 0x10292A })),
+            foreground: c(rgb(0xD3E6E3)),
+            cursor: c(rgb(0x7FE0B4)),
+            ansi,
+        }
+    }
+}
 
 /// Monospace family for addresses, fingerprints and terminal text.
 pub const MONO: &str = if cfg!(target_os = "macos") {
@@ -57,6 +118,7 @@ pub struct Theme {
     pub ok_glyph: Hsla,
     pub ok_halo: Hsla,
     pub info_glyph: Hsla,
+    pub danger: Hsla,
     pub selection: Hsla,
 }
 
@@ -75,6 +137,7 @@ impl Theme {
             ok_glyph: c(rgb(0x13804A)),
             ok_halo: c(rgba(0x13804A29)),
             info_glyph: c(rgb(0x1D5FD1)),
+            danger: c(rgb(0xC4321F)),
             selection: c(rgb(0x6C63FF)),
         }
     }
@@ -93,6 +156,7 @@ impl Theme {
             ok_glyph: c(rgb(0x6BE39A)),
             ok_halo: c(rgba(0x6BE39A38)),
             info_glyph: c(rgb(0x8DBBFF)),
+            danger: c(rgb(0xFF8A80)),
             selection: c(rgb(0x8F86FF)),
         }
     }
