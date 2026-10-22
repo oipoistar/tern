@@ -13,6 +13,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::filter::{self, Filter, Reach};
 use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
@@ -94,10 +95,22 @@ impl Section {
 
 impl EventEmitter<VaultEvent> for VaultContent {}
 
+/// How the hosts screen lays hosts out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    Cards,
+    List,
+}
+
 /// Everything on the vault tab except the header: the sidebar and the
 /// screen it picked.
 pub struct VaultContent {
     section: Section,
+    layout: Layout,
+    filter: Filter,
+    filter_open: bool,
+    /// Held by the hosts screen itself, for arrows, Enter and E.
+    focus: FocusHandle,
     /// Screens, made when first shown.
     keychain: Option<Entity<KeychainView>>,
     snippets: Option<Entity<SnippetsView>>,
@@ -299,6 +312,65 @@ impl VaultContent {
         cx.notify();
     }
 
+    /// The hosts the search and the filter let through, with their group,
+    /// in vault order.
+    fn visible(&self) -> Vec<(&str, &Host)> {
+        self.vault
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .hosts
+                    .iter()
+                    .map(move |host| (group.name.as_str(), host))
+            })
+            .filter(|(group, host)| {
+                host.matches(&self.query)
+                    && self.filter.matches(group, host, self.trace(host).status)
+            })
+            .collect()
+    }
+
+    /// Arrows move the selection, Enter connects, E edits; only while the
+    /// hosts screen itself has focus, not a field on it.
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) || self.editor.is_some() {
+            return;
+        }
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        let delta = match event.keystroke.key.as_str() {
+            "up" | "left" => -1,
+            "down" | "right" => 1,
+            "enter" => {
+                let selected = self.selected.clone();
+                self.connect_saved(&selected, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            "e" => {
+                if self.vault.find(&self.selected).is_some() {
+                    self.open_editor(Some(self.selected.clone()), window, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            _ => return,
+        };
+        let visible: Vec<&str> = self
+            .visible()
+            .iter()
+            .map(|(_, host)| host.name.as_str())
+            .collect();
+        if let Some(next) = filter::step(&visible, &self.selected, delta) {
+            self.selected = next.to_string();
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     /// The trace of the saved host called `name`, for a session's toolbar.
     pub fn host_trace(&self, name: &str) -> Option<Trace> {
         self.vault.find(name).map(|host| self.trace(host))
@@ -353,6 +425,10 @@ impl VaultContent {
             .unwrap_or_default();
         let mut content = Self {
             section: Section::Hosts,
+            layout: Layout::Cards,
+            filter: Filter::default(),
+            filter_open: false,
+            focus: cx.focus_handle(),
             keychain: None,
             snippets: None,
             forwards: None,
@@ -403,6 +479,7 @@ impl VaultContent {
     /// Writes the vault to its file, if it has one. A failure stays on
     /// screen until a later save works.
     fn persist(&mut self) {
+        self.filter.forget_missing(&self.vault);
         let Some(path) = &self.file else {
             return;
         };
@@ -911,28 +988,334 @@ impl VaultContent {
             .when_some(self.destination.clone(), |d, (target, identity)| {
                 d.child(destination_card(target, identity, theme, cx))
             })
-            .children(self.vault.groups.iter().filter_map(|group| {
-                let hosts: Vec<&Host> = group
-                    .hosts
-                    .iter()
-                    .filter(|host| host.matches(&self.query))
-                    .collect();
-                if hosts.is_empty() {
-                    return None;
-                }
-                Some(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(14.))
-                        .child(group_heading(group.name.clone(), theme))
-                        .child(
-                            div().flex().flex_wrap().gap(px(14.)).children(
-                                hosts.into_iter().map(|host| self.host_card(host, ui, cx)),
-                            ),
+            .children({
+                let visible = self.visible();
+                self.vault.groups.iter().filter_map(move |group| {
+                    let hosts: Vec<&Host> = visible
+                        .iter()
+                        .filter(|(of, _)| *of == group.name)
+                        .map(|(_, host)| *host)
+                        .collect();
+                    if hosts.is_empty() {
+                        return None;
+                    }
+                    let hosts = match self.layout {
+                        Layout::Cards => div().flex().flex_wrap().gap(px(14.)).children(
+                            hosts
+                                .into_iter()
+                                .map(|host| self.host_card(host, ui, cx).into_any_element()),
                         ),
-                )
+                        Layout::List => div().flex().flex_col().gap(px(8.)).children(
+                            hosts
+                                .into_iter()
+                                .map(|host| self.host_row(host, ui, cx).into_any_element()),
+                        ),
+                    };
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .child(group_heading(group.name.clone(), theme))
+                            .child(hosts),
+                    )
+                })
+            })
+    }
+
+    /// A host as a row of the list: art, name, target, tags, trace and
+    /// latency, and its actions. The selected one is inverted.
+    fn host_row(&self, host: &Host, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
+        let selected = host.name == self.selected;
+        let t = if selected {
+            Rc::new(ui.theme.inverse())
+        } else {
+            ui.theme.clone()
+        };
+        let art = self.keys.get(&(host.address.clone(), host.port)).cloned();
+        let trace = self.trace(host);
+        let latency = match trace.status {
+            HostStatus::Online {
+                latency_ms: Some(ms),
+            } => format!("{ms} ms"),
+            _ => String::new(),
+        };
+        let row_id = format!("row-{}", host.name);
+        let (pick, edit, connect) = (host.name.clone(), host.name.clone(), host.name.clone());
+        div()
+            .id(SharedString::from(row_id.clone()))
+            .debug_selector(move || row_id)
+            .h(px(60.))
+            .pl(px(10.))
+            .pr(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(14.))
+            .rounded(px(18.))
+            .bg(t.card)
+            .text_color(t.text)
+            .shadow(ui.theme.shadow())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.selected = pick.clone();
+                this.focus.focus(window, cx);
+                cx.notify();
             }))
+            .child(art_tile(art, 40., 12., &t))
+            .child(
+                div()
+                    .w(px(180.))
+                    .flex_none()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .truncate()
+                    .child(host.name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(200.))
+                    .flex_none()
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .text_color(t.text2)
+                    .truncate()
+                    .child(host.target()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family(MONO)
+                    .text_size(px(11.5))
+                    .text_color(t.text3)
+                    .truncate()
+                    .child(host.tags.join(" / ")),
+            )
+            .child(if self.editor.is_some() {
+                div().w(px(110.)).into_any_element()
+            } else {
+                ui.trace(
+                    format!("row-trace-{}", host.name),
+                    trace,
+                    marks::seed(&host.name),
+                    t.text,
+                    t.text3,
+                )
+                .w(px(110.))
+                .h(px(16.))
+                .into_any_element()
+            })
+            .child(
+                div()
+                    .w(px(44.))
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .child(latency),
+            )
+            .when(selected, |d| {
+                d.child(
+                    round_button(format!("edit-{}", host.name), IconName::Pencil, false, &t)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_editor(Some(edit.clone()), window, cx);
+                        })),
+                )
+            })
+            .child({
+                let id = format!("connect-{}", host.name);
+                round_button(id.clone(), IconName::ArrowRight, selected, &t)
+                    .debug_selector(move || id)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.connect_saved(&connect, window, cx);
+                    }))
+            })
+    }
+
+    /// The Filter button, its count of chosen values beside its name, and
+    /// the menu it opens: groups, tags and reachability to show.
+    fn filter_button(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let count = self.filter.count();
+        let groups: Vec<String> = self
+            .vault
+            .groups
+            .iter()
+            .map(|group| group.name.clone())
+            .collect();
+        let tags = filter::tags(&self.vault);
+        let hover = theme.card2;
+        let option = |id: String, label: String, on: bool| {
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
+                .h(px(34.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .rounded(px(10.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(
+                    div()
+                        .w(px(14.))
+                        .when(on, |d| d.child(icon(IconName::Check, 14., theme.text))),
+                )
+        };
+        let heading = |name: &'static str| {
+            div()
+                .px(px(10.))
+                .pt(px(8.))
+                .pb(px(2.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text2)
+                .child(name)
+        };
+        div()
+            .child(
+                button("filter", theme)
+                    .debug_selector(|| "filter".into())
+                    .h(px(46.))
+                    .px(px(16.))
+                    .rounded(px(16.))
+                    .text_size(px(14.))
+                    .child(icon(IconName::Funnel, 15., theme.text))
+                    .child("Filter")
+                    .when(count > 0, |d| {
+                        d.child(
+                            div()
+                                .font_family(MONO)
+                                .text_size(px(13.))
+                                .text_color(theme.text2)
+                                .child(count.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.filter_open = true;
+                        cx.notify();
+                    })),
+            )
+            .when(self.filter_open, |d| {
+                let reaches = [
+                    (Reach::Online, "Online"),
+                    (Reach::Offline, "Offline"),
+                    (Reach::Unchecked, "Not checked"),
+                ];
+                d.child(deferred(
+                    anchored().snap_to_window_with_margin(px(8.)).child(
+                        div()
+                            .id("filter-menu")
+                            .occlude()
+                            .mt(px(6.))
+                            .w(px(260.))
+                            .max_h(px(420.))
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .flex()
+                            .flex_col()
+                            .rounded(px(14.))
+                            .bg(theme.card)
+                            .border_1()
+                            .border_color(theme.line)
+                            .shadow(theme.shadow())
+                            .text_color(theme.text)
+                            .text_size(px(13.))
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.filter_open = false;
+                                cx.notify();
+                            }))
+                            .child(heading("Groups"))
+                            .children(groups.into_iter().map(|group| {
+                                let on = self.filter.groups.contains(&group);
+                                let picked = group.clone();
+                                option(format!("filter-group-{group}"), group, on).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.filter.toggle_group(&picked);
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .when(!tags.is_empty(), |d| d.child(heading("Tags")))
+                            .children(tags.into_iter().map(|tag| {
+                                let on = self.filter.tags.contains(&tag);
+                                let picked = tag.clone();
+                                option(format!("filter-tag-{tag}"), tag, on).on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.filter.toggle_tag(&picked);
+                                        cx.notify();
+                                    },
+                                ))
+                            }))
+                            .child(heading("Status"))
+                            .children(reaches.into_iter().map(|(reach, label)| {
+                                let on = self.filter.reach.contains(&reach);
+                                option(
+                                    format!("filter-status-{}", label.to_lowercase()),
+                                    label.into(),
+                                    on,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.filter.toggle_reach(reach);
+                                        cx.notify();
+                                    },
+                                ))
+                            }))
+                            .when(count > 0, |d| {
+                                d.child(div().my(px(4.)).h(px(1.)).bg(theme.line)).child(
+                                    option("filter-clear".into(), "Clear".into(), false).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.filter = Filter::default();
+                                            cx.notify();
+                                        }),
+                                    ),
+                                )
+                            }),
+                    ),
+                ))
+            })
+    }
+
+    /// Cards or a list, as a well of two glyphs.
+    fn layout_switch(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(46.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .p(px(4.))
+            .rounded(px(16.))
+            .bg(theme.card2)
+            .children(
+                [
+                    (Layout::Cards, IconName::LayoutGrid, "view-cards"),
+                    (Layout::List, IconName::List, "view-list"),
+                ]
+                .into_iter()
+                .map(|(layout, glyph, id)| {
+                    let on = self.layout == layout;
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.into())
+                        .size(px(38.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(12.))
+                        .when(on, |d| d.bg(theme.card).shadow(theme.shadow_sm()))
+                        .cursor_pointer()
+                        .child(icon(glyph, 16., if on { theme.text } else { theme.text2 }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.layout = layout;
+                            cx.notify();
+                        }))
+                }),
+            )
     }
 
     fn toolbar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
@@ -941,6 +1324,8 @@ impl VaultContent {
             .items_center()
             .gap(px(12.))
             .child(search_field("search", &self.search, theme))
+            .child(self.layout_switch(theme, cx))
+            .child(self.filter_button(theme, cx))
             // Offered only while PuTTY has sessions the vault lacks.
             .when(!self.putty.is_empty(), |d| {
                 d.child(
@@ -1015,8 +1400,9 @@ impl VaultContent {
             .flex_col()
             .gap(px(12.))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.selected = pick.clone();
+                this.focus.focus(window, cx);
                 cx.notify();
             }))
             .child(
@@ -1136,6 +1522,10 @@ impl Render for VaultContent {
             Section::History => self.history_view.clone().map(Into::into),
         };
         div()
+            .id("vault")
+            .track_focus(&self.focus)
+            .key_context("Vault")
+            .on_key_down(cx.listener(Self::key_down))
             .size_full()
             .relative()
             .flex()
@@ -1663,6 +2053,47 @@ mod tests {
         vault.read_with(cx, |vault, _| {
             assert!(!vault.vault.find("bastion").unwrap().forwards[0].on)
         });
+    }
+
+    #[gpui::test]
+    fn lists_filters_and_moves_with_the_keyboard(cx: &mut TestAppContext) {
+        let (vault, cx, connects) = open_vault(cx);
+        let selected = |cx: &mut VisualTestContext| vault.read_with(cx, |v, _| v.selected.clone());
+
+        // The list shows the same hosts as rows.
+        click(cx, "view-list");
+        assert!(cx.debug_bounds("row-bastion").is_some());
+        assert!(cx.debug_bounds("host-bastion").is_none());
+
+        // A tag and a group narrow it; the button counts what's chosen.
+        click(cx, "filter");
+        click(cx, "filter-tag-docker");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("row-stage-api").is_some());
+        assert!(cx.debug_bounds("row-bastion").is_none());
+        vault.read_with(cx, |vault, _| assert_eq!(vault.filter.count(), 1));
+        click(cx, "filter-group-Production");
+        assert!(
+            cx.debug_bounds("row-stage-api").is_none(),
+            "docker hosts aren't in Production"
+        );
+        click(cx, "filter-clear");
+        vault.read_with(cx, |vault, _| assert_eq!(vault.filter.count(), 0));
+
+        // Arrows move through what's on screen, Enter connects, E edits.
+        click(cx, "row-prod-web-02");
+        cx.simulate_keystrokes("down");
+        assert_eq!(selected(cx), "bastion");
+        cx.simulate_keystrokes("up up");
+        assert_eq!(selected(cx), "prod-web-01");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            connects.borrow().last().map(|c| c.target.host.clone()),
+            Some("web-01.internal".into())
+        );
+        cx.simulate_keystrokes("e");
+        vault.read_with(cx, |vault, _| assert!(vault.editor.is_some()));
     }
 
     #[gpui::test]

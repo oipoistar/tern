@@ -69,6 +69,9 @@ claude.ai account). Each item below names the artboard it comes from.
       sliders open General (the data folder), Terminal (font, size, cursor,
       scrollback, visual bell, copy on select) and Appearance (system, light
       or dark, also set by the header's toggle)
+- [x] Vault list view and filters (item 13): a cards / list switch; Filter
+      by group, tag and status with the count of chosen values on the
+      button; arrows move the selection, Enter connects, E edits
 
 ## Known gaps in what's built
 
@@ -82,12 +85,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 13. Vault list view and filters (Main artboard toolbar)
-- A grid / list switch.
-- Filter by group, tag and status, with the active filter count as a value on
-  the Filter button.
-- Keyboard: arrows move the selection, Enter connects, E edits.
 
 ### 14. Sync through your own storage (Sync artboard)
 - Providers: Google Drive, Dropbox, OneDrive, iCloud Drive, WebDAV /

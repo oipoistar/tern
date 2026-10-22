@@ -2,6 +2,7 @@
 //! and sync will land in this crate so any front end can reuse them.
 
 pub mod draft;
+pub mod filter;
 pub mod forward;
 pub mod history;
 pub mod host;

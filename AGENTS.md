@@ -47,7 +47,8 @@ russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
-(`history.rs`), port forwarding (`forward.rs`), SFTP (`sftp.rs`), settings
+(`history.rs`), the vault's filter (`filter.rs`), port forwarding
+(`forward.rs`), SFTP (`sftp.rs`), settings
 (`settings.rs`), reading
 PuTTY's saved sessions (`putty.rs`) and paths and safe writes
 (`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
