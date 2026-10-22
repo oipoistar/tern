@@ -4,6 +4,10 @@
 //! It listens on 127.0.0.1 only and accepts one user, `tern`, with either the
 //! generated test key or the generated password. Keys and password live in
 //! `dev/test-ssh/` (git-ignored) and are created on first run.
+//!
+//! It also works as a jump host, but only towards addresses on this
+//! computer: enough to try jump hosts locally (through itself) without
+//! becoming a proxy to anywhere.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -124,6 +128,7 @@ impl russh::server::Server for DevServer {
 
 /// The shell behind one SSH channel.
 struct Pty {
+    channel: ChannelId,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
 }
@@ -203,14 +208,51 @@ impl russh::server::Handler for Connection {
         Ok(())
     }
 
+    /// Typing for the shell. Forwarded channels arrive here too, so only the
+    /// shell's own channel is written to the PTY.
     async fn data(
         &mut self,
-        _: ChannelId,
+        channel: ChannelId,
         data: &[u8],
         _: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(pty) = self.pty.lock().unwrap().as_mut() {
+        if let Some(pty) = self.pty.lock().unwrap().as_mut()
+            && pty.channel == channel
+        {
             let _ = pty.writer.write_all(data);
+        }
+        Ok(())
+    }
+
+    /// Acts as a jump host for addresses on this computer. Dropping `reply`
+    /// without accepting refuses the channel.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host: &str,
+        port: u32,
+        _: &str,
+        _: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Ok(port) = u16::try_from(port) else {
+            return Ok(());
+        };
+        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+            println!("refused forwarding to {host}:{port}: only this computer");
+            return Ok(());
+        }
+        match tokio::net::TcpStream::connect((host, port)).await {
+            Ok(mut tcp) => {
+                println!("forwarding to {host}:{port}");
+                reply.accept().await;
+                tokio::spawn(async move {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                });
+            }
+            Err(error) => println!("can't forward to {host}:{port}: {error}"),
         }
         Ok(())
     }
@@ -288,6 +330,7 @@ fn spawn_shell(
         });
     });
     Ok(Pty {
+        channel,
         master: pair.master,
         writer,
     })

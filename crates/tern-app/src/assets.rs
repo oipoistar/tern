@@ -13,6 +13,7 @@ gpui_kit::assets::icon_assets!(
         Cloud,
         CodeXml,
         Funnel,
+        Import,
         KeyRound,
         Laptop,
         LayoutGrid,

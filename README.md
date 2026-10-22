@@ -31,6 +31,11 @@ editor (New host, or the pencil on the selected host). For now they live in
 memory: the vault starts from sample hosts and forgets edits on quit, until
 the encrypted vault file exists.
 
+When PuTTY has saved SSH sessions the vault lacks (in the registry on
+Windows, `~/.putty/sessions` elsewhere; only read), the vault offers "Import
+from PuTTY" and adds them to a PuTTY group. Sessions with a PuTTY `.ppk` key
+sign in through Pageant.
+
 Tern checks host keys against `~/.ssh/known_hosts` (read only) and its own
 known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application
 Support/Tern` or `~/.local/share/tern`; `TERN_DATA_DIR` overrides it).
@@ -42,11 +47,14 @@ cargo run -p tern-devserver                # SSH server on 127.0.0.1:2222
 ```
 
 It creates a test key and password in `dev/test-ssh/` (git-ignored) on first
-run, and the app then lists it under "Local dev server".
+run, and the app then lists it under "Local dev server", once directly and
+once as `devserver-via-jump`, which goes through the dev server itself as a
+jump host (it forwards only to addresses on this computer).
 
 ```sh
 cargo test --workspace                     # includes an end-to-end SSH test
 cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi"
+cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi" --jump "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1"
 cargo run -p tern-app --release -- --bench 10                    # frame cost of the vault's latency traces
 cargo run -p tern-app --release -- --bench 10 --bench-uncached   # same, re-rendering everything
 ```

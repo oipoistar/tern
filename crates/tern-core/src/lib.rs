@@ -4,6 +4,7 @@
 pub mod draft;
 pub mod host;
 pub mod paths;
+pub mod putty;
 pub mod randomart;
 pub mod ssh;
 pub mod vault;

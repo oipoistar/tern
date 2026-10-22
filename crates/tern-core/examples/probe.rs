@@ -2,15 +2,17 @@
 //! prints what comes back. Handy for debugging without the app:
 //!
 //! ```text
-//! cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi" [--trust]
+//! cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi" [--trust] [--jump "<ssh command>"]
 //! ```
 //!
 //! `--trust` accepts an unknown host key (and saves it to Tern's known hosts,
 //! so point `TERN_DATA_DIR` somewhere disposable when experimenting).
+//! `--jump` goes through that host first, like `ssh -J`.
 
 use std::time::Duration;
 
-use tern_core::ssh::{ConnectError, Connection, Event, Session, TermSize, parse_command};
+use tern_core::Auth;
+use tern_core::ssh::{ConnectError, Connection, Event, Jump, Session, TermSize, parse_command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +28,14 @@ async fn main() -> anyhow::Result<()> {
     let trust_unknown = args.iter().any(|arg| arg == "--trust");
 
     let (target, key) = parse_command(command)?;
-    let connection = Connection::typed(target.clone(), key);
+    let mut connection = Connection::typed(target.clone(), key);
+    if let Some(via) = args.iter().skip_while(|arg| *arg != "--jump").nth(1) {
+        let (target, key) = parse_command(via)?;
+        connection.jump = Some(Jump {
+            target,
+            auth: key.map_or(Auth::Agent, Auth::Key),
+        });
+    }
     let size = TermSize {
         cols: 100,
         rows: 30,

@@ -12,13 +12,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::randomart::Randomart;
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, quick_destination};
-use tern_core::{Auth, Host, HostGroup, HostStatus, Vault};
+use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, putty};
 
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::live::LiveSlots;
 use crate::marks;
 use crate::theme::{self, MONO, Theme};
-use crate::ui::{Ui, art_tile, icon};
+use crate::ui::{Ui, art_tile, button, icon};
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -46,6 +46,9 @@ pub struct VaultContent {
     /// Set when the search text is itself an SSH destination.
     destination: Option<(Target, Option<PathBuf>)>,
     editor: Option<Entity<HostEditor>>,
+    /// Saved PuTTY sessions not in the vault yet; the import button shows
+    /// only while there are some.
+    putty: Vec<Host>,
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
 }
@@ -89,11 +92,32 @@ impl VaultContent {
             query: SharedString::default(),
             destination: None,
             editor: None,
+            putty: Vec::new(),
             _subscription: subscription,
             _editor_events: None,
         };
         content.refresh_keys();
+        content.putty = putty::importable_here(&content.vault);
         content
+    }
+
+    /// Adds every PuTTY session not in the vault yet to the PuTTY group and
+    /// selects the first.
+    fn import_putty(&mut self, cx: &mut Context<Self>) {
+        let hosts = std::mem::take(&mut self.putty);
+        if let Some(first) = hosts.first() {
+            self.selected = first.name.clone();
+        }
+        for host in hosts {
+            self.vault.save(None, host, putty::GROUP);
+        }
+        self.refresh_keys();
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    fn offer_putty(&mut self, hosts: Vec<Host>) {
+        self.putty = hosts;
     }
 
     /// Re-reads which hosts have a trusted key (known_hosts files only, read
@@ -197,6 +221,11 @@ impl VaultContent {
             }
             EditorEvent::Close => {}
         }
+        // A deleted import can come back; a host edited to match a session
+        // makes it redundant.
+        if !matches!(event, EditorEvent::Close) {
+            self.putty = putty::importable_here(&self.vault);
+        }
         self.editor = None;
         self._editor_events = None;
         cx.notify();
@@ -290,6 +319,20 @@ impl VaultContent {
                             .child(icon(IconName::Search, 17., theme.text2)),
                     ),
             )
+            // Offered only while PuTTY has sessions the vault lacks.
+            .when(!self.putty.is_empty(), |d| {
+                d.child(
+                    button("import-putty", theme)
+                        .debug_selector(|| "import-putty".into())
+                        .h(px(46.))
+                        .px(px(16.))
+                        .rounded(px(16.))
+                        .text_size(px(14.))
+                        .child(icon(IconName::Import, 16., theme.text))
+                        .child("Import from PuTTY")
+                        .on_click(cx.listener(|this, _, _, cx| this.import_putty(cx))),
+                )
+            })
             // The screen's primary action, so the one solid ink button.
             .child(
                 div()
@@ -569,17 +612,25 @@ fn round_button(id: String, glyph: IconName, filled: bool, theme: &Theme) -> Sta
         ))
 }
 
-/// The local dev server from `tern-devserver`, shown only when its key exists.
+/// The local dev server from `tern-devserver`, shown only when its key
+/// exists: once directly, and once through itself as a jump host.
 fn dev_server_group() -> HostGroup {
+    let dev = Host {
+        os: "This computer".into(),
+        tags: vec!["dev".into()],
+        status: HostStatus::Online { latency_ms: None },
+        auth: Auth::Key(PathBuf::from(DEV_KEY)),
+        ..Host::new("tern-devserver", "tern", "127.0.0.1", 2222)
+    };
+    let through_itself = Host {
+        name: "devserver-via-jump".into(),
+        tags: vec!["dev".into(), "jump".into()],
+        jump: Some(dev.name.clone()),
+        ..dev.clone()
+    };
     HostGroup {
         name: "Local dev server".into(),
-        hosts: vec![Host {
-            os: "This computer".into(),
-            tags: vec!["dev".into()],
-            status: HostStatus::Online { latency_ms: None },
-            auth: Auth::Key(PathBuf::from(DEV_KEY)),
-            ..Host::new("tern-devserver", "tern", "127.0.0.1", 2222)
-        }],
+        hosts: vec![dev, through_itself],
     }
 }
 
@@ -628,6 +679,7 @@ mod tests {
 
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use gpui_kit::Entity;
+    use tern_core::Host;
     use tern_core::draft::Field;
     use tern_core::ssh::Connection;
 
@@ -714,6 +766,31 @@ mod tests {
         vault.read_with(cx, |vault, cx| {
             assert!(vault.search.read(cx).value().is_empty())
         });
+    }
+
+    #[gpui::test]
+    fn importing_from_putty_adds_its_sessions_once(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        // Seeded here rather than read from this computer's PuTTY.
+        let sessions = vec![
+            Host::new("nas", "admin", "nas.lan", 22),
+            Host::new("router", "root", "10.0.0.1", 2222),
+        ];
+        vault.update(cx, |vault, cx| {
+            vault.offer_putty(sessions);
+            cx.notify();
+        });
+
+        click(cx, "import-putty");
+        vault.read_with(cx, |vault, _| {
+            assert_eq!(vault.vault.group_of("nas"), Some("PuTTY"));
+            assert_eq!(vault.vault.group_of("router"), Some("PuTTY"));
+            assert_eq!(vault.selected, "nas");
+        });
+        assert!(
+            cx.debug_bounds("import-putty").is_none(),
+            "nothing is left to import"
+        );
     }
 
     #[gpui::test]

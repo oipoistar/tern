@@ -43,7 +43,8 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 `vault.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
-host-key art (`randomart.rs`) and paths. `tern-app` is GPUI:
+host-key art (`randomart.rs`), reading PuTTY's saved sessions (`putty.rs`)
+and paths. `tern-app` is GPUI:
 `workspace.rs` is the window root (header, tabs, live layer), `vault.rs`
 and `terminal.rs` are the screens, `host_editor.rs` is the dialog the vault
 opens over itself, and `marks.rs` draws the art and traces.
@@ -74,9 +75,10 @@ at startup, for looking at it without clicking.
   find them with `cx.debug_bounds(...)` and `simulate_click` the centre (see
   `vault.rs`). Focusing an input puts the cursor at the start, so select all
   (`ctrl-a`, `cmd-a` on macOS) before typing a replacement.
-- **Jump hosts tunnel SSH inside an SSH channel.** A test server's `data`
-  hook sees forwarded channels too; echoing there corrupts the inner
-  connection ("Bad packet size" decodes as the echoed text).
+- **Jump hosts tunnel SSH inside an SSH channel.** A russh server's `data`
+  hook sees forwarded channels too, so the test server and `tern-devserver`
+  only act on their shell's channel; echoing or writing elsewhere corrupts
+  the inner connection ("Bad packet size" decodes as the stray text).
 - **russh uses the `ring` backend**; the default aws-lc needs CMake and NASM on
   Windows.
 - **Windows ConPTY waits for a reply to its cursor-position query** before

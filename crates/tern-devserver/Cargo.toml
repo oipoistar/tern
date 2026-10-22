@@ -10,4 +10,4 @@ anyhow = "1"
 portable-pty = "0.9"
 rand = { version = "0.10", features = ["thread_rng"] }
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
