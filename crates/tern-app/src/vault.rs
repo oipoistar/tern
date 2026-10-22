@@ -1,22 +1,27 @@
 //! The hosts vault: Tern's home screen. It asks the workspace to open a
 //! session with [`VaultEvent::Connect`], opens the host editor over itself
-//! to add or change hosts, and saves every change to the vault file.
+//! to add or change hosts, and saves every change to the vault file. While
+//! it shows in the active window it checks in the background that the hosts
+//! answer, and their traces draw what the checks measured.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::randomart::Randomart;
-use tern_core::ssh::{Connection, Target, key_art, known_host_key, quick_destination};
+use tern_core::reach::{Monitor, Place};
+use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 
+use crate::bench;
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::live::LiveSlots;
-use crate::marks;
+use crate::marks::{self, Trace};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{Ui, art_tile, button, icon};
 
@@ -54,14 +59,25 @@ pub struct VaultContent {
     /// Saved PuTTY sessions not in the vault yet; the import button shows
     /// only while there are some.
     putty: Vec<Host>,
+    /// What the background checks found.
+    monitor: Monitor,
+    /// The vault is the tab on screen; checks run only then.
+    showing: bool,
+    _checks: Option<Task<()>>,
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
 }
 
 impl VaultContent {
-    /// The vault saved in Tern's data folder. A first run in a dev checkout
-    /// starts with the dev server's hosts.
+    /// The vault saved in Tern's data folder, checked in the background. A
+    /// first run in a dev checkout starts with the dev server's hosts. While
+    /// benchmarking: the same hosts every run, with made-up checks.
     pub fn open(live: LiveSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        if bench::enabled() {
+            let mut content = Self::new(bench::vault(), None, live, window, cx);
+            bench::fill(&mut content.monitor, &content.vault);
+            return content;
+        }
         let opened = tern_core::vault::open(&paths::vault());
         let mut vault = opened.vault;
         if opened.fresh && Path::new(DEV_KEY).exists() {
@@ -69,7 +85,69 @@ impl VaultContent {
         }
         let mut content = Self::new(vault, opened.path, live, window, cx);
         content.notice = opened.notice.map(Into::into);
+        content.start_checks(window, cx);
         content
+    }
+
+    /// Whether the vault is the tab on screen.
+    pub fn set_showing(&mut self, showing: bool) {
+        self.showing = showing;
+    }
+
+    /// Looks every second for checks that are due, and runs them while the
+    /// vault shows in the active window.
+    fn start_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._checks = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if this.showing && window.is_window_active() {
+                        this.run_due_checks(cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+            }
+        }));
+    }
+
+    fn run_due_checks(&mut self, cx: &mut Context<Self>) {
+        let mut places: Vec<Place> = Vec::new();
+        for host in self.vault.hosts() {
+            let place = self.vault.first_hop(host);
+            if !places.contains(&place) {
+                places.push(place);
+            }
+        }
+        let due = self.monitor.due(&places, Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        for place in due {
+            let check = probe(&place.0, place.1);
+            cx.spawn(async move |this, cx| {
+                let latency_ms = check.await.ok().map(|reached| reached.latency_ms);
+                let _ = this.update(cx, |this, cx| {
+                    this.monitor.record(&place, latency_ms, Instant::now());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        // A first check shows as connecting.
+        cx.notify();
+    }
+
+    /// The trace for `host`, from the checks of its first hop.
+    fn trace(&self, host: &Host) -> Trace {
+        let place = self.vault.first_hop(host);
+        let (samples, sampled_at) = self.monitor.samples(&place);
+        Trace {
+            status: self.monitor.status(&place),
+            samples: samples.into(),
+            sampled_at,
+        }
     }
 
     /// Shows `vault`, saving changes to `file` when there is one.
@@ -120,6 +198,9 @@ impl VaultContent {
             destination: None,
             editor: None,
             putty: Vec::new(),
+            monitor: Monitor::default(),
+            showing: true,
+            _checks: None,
             _subscription: subscription,
             _editor_events: None,
         };
@@ -244,10 +325,15 @@ impl VaultContent {
                 replacing,
                 host,
                 group,
+                checked,
             } => {
                 self.vault
                     .save(replacing.as_deref(), (**host).clone(), group);
                 self.persist();
+                if let Some((place, latency_ms)) = checked {
+                    self.monitor
+                        .record(place, Some(*latency_ms), Instant::now());
+                }
                 self.selected = host.name.clone();
                 self.refresh_keys();
             }
@@ -422,7 +508,8 @@ impl VaultContent {
             ui.theme.clone()
         };
         let art = self.keys.get(&(host.address.clone(), host.port)).cloned();
-        let latency = match host.status {
+        let trace = self.trace(host);
+        let latency = match trace.status {
             HostStatus::Online {
                 latency_ms: Some(ms),
             } => format!("{ms} ms"),
@@ -528,7 +615,7 @@ impl VaultContent {
                     } else {
                         ui.trace(
                             format!("trace-{}", host.name),
-                            host.status,
+                            trace,
                             marks::seed(&host.name),
                             t.text,
                             t.text3,
@@ -673,7 +760,6 @@ fn dev_server_group() -> HostGroup {
     let dev = Host {
         os: "This computer".into(),
         tags: vec!["dev".into()],
-        status: HostStatus::Online { latency_ms: None },
         auth: Auth::Key(PathBuf::from(DEV_KEY)),
         ..Host::new("tern-devserver", "tern", "127.0.0.1", 2222)
     };
@@ -923,6 +1009,67 @@ mod tests {
         click(cx, "delete-host");
         assert!(!editor_open(cx));
         vault.read_with(cx, |vault, _| assert!(vault.vault.find("db-new").is_none()));
+    }
+
+    #[gpui::test]
+    fn checks_hosts_at_their_first_hop(cx: &mut TestAppContext) {
+        use std::io::Write as _;
+        use std::time::{Duration, Instant};
+
+        use tern_core::HostStatus;
+
+        // A local server that only greets, which is all a check needs.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.write_all(b"SSH-2.0-Test\r\n");
+            }
+        });
+        let mut hosts = Vault::default();
+        hosts.save(None, Host::new("gateway", "me", "127.0.0.1", port), "Lab");
+        // Behind the gateway, so checked there; its own address is never
+        // tried.
+        let behind = Host {
+            jump: Some("gateway".into()),
+            ..Host::new("behind", "me", "192.0.2.1", 22)
+        };
+        hosts.save(None, behind, "Lab");
+        // The check's answer arrives from the SSH runtime's own threads.
+        cx.executor().allow_parking();
+
+        cx.update(gpui_kit::init);
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(hosts, None, LiveSlots::default(), window, cx)
+        });
+        let status = |cx: &mut VisualTestContext| {
+            vault.read_with(cx, |vault, _| {
+                vault.trace(vault.vault.find("behind").unwrap()).status
+            })
+        };
+        assert_eq!(status(cx), HostStatus::Unknown);
+
+        vault.update(cx, |vault, cx| vault.run_due_checks(cx));
+        assert_eq!(status(cx), HostStatus::Connecting);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while status(cx) == HostStatus::Connecting && Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reached = status(cx);
+        assert!(
+            matches!(
+                reached,
+                HostStatus::Online {
+                    latency_ms: Some(_)
+                }
+            ),
+            "{reached:?}"
+        );
+        vault.read_with(cx, |vault, _| {
+            let gateway = vault.vault.find("gateway").unwrap();
+            assert_eq!(vault.trace(gateway).samples.len(), 1);
+        });
     }
 
     #[gpui::test]

@@ -5,11 +5,10 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::*;
-use tern_core::HostStatus;
 use tern_core::randomart::Randomart;
 
 use crate::live::{LiveSlots, live};
-use crate::marks;
+use crate::marks::{self, Trace};
 use crate::theme::Theme;
 
 /// What a screen's builders need: the theme and where live marks register.
@@ -24,13 +23,13 @@ impl Ui<'_> {
     pub fn trace(
         &self,
         id: impl Into<SharedString>,
-        status: HostStatus,
+        trace: Trace,
         seed: u32,
         ink: Hsla,
         faint: Hsla,
     ) -> Canvas<()> {
         live(self.live, id, move |bounds, time, window| {
-            marks::paint_trace(bounds, status, seed, time, ink, faint, window)
+            marks::paint_trace(bounds, &trace, seed, time, ink, faint, window)
         })
     }
 }

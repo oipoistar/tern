@@ -29,25 +29,17 @@ claude.ai account). Each item below names the artboard it comes from.
       triple-click for a line, Shift+click extends; painted ink on paper and
       kept in place while output scrolls; Ctrl+Shift+C / Cmd+C copies,
       Ctrl+Shift+A / Cmd+A selects everything
+- [x] Real reachability (item 3): saved hosts are checked in the background
+      (TCP plus SSH greeting) every 30 s while the vault shows in the
+      active window, four at a time, a host behind a jump host at the jump
+      host; cards draw the last 40 measured samples
 
 ## Known gaps in what's built
 
-- Host status and latency on the cards are sample data (item 3).
 - The header's "Synced" is static text (item 14).
 - Only tested on Windows so far (item 23).
 
 ## Next, in order
-
-### 3. Real reachability
-The traces and latency become measured.
-- Check saved hosts in the background with `ssh::probe` (TCP plus SSH
-  greeting), every ~30 s, only while the vault shows and the window is active.
-  Cap how many run at once. For a host behind a jump host, check the jump host.
-- Keep the last ~40 samples per host. `marks::paint_trace` draws them instead
-  of today's procedural jitter (which is seeded per host and only scaled by
-  the sample latency).
-- Status goes Connecting while the first check runs, Offline when it fails,
-  and Unknown until checked.
 
 ### 4. Known hosts screen (sidebar "Known hosts")
 - Every trusted key: host[:port], key art, type, fingerprint. Hashed OpenSSH

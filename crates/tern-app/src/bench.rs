@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{App, Bounds, WindowBounds, point, px, size};
+use tern_core::reach::{KEEP, Monitor};
+use tern_core::{Host, HostGroup, Vault};
 
 /// Seconds discarded before sampling, so startup work doesn't skew results.
 const WARMUP: Duration = Duration::from_secs(2);
@@ -49,6 +51,53 @@ pub fn window_bounds() -> WindowBounds {
         point(px(-6000.), px(-6000.)),
         size(px(1280.), px(820.)),
     ))
+}
+
+/// What the benchmark draws: seven hosts in two groups, the same every run
+/// and never saved.
+pub fn vault() -> Vault {
+    let group = |name: &str, hosts: &[(&str, &str)]| HostGroup {
+        name: name.into(),
+        hosts: hosts
+            .iter()
+            .map(|(name, address)| Host::new(name, "deploy", address, 22))
+            .collect(),
+    };
+    Vault {
+        groups: vec![
+            group(
+                "Production",
+                &[
+                    ("prod-db-01", "10.0.4.21"),
+                    ("prod-web-01", "10.0.4.22"),
+                    ("prod-web-02", "10.0.4.23"),
+                    ("bastion", "10.0.4.1"),
+                ],
+            ),
+            group(
+                "Staging",
+                &[
+                    ("stage-api", "10.0.8.10"),
+                    ("stage-worker", "10.0.8.11"),
+                    ("pi-homelab", "192.168.1.40"),
+                ],
+            ),
+        ],
+    }
+}
+
+/// Gives every host in `vault` a full trace of made-up checks, the odd one
+/// failed, so the benchmark draws what a busy vault shows.
+pub fn fill(monitor: &mut Monitor, vault: &Vault) {
+    let now = Instant::now();
+    for (n, host) in vault.hosts().enumerate() {
+        let place = vault.first_hop(host);
+        for i in 0..KEEP {
+            let roll = (n * 31 + i * 17) % 23;
+            let latency_ms = (roll != 0).then_some(4 + (n * 7 + roll) as u32 % 40);
+            monitor.record(&place, latency_ms, now);
+        }
+    }
 }
 
 /// Marks the start of a frame's work; call first thing in the root render.

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Reachability of a saved host, as last observed.
+/// Reachability of a saved host, as last observed (see [`crate::reach`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostStatus {
     /// Never checked, like a host that was just added.
@@ -37,7 +37,7 @@ pub enum Auth {
     Password,
 }
 
-/// A saved host. Everything but `status` is kept in the vault file.
+/// A saved host, as kept in the vault file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
     pub name: String,
@@ -48,9 +48,6 @@ pub struct Host {
     pub os: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Observed while Tern runs, never saved.
-    #[serde(skip)]
-    pub status: HostStatus,
     #[serde(default)]
     pub auth: Auth,
     /// Another saved host to connect through first, by name.
@@ -78,7 +75,6 @@ impl Host {
             port,
             os: String::new(),
             tags: Vec::new(),
-            status: HostStatus::Unknown,
             auth: Auth::Agent,
             jump: None,
             keep_alive: true,
@@ -128,14 +124,12 @@ pub struct HostGroup {
     pub hosts: Vec<Host>,
 }
 
-/// Sample hosts with observed statuses, for tests and screenshots. A real
-/// vault starts empty.
+/// Sample hosts, for tests. A real vault starts empty.
 #[cfg(any(test, feature = "test-support"))]
 pub fn sample_groups() -> Vec<HostGroup> {
-    let host = |name: &str, user, address, port, os: &str, tags: &[&str], status| Host {
+    let host = |name: &str, user, address, port, os: &str, tags: &[&str]| Host {
         os: os.into(),
         tags: tags.iter().map(|t| t.to_string()).collect(),
-        status,
         ..Host::new(name, user, address, port)
     };
     vec![
@@ -149,7 +143,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Ubuntu 24.04",
                     &["postgres", "eu-west"],
-                    HostStatus::online(14),
                 ),
                 host(
                     "prod-web-01",
@@ -158,7 +151,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Debian 12",
                     &["nginx", "eu-west"],
-                    HostStatus::online(9),
                 ),
                 host(
                     "prod-web-02",
@@ -167,7 +159,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Debian 12",
                     &["nginx", "eu-west"],
-                    HostStatus::Connecting,
                 ),
                 host(
                     "bastion",
@@ -176,7 +167,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     2222,
                     "Alpine 3.20",
                     &["jump host"],
-                    HostStatus::online(38),
                 ),
             ],
         },
@@ -190,7 +180,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Ubuntu 22.04",
                     &["docker"],
-                    HostStatus::online(3),
                 ),
                 host(
                     "stage-worker",
@@ -199,7 +188,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Ubuntu 22.04",
                     &["docker"],
-                    HostStatus::Offline,
                 ),
                 host(
                     "pi-homelab",
@@ -208,7 +196,6 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Raspberry Pi OS",
                     &["raspberry pi"],
-                    HostStatus::online(1),
                 ),
             ],
         },

@@ -40,8 +40,9 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 
 ## Architecture in one breath
 
-`tern-core` has no UI: hosts and the in-memory `Vault` (`host.rs`,
-`vault.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
+`tern-core` has no UI: hosts and the `Vault` with its `vault.json`
+(`host.rs`, `vault.rs`), the bookkeeping of background reachability checks
+(`reach.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), reading PuTTY's saved sessions (`putty.rs`)

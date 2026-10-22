@@ -51,12 +51,11 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(FRAME).await;
                 // Redraw only while something moves: not on a terminal
-                // tab, and frozen while another app has focus.
+                // tab, and frozen while another app has focus or motion is
+                // reduced. The benchmark draws regardless.
                 let alive = this.update_in(cx, |this, window, cx| {
-                    if (window.is_window_active() || bench::enabled())
-                        && !cx.reduce_motion()
-                        && !this.live.is_empty()
-                    {
+                    let moving = window.is_window_active() && !cx.reduce_motion();
+                    if (moving || bench::enabled()) && !this.live.is_empty() {
                         cx.notify();
                     }
                 });
@@ -116,6 +115,8 @@ impl Workspace {
         self.active = tab;
         // Marks from the previous screen must not linger over the new one.
         self.live.clear();
+        self.vault
+            .update(cx, |vault, _| vault.set_showing(tab.is_none()));
         match tab {
             // The cached vault re-renders so its marks register again, with
             // art for any key trusted in a session meanwhile.
@@ -295,7 +296,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         bench::frame_start();
-        let time = if cx.reduce_motion() {
+        let time = if cx.reduce_motion() && !bench::enabled() {
             0.
         } else {
             self.started.elapsed().as_secs_f32()

@@ -1,8 +1,8 @@
 //! The saved hosts, in groups, and `vault.json`, the file they're kept in.
 //!
 //! The file holds no secrets (names, addresses, users and key-file paths,
-//! like `~/.ssh/config`); encrypting it belongs to sync. Observed status
-//! isn't saved.
+//! like `~/.ssh/config`); encrypting it belongs to sync. What checks observe
+//! (see [`crate::reach`]) isn't saved.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, HostGroup};
+use crate::reach::Place;
 use crate::ssh::{Connection, Jump};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -103,6 +104,17 @@ impl Vault {
         }
         self.groups.retain(|group| !group.hosts.is_empty());
         Ok(())
+    }
+
+    /// Where to check that `host` answers: its jump host, the first hop,
+    /// when it goes through one, otherwise the host itself.
+    pub fn first_hop(&self, host: &Host) -> Place {
+        let hop = host
+            .jump
+            .as_deref()
+            .and_then(|name| self.find(name))
+            .unwrap_or(host);
+        (hop.address.clone(), hop.port)
     }
 
     /// How to connect to `host`, with its jump host resolved.
@@ -305,7 +317,7 @@ fn set_aside(path: &Path, reason: &str) -> Opened {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{Auth, HostStatus};
+    use crate::host::Auth;
 
     fn names(vault: &Vault, group: usize) -> Vec<&str> {
         vault.groups[group]
@@ -409,7 +421,21 @@ mod tests {
     }
 
     #[test]
-    fn the_file_keeps_everything_but_observed_status() {
+    fn a_host_is_checked_at_its_first_hop() {
+        let mut vault = Vault::sample();
+        let db = vault.find("prod-db-01").unwrap().clone();
+        assert_eq!(vault.first_hop(&db), ("10.0.4.21".to_string(), 22));
+        let mut db = db;
+        db.jump = Some("bastion".into());
+        vault.save(Some("prod-db-01"), db.clone(), "Production");
+        assert_eq!(
+            vault.first_hop(&db),
+            ("bastion.example.com".to_string(), 2222)
+        );
+    }
+
+    #[test]
+    fn the_file_keeps_every_host_setting() {
         let dir = scratch("round-trip");
         let path = dir.join("vault.json");
         let mut vault = Vault::sample();
@@ -429,9 +455,6 @@ mod tests {
         let opened = open(&path);
         assert!(!opened.fresh && opened.notice.is_none());
         assert_eq!(opened.path.as_deref(), Some(path.as_path()));
-        for host in vault.groups.iter_mut().flat_map(|group| &mut group.hosts) {
-            host.status = HostStatus::Unknown;
-        }
         assert_eq!(opened.vault, vault);
 
         // Saving again replaces the file.

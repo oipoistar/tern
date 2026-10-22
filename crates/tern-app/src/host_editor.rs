@@ -11,20 +11,23 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::draft::{Field, HostDraft, Problem};
 use tern_core::randomart::Randomart;
+use tern_core::reach::Place;
 use tern_core::ssh::{KeyInfo, key_file_info, probe};
-use tern_core::{Auth, Host, HostStatus, Vault};
+use tern_core::{Auth, Host, Vault};
 
 use crate::live::LiveSlots;
-use crate::marks;
+use crate::marks::{self, Trace};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{Ui, art_tile, button, icon, ink_button, switch};
 
 pub enum EditorEvent {
     /// Save `host` into `group`; `replacing` is its name before editing.
+    /// `checked` is a Test connection result for the host's first hop.
     Save {
         replacing: Option<String>,
         host: Box<Host>,
         group: String,
+        checked: Option<(Place, u32)>,
     },
     Delete(String),
     Close,
@@ -238,21 +241,20 @@ impl HostEditor {
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
         match self.draft(cx).check(&self.vault, self.replacing.as_deref()) {
-            Ok(mut host) => {
-                // A direct check of this very address is fresh news.
-                if let Test::Reached {
-                    hop: None,
-                    latency_ms,
-                    at,
-                } = &self.test
-                    && *at == (host.address.clone(), host.port)
-                {
-                    host.status = HostStatus::online(*latency_ms);
-                }
+            Ok(host) => {
+                // A check of the place the vault will check is fresh news.
+                let first_hop = self.vault.first_hop(&host);
+                let checked = match &self.test {
+                    Test::Reached { latency_ms, at, .. } if *at == first_hop => {
+                        Some((first_hop, *latency_ms))
+                    }
+                    _ => None,
+                };
                 cx.emit(EditorEvent::Save {
                     replacing: self.replacing.clone(),
                     host: Box::new(host),
                     group: self.group.clone(),
+                    checked,
                 });
             }
             Err(problems) => {
@@ -846,7 +848,7 @@ impl HostEditor {
                 .child(
                     ui.trace(
                         "editor-test",
-                        HostStatus::online(*latency_ms),
+                        Trace::single(*latency_ms),
                         marks::seed("editor-test"),
                         t.text,
                         t.text3,

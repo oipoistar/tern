@@ -1,6 +1,6 @@
 //! The host editor's form, checked before it becomes a saved [`Host`].
 
-use crate::host::{Auth, Host, HostStatus};
+use crate::host::{Auth, Host};
 use crate::vault::Vault;
 
 /// A host as typed into the editor.
@@ -71,8 +71,8 @@ impl HostDraft {
     }
 
     /// Checks the draft against the vault. `replacing` is the name of the
-    /// host being edited, so it doesn't clash with itself; its status and
-    /// OS carry over. Every problem is reported, in form order.
+    /// host being edited, so it doesn't clash with itself; its OS carries
+    /// over. Every problem is reported, in form order.
     pub fn check(&self, vault: &Vault, replacing: Option<&str>) -> Result<Host, Vec<Problem>> {
         let mut problems = Vec::new();
         let mut problem = |field, message: &str| {
@@ -148,7 +148,6 @@ impl HostDraft {
             port: port.unwrap_or(22),
             os: previous.map(|host| host.os.clone()).unwrap_or_default(),
             tags: normalize_tags(&self.tags),
-            status: previous.map_or(HostStatus::Unknown, |host| host.status),
             auth: self.auth.clone(),
             jump: self.jump.as_deref().map(|jump| jump.trim().to_string()),
             keep_alive: self.keep_alive,
@@ -202,7 +201,6 @@ mod tests {
         );
         assert_eq!(host.tags, ["SQL", "eu"]);
         assert_eq!(host.on_login, None);
-        assert_eq!(host.status, HostStatus::Unknown);
     }
 
     #[test]
@@ -226,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_keeps_the_name_and_status() {
+    fn editing_changes_nothing_by_itself() {
         let vault = Vault::sample();
         let db = vault.find("prod-db-01").unwrap();
         let host = HostDraft::edit(db, "Production")
