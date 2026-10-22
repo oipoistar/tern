@@ -15,6 +15,7 @@ pub mod paths;
 pub mod putty;
 pub mod randomart;
 pub mod reach;
+pub mod reconnect;
 pub mod secrets;
 pub mod settings;
 pub mod sftp;

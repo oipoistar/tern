@@ -2,7 +2,8 @@
 //! alacritty_terminal and drawn cell by cell with GPUI.
 //!
 //! Before the shell is live the pane shows what the connection needs: trust
-//! for an unknown host key, a password, or a way to reconnect.
+//! for an unknown host key, a password, or a way to reconnect. A dropped
+//! connection reconnects by itself, keeping what was on screen.
 //!
 //! Dragging selects text (double-click a word, triple-click a line,
 //! Shift+click extends), painted inverted; Ctrl+Shift+C (Cmd+C on macOS)
@@ -34,6 +35,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{self, Visit};
+use tern_core::reconnect;
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
@@ -49,6 +51,12 @@ const LINE_SPACING: f32 = 1.35;
 const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(120);
 /// Lines a session's preview keeps: those ending at the cursor.
 const PREVIEW_LINES: i32 = 9;
+/// What a reconnected shell starts on: the modes the last program may have
+/// left on switched off (mouse reporting, application keys, bracketed
+/// paste, a hidden cursor, colours, a scroll region), and a clear screen,
+/// whose old lines move into the scrollback.
+const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\
+\x1b[?1l\x1b>\x1b[?2004l\x1b[?25h\x1b[0m\x1b[r\x1b[2J\x1b[H";
 
 /// The last lines of a session, shared with the vault's side panel.
 pub type Preview = Rc<RefCell<Vec<String>>>;
@@ -112,6 +120,12 @@ pub struct TerminalView {
     started: u64,
     /// Since when the shell has been up.
     live_since: Option<Instant>,
+    /// A shell has run in this pane, so a new one continues below it.
+    had_shell: bool,
+    /// Reconnecting after the connection dropped: the attempt being made
+    /// or waited for, counting from 1.
+    reconnect: Option<u32>,
+    _retry: Option<Task<()>>,
     preview: Preview,
     /// The scrollback and cursor the terminal was last configured with.
     configured: (usize, CursorStyle),
@@ -302,6 +316,9 @@ impl TerminalView {
             selecting: false,
             started: history::now(),
             live_since: None,
+            had_shell: false,
+            reconnect: None,
+            _retry: None,
             preview: Preview::default(),
             configured: (terminal.scrollback, terminal.cursor),
             flash_until: None,
@@ -421,11 +438,22 @@ impl TerminalView {
             Event::Connected => {
                 self.phase = Phase::Live;
                 self.live_since = Some(Instant::now());
-                self.term = Term::new(
-                    term_config(&settings::current(cx).terminal),
-                    &GridSize(self.size),
-                    Listener(self.term_events.clone()),
-                );
+                self.reconnect = None;
+                if self.had_shell {
+                    // Reconnected: the scrollback stays.
+                    if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                        self.parser.advance(&mut self.term, b"\x1b[?1049l");
+                    }
+                    self.parser.advance(&mut self.term, FRESH_MODES);
+                    self.title = None;
+                } else {
+                    self.term = Term::new(
+                        term_config(&settings::current(cx).terminal),
+                        &GridSize(self.size),
+                        Listener(self.term_events.clone()),
+                    );
+                }
+                self.had_shell = true;
                 // Queued now, it reaches the shell as soon as it starts.
                 if let Some(command) = &self.connection.on_login {
                     self.send(format!("{command}\r").into_bytes());
@@ -453,8 +481,26 @@ impl TerminalView {
                 };
                 self.end(message, cx);
             }
+            Event::Lost => {
+                self.input = None;
+                cx.emit(TerminalEvent::Finished(self.visit("Connection lost")));
+                self.live_since = None;
+                self.retry(1, cx);
+            }
+            // While reconnecting, what may pass by itself is tried again
+            // later; the attempts in between aren't History's business.
+            Event::Failed(error)
+                if self.reconnect.is_some_and(|attempt| {
+                    reconnect::worth_retrying(&error) && reconnect::delay(attempt + 1).is_some()
+                }) =>
+            {
+                self.input = None;
+                let next = self.reconnect.map_or(1, |attempt| attempt + 1);
+                self.retry(next, cx);
+            }
             Event::Failed(error) => {
                 self.input = None;
+                self.reconnect = None;
                 match error {
                     ConnectError::UnknownHostKey { host, port, key, fingerprint } => self.phase = Phase::Trust {
                         host: if port == 22 { host.into() } else { format!("{host}:{port}").into() },
@@ -477,6 +523,40 @@ impl TerminalView {
             }
         }
         cx.notify();
+    }
+
+    /// Waits, then makes reconnect attempt `attempt`.
+    fn retry(&mut self, attempt: u32, cx: &mut Context<Self>) {
+        let Some(delay) = reconnect::delay(attempt) else {
+            return;
+        };
+        self.reconnect = Some(attempt);
+        self.phase = Phase::Connecting;
+        self._retry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |view, cx| view.reconnect_now(cx));
+        }));
+        cx.notify();
+    }
+
+    /// Makes the awaited reconnect attempt without waiting any longer.
+    fn reconnect_now(&mut self, cx: &mut Context<Self>) {
+        if self.reconnect.is_some() && self.input.is_none() {
+            self._retry = None;
+            self.connect(cx);
+        }
+    }
+
+    /// Stops reconnecting, closing an attempt in progress.
+    fn stop_reconnecting(&mut self, cx: &mut Context<Self>) {
+        if self.reconnect.take().is_some() {
+            self._retry = None;
+            self.input = None;
+            self._events = None;
+            // History already has the drop.
+            self.phase = Phase::Ended("Connection lost".into());
+            cx.notify();
+        }
     }
 
     /// Replies to queries the remote program made of the terminal (cursor
@@ -604,6 +684,11 @@ impl TerminalView {
                 _ => return,
             },
             Phase::Ended(_) if keystroke.key == "enter" => self.connect(cx),
+            Phase::Connecting if self.reconnect.is_some() => match keystroke.key.as_str() {
+                "enter" => self.reconnect_now(cx),
+                "escape" => self.stop_reconnecting(cx),
+                _ => return,
+            },
             _ => return,
         }
         cx.stop_propagation();
@@ -1282,6 +1367,26 @@ impl TerminalView {
 
         Some(match &self.phase {
             Phase::Live => return None,
+            Phase::Connecting if self.reconnect.is_some() => card(
+                format!("Reconnecting to {target}").into(),
+                Some(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        // Now, unless an attempt is already on its way.
+                        .when(self.input.is_none(), |d| {
+                            d.child(
+                                button("reconnect-now", "Reconnect now", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.reconnect_now(cx))),
+                            )
+                        })
+                        .child(
+                            button("stop-reconnecting", "Cancel", false)
+                                .on_click(cx.listener(|this, _, _, cx| this.stop_reconnecting(cx))),
+                        )
+                        .into_any_element(),
+                ),
+            ),
             Phase::Connecting => card(target.into(), None),
             Phase::Trust {
                 host, fingerprint, ..
@@ -2085,6 +2190,84 @@ mod tests {
         click(cx, at, 2, Modifiers::none());
         assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
         assert_eq!(sent(cx), "");
+    }
+
+    #[gpui::test]
+    fn reconnects_after_a_dropped_connection(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use alacritty_terminal::grid::Dimensions as _;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::TermMode;
+        use tern_core::ssh::ConnectError;
+
+        use super::{Phase, TerminalEvent};
+
+        // A program had switched mouse reporting on when the line dropped.
+        let (view, cx) = pane_with(cx, "before\r\n\x1b[?1000h");
+        let ended: Rc<RefCell<Vec<String>>> = Rc::default();
+        let recorded = ended.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
+                if let TerminalEvent::Finished(visit) = event {
+                    recorded.borrow_mut().push(visit.ended.clone());
+                }
+            })
+            .detach()
+        });
+        let event = |event: Event, cx: &mut VisualTestContext| {
+            view.update(cx, |view, cx| view.on_session_event(event, cx))
+        };
+        let attempt = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.reconnect);
+
+        event(Event::Lost, cx);
+        assert_eq!(attempt(cx), Some(1));
+        assert_eq!(*ended.borrow(), ["Connection lost"]);
+        // What may pass by itself is tried again, and History hears
+        // nothing of it.
+        event(
+            Event::Failed(ConnectError::Other("connection refused".into())),
+            cx,
+        );
+        assert_eq!(attempt(cx), Some(2));
+        assert_eq!(ended.borrow().len(), 1);
+
+        // Back on a clear screen: what was on it is in the scrollback, and
+        // the program's modes are gone.
+        event(Event::Connected, cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.is_live() && view.reconnect.is_none());
+            assert!(!view.term.mode().intersects(TermMode::MOUSE_MODE));
+            let row = |line: Line| -> String {
+                (0..6)
+                    .map(|c| view.term.grid()[line][Column(c)].c)
+                    .collect()
+            };
+            assert_eq!(row(view.term.topmost_line()), "before");
+            assert_eq!(row(Line(0)).trim(), "");
+        });
+
+        // A refused sign-in needs the user.
+        event(Event::Lost, cx);
+        event(
+            Event::Failed(ConnectError::AuthFailed { tried: Vec::new() }),
+            cx,
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.reconnect.is_none());
+            assert!(matches!(view.phase, Phase::Password { .. }));
+        });
+
+        // Escape stops waiting.
+        event(Event::Connected, cx);
+        event(Event::Lost, cx);
+        focus(&view, cx);
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| {
+            assert!(view.reconnect.is_none());
+            assert!(matches!(&view.phase, Phase::Ended(message) if message == "Connection lost"));
+        });
     }
 
     #[gpui::test]

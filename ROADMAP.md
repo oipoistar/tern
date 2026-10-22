@@ -97,6 +97,12 @@ claude.ai account). Each item below names the artboard it comes from.
       get the mouse (clicks, drags, motion, wheel; SGR and UTF-8), Shift
       keeps it for selecting, and the wheel sends arrows to full-screen
       programs that don't take it; the visual bell came with Settings
+- [x] More SSH (item 18): jump hosts that go through jump hosts, OpenSSH
+      host and user certificates, and reconnecting by itself after a
+      dropped connection (told apart from a shell that ended): a second,
+      doubling to half a minute, eight tries; a refused sign-in or a key
+      problem stops it for the user; the new shell starts on a clear
+      screen with the old one in the scrollback
 
 ## Known gaps in what's built
 
@@ -116,9 +122,6 @@ claude.ai account). Each item below names the artboard it comes from.
   page (Google Drive, Dropbox, OneDrive, iCloud Drive) where a folder isn't
   enough.
 - No Tern servers and no accounts, ever.
-
-### 18. More SSH
-- Reconnect automatically after a dropped connection.
 
 ### 19. macOS and Linux
 - Built and tested on Windows only so far. Check:

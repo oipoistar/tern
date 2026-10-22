@@ -225,10 +225,13 @@ pub enum Event {
     Connected,
     /// Bytes for the terminal (stdout and stderr interleaved, as a PTY does).
     Output(Vec<u8>),
-    /// The shell ended or the connection dropped.
+    /// The shell ended, or the server closed it.
     Closed {
         exit_status: Option<u32>,
     },
+    /// The connection dropped (the network, or the server went away)
+    /// while the shell was still running.
+    Lost,
     Failed(ConnectError),
     /// A port forwarding rule started, stopped or couldn't start.
     Forwarding {
@@ -444,6 +447,8 @@ async fn run(
     let (mut reader, writer) = channel.split();
 
     let mut exit_status = None;
+    // The channel went away without the server closing it.
+    let mut lost = false;
     loop {
         tokio::select! {
             message = reader.wait() => match message {
@@ -451,12 +456,17 @@ async fn run(
                     let _ = events.send(Event::Output(data.to_vec()));
                 }
                 Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => break,
+                None => {
+                    lost = true;
+                    break;
+                }
                 Some(_) => {}
             },
             command = input.recv() => match command {
                 Some(Input::Data(bytes)) => {
                     if writer.data(&bytes[..]).await.is_err() {
+                        lost = true;
                         break;
                     }
                 }
@@ -487,7 +497,12 @@ async fn run(
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
-    let _ = events.send(Event::Closed { exit_status });
+    // A shell that reported its exit ended, however the channel went.
+    let _ = events.send(if lost && exit_status.is_none() {
+        Event::Lost
+    } else {
+        Event::Closed { exit_status }
+    });
     Ok(())
 }
 
