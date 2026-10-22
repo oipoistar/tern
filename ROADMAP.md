@@ -25,6 +25,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Saved vault (item 1): `vault.json` in the data folder, versioned, no
       secrets, written through a temp file; an unreadable file is moved
       aside, a newer one left alone; empty on a fresh install
+- [x] Terminal select and copy (item 2): drag, double-click for a word,
+      triple-click for a line, Shift+click extends; painted ink on paper and
+      kept in place while output scrolls; Ctrl+Shift+C / Cmd+C copies,
+      Ctrl+Shift+A / Cmd+A selects everything
 
 ## Known gaps in what's built
 
@@ -33,13 +37,6 @@ claude.ai account). Each item below names the artboard it comes from.
 - Only tested on Windows so far (item 23).
 
 ## Next, in order
-
-### 2. Terminal select and copy
-- Drag to select, using alacritty_terminal's `Selection`. Double-click selects
-  a word, triple-click a line, Shift+click extends.
-- Copy with Ctrl+Shift+C (Cmd+C on macOS). Optionally copy on select.
-- Paint the selection inverted (ink on paper inside the terminal palette). It
-  stays put while output scrolls.
 
 ### 3. Real reachability
 The traces and latency become measured.
@@ -117,7 +114,8 @@ The traces and latency become measured.
 
 ### 12. Settings (Sync artboard tabs: General, Terminal, Appearance, Sync)
 - Appearance: light, dark or system.
-- Terminal: font family and size, cursor style, scrollback length, bell.
+- Terminal: font family and size, cursor style, scrollback length, bell,
+  copy on select.
 - `settings.json` in the data folder.
 - The header's sliders button opens Settings (mockup).
 

@@ -3,16 +3,22 @@
 //!
 //! Before the shell is live the pane shows what the connection needs: trust
 //! for an unknown host key, a password, or a way to reconnect.
+//!
+//! Dragging selects text (double-click a word, triple-click a line,
+//! Shift+click extends), painted inverted; Ctrl+Shift+C (Cmd+C on macOS)
+//! copies it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
 use gpui_kit::*;
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
@@ -56,6 +62,19 @@ pub struct TerminalView {
     size: TermSize,
     title: Option<SharedString>,
     focus: FocusHandle,
+    /// Where the grid was last painted, for finding the cell under the
+    /// pointer.
+    grid: Rc<Cell<GridGeometry>>,
+    /// A drag is extending the selection.
+    selecting: bool,
+}
+
+/// Where the grid sits in the window, as of the last paint.
+#[derive(Clone, Copy, Default)]
+struct GridGeometry {
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
 }
 
 /// Collects events alacritty_terminal raises while parsing output.
@@ -84,6 +103,13 @@ impl Dimensions for GridSize {
 
 impl TerminalView {
     pub fn new(connection: Connection, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::idle(connection, cx);
+        view.connect(cx);
+        view
+    }
+
+    /// A pane for `connection` that hasn't started connecting.
+    fn idle(connection: Connection, cx: &mut Context<Self>) -> Self {
         let size = TermSize {
             cols: 100,
             rows: 30,
@@ -93,7 +119,7 @@ impl TerminalView {
             scrolling_history: SCROLLBACK,
             ..Default::default()
         };
-        let mut view = Self {
+        Self {
             connection,
             password: None,
             trust: None,
@@ -106,9 +132,9 @@ impl TerminalView {
             size,
             title: None,
             focus: cx.focus_handle(),
-        };
-        view.connect(cx);
-        view
+            grid: Rc::default(),
+            selecting: false,
+        }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -258,12 +284,24 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if is_copy(keystroke) {
+            self.copy(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if is_select_all(keystroke) {
+            self.select_all();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         match &mut self.phase {
             Phase::Live => {
                 if is_paste(keystroke) {
                     self.paste(cx);
                 } else if let Some(bytes) = encode_key(keystroke, *self.term.mode()) {
                     self.term.scroll_display(Scroll::Bottom);
+                    self.term.selection = None;
                     self.send(bytes);
                 } else {
                     return;
@@ -298,6 +336,7 @@ impl TerminalView {
         match &mut self.phase {
             Phase::Live => {
                 self.term.scroll_display(Scroll::Bottom);
+                self.term.selection = None;
                 self.send(text.as_bytes().to_vec());
             }
             Phase::Password { typed, .. } => typed.push_str(text),
@@ -319,7 +358,79 @@ impl TerminalView {
             text
         };
         self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
         self.send(bytes.into_bytes());
+    }
+
+    /// The cell under `position` in the window, and which half of it.
+    fn cell_at(&self, position: Point<Pixels>) -> (GridPoint, Side) {
+        let grid = self.grid.get();
+        let x = ((position.x - grid.origin.x) / grid.cell_width.max(px(1.))).max(0.);
+        let y = ((position.y - grid.origin.y) / grid.line_height.max(px(1.))).max(0.);
+        let last_column = usize::from(self.size.cols).saturating_sub(1);
+        let column = (x as usize).min(last_column);
+        // Past the last column counts as its right half.
+        let side = if x as usize > last_column || x.fract() >= 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        let line = (y as usize).min(usize::from(self.size.rows).saturating_sub(1));
+        let offset = self.term.grid().display_offset();
+        (
+            viewport_to_point(offset, GridPoint::new(line, Column(column))),
+            side,
+        )
+    }
+
+    /// Starts a selection: by character, by word on a double-click, by line
+    /// on a triple-click. Shift+click extends the current one instead.
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window, cx);
+        let (point, side) = self.cell_at(event.position);
+        let kind = match event.click_count {
+            0 | 1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        match &mut self.term.selection {
+            Some(selection) if event.modifiers.shift && kind == SelectionType::Simple => {
+                selection.update(point, side)
+            }
+            _ => self.term.selection = Some(Selection::new(kind, point, side)),
+        }
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        let (point, side) = self.cell_at(position);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(point, side);
+            cx.notify();
+        }
+    }
+
+    fn copy(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self
+            .term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Selects the whole scrollback and screen.
+    fn select_all(&mut self) {
+        let top = GridPoint::new(self.term.topmost_line(), Column(0));
+        let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
+        let mut all = Selection::new(SelectionType::Lines, top, Side::Left);
+        all.update(bottom, Side::Right);
+        self.term.selection = Some(all);
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -349,6 +460,7 @@ impl TerminalView {
         let cursor_at = (show_cursor && (0..rows as i32).contains(&cursor_row))
             .then_some((cursor_row as usize, cursor.point.column.0));
         let block_cursor = focused && cursor.shape == CursorShape::Block;
+        let selection = content.selection;
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
@@ -367,6 +479,11 @@ impl TerminalView {
             }
             if cell.flags.contains(Flags::HIDDEN) {
                 fg = bg;
+            }
+            // Selected text is ink on paper, whatever its own colours.
+            if selection.is_some_and(|range| range.contains(indexed.point)) {
+                fg = palette.background;
+                bg = palette.foreground;
             }
             if block_cursor && cursor_at == Some((row, col)) {
                 fg = palette.background;
@@ -451,6 +568,8 @@ impl TerminalView {
                 .justify_center()
                 .child(
                     div()
+                        // Clicks here are for the card, not a selection.
+                        .occlude()
                         .max_w(px(520.))
                         .p(px(22.))
                         .rounded(px(22.))
@@ -572,8 +691,10 @@ impl Render for TerminalView {
         let frame = Rc::new(self.frame(&palette, focused));
         let entity = cx.entity();
         let this = entity.downgrade();
+        let dragging = this.clone();
         let focus = self.focus.clone();
         let current = self.size;
+        let grid = self.grid.clone();
 
         div()
             .id("terminal")
@@ -581,9 +702,14 @@ impl Render for TerminalView {
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(Self::scroll))
-            .on_mouse_down(
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus(window, cx)),
+                cx.listener(|this, _, _, _| this.selecting = false),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.selecting = false),
             )
             .relative()
             .size_full()
@@ -600,11 +726,23 @@ impl Render for TerminalView {
                                 let _ = this.update(cx, |view, cx| view.resize(size, cx));
                             });
                         }
+                        grid.set(GridGeometry {
+                            origin: bounds.origin,
+                            cell_width: metrics.cell_width,
+                            line_height: metrics.line_height,
+                        });
                         metrics
                     },
                     move |bounds, metrics, window, cx| {
                         window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
                         paint_frame(&frame, &metrics, bounds.origin, window, cx);
+                        // Follows a selection drag even outside the pane.
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble && event.dragging() {
+                                let _ = dragging
+                                    .update(cx, |view, cx| view.drag_to(event.position, cx));
+                            }
+                        });
                     },
                 )
                 .size_full(),
@@ -902,9 +1040,23 @@ fn resolve(color: AnsiColor, colors: &Colors, palette: &TermPalette) -> Hsla {
     }
 }
 
-fn is_paste(keystroke: &Keystroke) -> bool {
+/// Ctrl+Shift+`key`, or Cmd+`key` on macOS: the terminal's own shortcuts,
+/// leaving plain Ctrl+`key` to the shell.
+fn is_shortcut(keystroke: &Keystroke, key: &str) -> bool {
     let m = &keystroke.modifiers;
-    keystroke.key == "v" && ((m.control && m.shift) || m.platform)
+    keystroke.key == key && ((m.control && m.shift) || m.platform)
+}
+
+fn is_paste(keystroke: &Keystroke) -> bool {
+    is_shortcut(keystroke, "v")
+}
+
+fn is_copy(keystroke: &Keystroke) -> bool {
+    is_shortcut(keystroke, "c")
+}
+
+fn is_select_all(keystroke: &Keystroke) -> bool {
+    is_shortcut(keystroke, "a")
 }
 
 /// Encodes a key press as the bytes an xterm-compatible terminal would send.
@@ -990,9 +1142,125 @@ mod tests {
     // Explicit imports: `gpui_kit::*` brings GPUI's own `test` macro, which
     // would shadow Rust's `#[test]`.
     use alacritty_terminal::term::TermMode;
-    use gpui_kit::{Keystroke, Modifiers};
+    use gpui::{
+        MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, TestAppContext,
+        VisualTestContext, point,
+    };
+    use gpui_kit::{Entity, Keystroke, Modifiers};
+    use tern_core::ssh::{Connection, Event, Target};
 
-    use super::encode_key;
+    use super::{TerminalView, encode_key};
+    use crate::theme::{self, TermPalette};
+
+    /// A live pane showing `output` as a shell would print it, with no
+    /// connection behind it.
+    fn pane_with<'a>(
+        cx: &'a mut TestAppContext,
+        output: &str,
+    ) -> (Entity<TerminalView>, &'a mut VisualTestContext) {
+        cx.update(gpui_kit::init);
+        let output = output.as_bytes().to_vec();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let target = Target {
+                host: "example".into(),
+                port: 22,
+                user: "me".into(),
+            };
+            let mut view = TerminalView::idle(Connection::typed(target, None), cx);
+            view.on_session_event(Event::Connected, cx);
+            view.on_session_event(Event::Output(output), cx);
+            view
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// The middle of a cell's left or right half, in the window.
+    fn cell(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        line: usize,
+        column: usize,
+        right_half: bool,
+    ) -> Point<Pixels> {
+        let grid = view.read_with(cx, |view, _| view.grid.get());
+        let x = column as f32 + if right_half { 0.75 } else { 0.25 };
+        point(
+            grid.origin.x + grid.cell_width * x,
+            grid.origin.y + grid.line_height * (line as f32 + 0.5),
+        )
+    }
+
+    /// Presses and releases the left button, as the `clicks`-th click.
+    fn click(
+        cx: &mut VisualTestContext,
+        position: Point<Pixels>,
+        clicks: usize,
+        modifiers: Modifiers,
+    ) {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers,
+            click_count: clicks,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers,
+            click_count: clicks,
+        });
+    }
+
+    fn selected(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |view, _| view.term.selection_to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    #[gpui::test]
+    fn selects_and_copies_text(cx: &mut TestAppContext) {
+        let (view, cx) = pane_with(cx, "hello world\r\nsecond line");
+
+        // Dragging selects by character, painted ink on paper.
+        let (from, to) = (cell(&view, cx, 0, 0, false), cell(&view, cx, 0, 4, true));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
+        view.read_with(cx, |view, cx| {
+            let palette = TermPalette::for_theme(&theme::current(cx));
+            let frame = view.frame(&palette, false);
+            let span = &frame.rows[0].backgrounds[0];
+            assert_eq!((span.start, span.end), (0, 5));
+            assert_eq!(span.color, palette.foreground);
+        });
+
+        // The terminal's copy shortcut; plain Ctrl+C stays the shell's.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-shift-c"
+        });
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("hello"));
+
+        // Shift+click extends; a double-click takes a word, a triple-click
+        // the line; a plain click clears.
+        let end_of_world = cell(&view, cx, 0, 10, true);
+        click(cx, end_of_world, 1, Modifiers::shift());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello world"));
+        let in_line = cell(&view, cx, 1, 8, false);
+        click(cx, in_line, 2, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("line"));
+        click(cx, in_line, 3, Modifiers::none());
+        assert_eq!(
+            selected(&view, cx).as_deref().map(str::trim_end),
+            Some("second line")
+        );
+        click(cx, in_line, 1, Modifiers::none());
+        assert_eq!(selected(&view, cx), None);
+    }
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
