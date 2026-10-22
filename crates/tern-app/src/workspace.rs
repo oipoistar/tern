@@ -180,7 +180,7 @@ impl Workspace {
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(icon(IconName::Check, 14., check))
-                            .child("Synced · Google Drive")
+                            .child("Synced")
                     }
                 }),
             )

@@ -40,9 +40,7 @@ pub struct VaultContent {
 
 impl VaultContent {
     pub fn new(slots: GlassSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let quick = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search hosts, or paste ssh user@host -p 22")
-        });
+        let quick = cx.new(|cx| InputState::new(window, cx).placeholder("Search or ssh user@host"));
         let subscription = cx.subscribe_in(
             &quick,
             window,
@@ -78,7 +76,6 @@ impl VaultContent {
     }
 
     fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
-        let theme = ui.theme;
         let mut seed = 3.;
         div()
             .id("hosts")
@@ -97,22 +94,10 @@ impl VaultContent {
                     .gap(px(12.))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
                             .px(px(4.))
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(group.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme.text3)
-                                    .child(format!("{} hosts", group.hosts.len())),
-                            ),
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(group.name.clone()),
                     )
                     .child(
                         div()
@@ -300,23 +285,12 @@ impl VaultContent {
                     ))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(12.))
                             .text_color(theme.text2)
                             .truncate()
                             .child(host.tags.join(" · ")),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.))
-                            .text_color(theme.text3)
-                            .child(format!("{} · port {}", host.os, host.port)),
                     )
                     .child(
                         div()
@@ -388,12 +362,12 @@ fn dev_server_group() -> HostGroup {
 fn sidebar(ui: &Ui) -> impl IntoElement {
     let theme = ui.theme;
     let items = [
-        (IconName::Server, "Hosts", "7"),
-        (IconName::KeyRound, "Keychain", "4"),
-        (IconName::CodeXml, "Snippets", "18"),
-        (IconName::ArrowLeftRight, "Port forwarding", "2"),
-        (IconName::ShieldCheck, "Known hosts", "9"),
-        (IconName::Clock, "History", ""),
+        (IconName::Server, "Hosts"),
+        (IconName::KeyRound, "Keychain"),
+        (IconName::CodeXml, "Snippets"),
+        (IconName::ArrowLeftRight, "Port forwarding"),
+        (IconName::ShieldCheck, "Known hosts"),
+        (IconName::Clock, "History"),
     ];
     div()
         .w(px(220.))
@@ -401,104 +375,26 @@ fn sidebar(ui: &Ui) -> impl IntoElement {
         .flex()
         .flex_col()
         .gap(px(4.))
-        .children(
-            items
-                .into_iter()
-                .enumerate()
-                .map(|(i, (name, label, count))| {
-                    let active = i == 0;
-                    let fg = if active { theme.text } else { theme.text2 };
-                    div()
-                        .h(px(42.))
-                        .px(px(14.))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .rounded(px(14.))
-                        .when(active, |d| d.bg(theme.card).shadow(theme.shadow()))
-                        .text_color(fg)
-                        .font_weight(if active {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::MEDIUM
-                        })
-                        .child(icon(name, 18., fg))
-                        .child(div().flex_1().child(label))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.text3)
-                                .child(count),
-                        )
-                }),
-        )
-        .child(div().flex_1())
-        .child(sync_card(ui))
-}
-
-fn sync_card(ui: &Ui) -> impl IntoElement {
-    let theme = ui.theme;
-    div()
-        .p(px(14.))
-        .rounded(px(20.))
-        .bg(theme.card)
-        .shadow(theme.shadow())
-        .flex()
-        .flex_col()
-        .gap(px(10.))
-        .child(
+        .children(items.into_iter().enumerate().map(|(i, (name, label))| {
+            let active = i == 0;
+            let fg = if active { theme.text } else { theme.text2 };
             div()
+                .h(px(42.))
+                .px(px(14.))
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .child(ui.glass(
-                    "sync-tile",
-                    Tone::Ok,
-                    Milk::Regular,
-                    12.,
-                    theme.card,
-                    2.1,
-                    {
-                        let color = theme.glass_text;
-                        move || {
-                            div()
-                                .size(px(36.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon(IconName::Cloud, 18., color))
-                        }
-                    },
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Google Drive"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.text3)
-                                .child("Synced 2 min ago"),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .text_size(px(12.))
-                .text_color(theme.text2)
-                .child(icon(IconName::Lock, 14., theme.text2))
-                .child("Encrypted on this device"),
-        )
+                .gap(px(12.))
+                .rounded(px(14.))
+                .when(active, |d| d.bg(theme.card).shadow(theme.shadow()))
+                .text_color(fg)
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .child(icon(name, 18., fg))
+                .child(label)
+        }))
 }
 
 fn status_chip(ui: &Ui, id: String, status: HostStatus, seed: f32) -> AnyElement {

@@ -15,7 +15,6 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::ssh::{
     ConnectError, ConnectRequest, Credential, Event, HostKey, Session, SessionInput, Target,
@@ -181,8 +180,8 @@ impl TerminalView {
             Event::Closed { exit_status } => {
                 self.input = None;
                 self.phase = Phase::Ended(match exit_status {
-                    Some(status) => format!("The session ended (exit status {status}).").into(),
-                    None => "The connection closed.".into(),
+                    Some(status) => format!("Exited with status {status}").into(),
+                    None => "Connection closed".into(),
                 });
             }
             Event::Failed(error) => {
@@ -191,9 +190,10 @@ impl TerminalView {
                     ConnectError::UnknownHostKey { key, fingerprint } => Phase::Trust { key: *key, fingerprint: fingerprint.into() },
                     ConnectError::AuthFailed { .. } => Phase::Password { typed: String::new(), rejected: self.password.is_some() },
                     ConnectError::HostKeyChanged { fingerprint, file, line } => Phase::Ended(
+                        // The one place the extra words earn their keep: this
+                        // may be an attack, and the user needs the line to fix it.
                         format!(
-                            "Refusing to connect: the host key changed to {fingerprint}. It doesn't match line {line} of {}. \
-                             If the server was reinstalled, remove that line; otherwise someone may be intercepting the connection.",
+                            "Host key changed to {fingerprint}, possible interception. Known key: {}:{line}",
                             file.display()
                         )
                         .into(),
@@ -287,15 +287,12 @@ impl TerminalView {
                 "backspace" => {
                     typed.pop();
                 }
-                "escape" => self.phase = Phase::Ended("Login cancelled.".into()),
+                "escape" => self.phase = Phase::Ended("Cancelled".into()),
                 _ => return,
             },
             Phase::Trust { .. } => match keystroke.key.as_str() {
                 "enter" => self.trust_and_connect(cx),
-                "escape" => {
-                    self.phase =
-                        Phase::Ended("Host key not trusted; nothing was sent to the server.".into())
-                }
+                "escape" => self.phase = Phase::Ended("Not trusted".into()),
                 _ => return,
             },
             Phase::Ended(_) if keystroke.key == "enter" => self.connect(cx),
@@ -452,7 +449,7 @@ impl TerminalView {
     }
 
     fn overlay(&self, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
-        let card = |title: SharedString, body: AnyElement| {
+        let card = |title: SharedString, body: Option<AnyElement>| {
             div()
                 .absolute()
                 .top_0()
@@ -471,14 +468,14 @@ impl TerminalView {
                         .shadow(theme.shadow())
                         .flex()
                         .flex_col()
-                        .gap(px(12.))
+                        .gap(px(14.))
                         .child(
                             div()
                                 .text_size(px(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(title),
                         )
-                        .child(body),
+                        .children(body),
                 )
                 .into_any_element()
         };
@@ -499,8 +496,6 @@ impl TerminalView {
                 .cursor_pointer()
                 .child(label)
         };
-        let muted =
-            |text: SharedString| div().text_size(px(13.)).text_color(theme.text2).child(text);
         let target = format!(
             "{}@{}:{}",
             self.target.user, self.target.host, self.target.port
@@ -508,71 +503,69 @@ impl TerminalView {
 
         Some(match &self.phase {
             Phase::Live => return None,
-            Phase::Connecting => card(format!("Connecting to {target}").into(), muted("Negotiating keys…".into()).into_any_element()),
+            Phase::Connecting => card(target.into(), None),
             Phase::Trust { fingerprint, .. } => card(
-                "Trust this server?".into(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .child(muted(format!("{target} isn't in your known hosts yet. Check its fingerprint with the server's owner:").into()))
-                    .child(
-                        div()
-                            .p(px(10.))
-                            .rounded(px(10.))
-                            .bg(theme.card2)
-                            .font_family(MONO)
-                            .text_size(px(12.))
-                            .child(fingerprint.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(button("trust", "Trust and connect", true).on_click(cx.listener(|this, _, _, cx| {
-                                this.trust_and_connect(cx);
-                            })))
-                            .child(button("cancel", "Cancel", false).on_click(cx.listener(|this, _, _, cx| {
-                                this.phase = Phase::Ended("Host key not trusted; nothing was sent to the server.".into());
-                                cx.notify();
-                            }))),
-                    )
-                    .into_any_element(),
+                format!("Trust {target}?").into(),
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.))
+                        .child(
+                            div()
+                                .p(px(10.))
+                                .rounded(px(10.))
+                                .bg(theme.card2)
+                                .font_family(MONO)
+                                .text_size(px(12.))
+                                .child(fingerprint.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button("trust", "Trust", true).on_click(
+                                    cx.listener(|this, _, _, cx| this.trust_and_connect(cx)),
+                                ))
+                                .child(button("cancel", "Cancel", false).on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.phase = Phase::Ended("Not trusted".into());
+                                        cx.notify();
+                                    },
+                                ))),
+                        )
+                        .into_any_element(),
+                ),
             ),
             Phase::Password { typed, rejected } => card(
-                format!("Password for {}", self.target.user).into(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .when(*rejected, |d| d.child(muted("That password was rejected. Try again.".into())))
-                    .child(
-                        div()
-                            .h(px(40.))
-                            .px(px(12.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(10.))
-                            .bg(theme.card2)
-                            .font_family(MONO)
-                            .child(if typed.is_empty() { "type, then press Enter".to_string() } else { "•".repeat(typed.chars().count()) }),
-                    )
-                    .child(muted("Keys and the SSH agent didn't get in. Esc cancels.".into()))
-                    .into_any_element(),
+                format!("Password for {target}").into(),
+                Some(
+                    div()
+                        .w(px(360.))
+                        .h(px(40.))
+                        .px(px(12.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(10.))
+                        .bg(theme.card2)
+                        .border_1()
+                        .border_color(if *rejected { theme.danger } else { theme.card2 })
+                        .font_family(MONO)
+                        .child("•".repeat(typed.chars().count()))
+                        .into_any_element(),
+                ),
             ),
             Phase::Ended(message) => card(
-                "Disconnected".into(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .child(muted(message.clone()))
-                    .child(
-                        div().flex().child(button("reconnect", "Reconnect", true).on_click(cx.listener(|this, _, _, cx| {
-                            this.connect(cx);
-                        }))),
-                    )
-                    .into_any_element(),
+                message.clone(),
+                Some(
+                    div()
+                        .flex()
+                        .child(
+                            button("reconnect", "Reconnect", true)
+                                .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
+                        )
+                        .into_any_element(),
+                ),
             ),
         })
     }
