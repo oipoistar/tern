@@ -558,18 +558,22 @@ pub fn key_file_info(path: &Path) -> Option<KeyInfo> {
                 .ok()
                 .map(|key| key.public_key().clone())
         })?;
-    let kind = match key.algorithm() {
+    Some(KeyInfo {
+        kind: key_kind(&key),
+        fingerprint: fingerprint(&key),
+        art: key_art(&key),
+    })
+}
+
+/// A key's type in a word or two: `ed25519`, `ecdsa nistp256`, `rsa`.
+pub fn key_kind(key: &PublicKey) -> String {
+    match key.algorithm() {
         Algorithm::Ed25519 => "ed25519".to_string(),
         Algorithm::SkEd25519 => "ed25519-sk".to_string(),
         Algorithm::Ecdsa { curve } => format!("ecdsa {curve}"),
         Algorithm::Rsa { .. } => "rsa".to_string(),
         other => other.to_string(),
-    };
-    Some(KeyInfo {
-        kind,
-        fingerprint: fingerprint(&key),
-        art: key_art(&key),
-    })
+    }
 }
 
 /// An SSH server that answered a reachability check.

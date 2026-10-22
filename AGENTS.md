@@ -45,11 +45,12 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 (`reach.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
-host-key art (`randomart.rs`), reading PuTTY's saved sessions (`putty.rs`)
-and paths. `tern-app` is GPUI:
-`workspace.rs` is the window root (header, tabs, live layer), `vault.rs`
-and `terminal.rs` are the screens, `host_editor.rs` is the dialog the vault
-opens over itself, and `marks.rs` draws the art and traces.
+host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
+reading PuTTY's saved sessions (`putty.rs`) and paths. `tern-app` is GPUI:
+`workspace.rs` is the window root (header, tabs, live layer), `vault.rs` is
+the vault tab (sidebar and the hosts screen) and `known_hosts.rs` another
+of its screens, `terminal.rs` is a session, `host_editor.rs` is the dialog
+the vault opens over itself, and `marks.rs` draws the art and traces.
 `tern-devserver` is a local SSH server with a real shell for manual testing.
 
 Rules live in tern-core with unit tests (what a draft needs, what a saved

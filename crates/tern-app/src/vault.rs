@@ -10,9 +10,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::known_hosts;
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
@@ -20,10 +21,11 @@ use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
 
 use crate::bench;
 use crate::host_editor::{EditorEvent, HostEditor};
+use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
 use crate::theme::{self, MONO, Theme};
-use crate::ui::{Ui, art_tile, button, icon};
+use crate::ui::{Ui, art_tile, button, group_heading, icon, search_field};
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -36,10 +38,38 @@ pub enum VaultEvent {
     Connect(Connection),
 }
 
+/// The screens the sidebar switches between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Hosts,
+    KnownHosts,
+}
+
+impl Section {
+    /// Sidebar entries in order, with their glyph, label and the section
+    /// they open (`None` for screens not built yet).
+    const SIDEBAR: [(IconName, &'static str, Option<Section>); 6] = [
+        (IconName::Server, "Hosts", Some(Section::Hosts)),
+        (IconName::KeyRound, "Keychain", None),
+        (IconName::CodeXml, "Snippets", None),
+        (IconName::ArrowLeftRight, "Port forwarding", None),
+        (
+            IconName::ShieldCheck,
+            "Known hosts",
+            Some(Section::KnownHosts),
+        ),
+        (IconName::Clock, "History", None),
+    ];
+}
+
 impl EventEmitter<VaultEvent> for VaultContent {}
 
-/// Everything on the vault screen except the header.
+/// Everything on the vault tab except the header: the sidebar and the
+/// screen it picked.
 pub struct VaultContent {
+    section: Section,
+    /// Made when first shown.
+    known_hosts: Option<Entity<KnownHostsView>>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
     /// file this Tern mustn't overwrite).
@@ -94,13 +124,31 @@ impl VaultContent {
         self.showing = showing;
     }
 
+    /// Switches the screen beside the sidebar. Screens that show files
+    /// read them again, for changes made meanwhile.
+    fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = section;
+        match section {
+            Section::Hosts => self.refresh_keys(),
+            Section::KnownHosts => match &self.known_hosts {
+                Some(view) => view.update(cx, |view, cx| view.refresh(cx)),
+                None => {
+                    let files = known_hosts::files();
+                    self.known_hosts = Some(cx.new(|cx| KnownHostsView::new(files, window, cx)));
+                }
+            },
+        }
+        cx.notify();
+    }
+
     /// Looks every second for checks that are due, and runs them while the
     /// vault shows in the active window.
     fn start_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._checks = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 let alive = this.update_in(cx, |this, window, cx| {
-                    if this.showing && window.is_window_active() {
+                    let on_screen = this.showing && this.section == Section::Hosts;
+                    if on_screen && window.is_window_active() {
                         this.run_due_checks(cx);
                     }
                 });
@@ -187,6 +235,8 @@ impl VaultContent {
             .map(|host| host.name.clone())
             .unwrap_or_default();
         let mut content = Self {
+            section: Section::Hosts,
+            known_hosts: None,
             vault,
             file,
             notice: None,
@@ -401,20 +451,7 @@ impl VaultContent {
                         .flex()
                         .flex_col()
                         .gap(px(14.))
-                        .child(
-                            div()
-                                .px(px(4.))
-                                .flex()
-                                .items_center()
-                                .gap(px(14.))
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(group.name.clone()),
-                                )
-                                .child(div().flex_1().h(px(1.)).bg(theme.line)),
-                        )
+                        .child(group_heading(group.name.clone(), theme))
                         .child(
                             div().flex().flex_wrap().gap(px(14.)).children(
                                 hosts.into_iter().map(|host| self.host_card(host, ui, cx)),
@@ -429,37 +466,7 @@ impl VaultContent {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h(px(46.))
-                    .pl(px(10.))
-                    .pr(px(4.))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .rounded(px(16.))
-                    .bg(theme.card2)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.search).id("search").appearance(false)),
-                    )
-                    .child(
-                        div()
-                            .size(px(38.))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(theme.card)
-                            .shadow(theme.shadow_sm())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(IconName::Search, 17., theme.text2)),
-                    ),
-            )
+            .child(search_field("search", &self.search, theme))
             // Offered only while PuTTY has sessions the vault lacks.
             .when(!self.putty.is_empty(), |d| {
                 d.child(
@@ -655,8 +662,11 @@ impl Render for VaultContent {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(sidebar(&theme))
-            .child(self.hosts(&ui, cx))
+            .child(sidebar(self.section, &theme, cx))
+            .map(|d| match (self.section, &self.known_hosts) {
+                (Section::KnownHosts, Some(view)) => d.child(view.clone()),
+                _ => d.child(self.hosts(&ui, cx)),
+            })
             .when_some(self.editor.clone(), |d, editor| {
                 d.child(
                     div()
@@ -775,25 +785,20 @@ fn dev_server_group() -> HostGroup {
     }
 }
 
-fn sidebar(theme: &Theme) -> impl IntoElement {
-    let items = [
-        (IconName::Server, "Hosts"),
-        (IconName::KeyRound, "Keychain"),
-        (IconName::CodeXml, "Snippets"),
-        (IconName::ArrowLeftRight, "Port forwarding"),
-        (IconName::ShieldCheck, "Known hosts"),
-        (IconName::Clock, "History"),
-    ];
+fn sidebar(current: Section, theme: &Theme, cx: &Context<VaultContent>) -> impl IntoElement {
     div()
         .w(px(220.))
         .flex_none()
         .flex()
         .flex_col()
         .gap(px(4.))
-        .children(items.into_iter().enumerate().map(|(i, (name, label))| {
-            let active = i == 0;
+        .children(Section::SIDEBAR.into_iter().map(|(glyph, label, section)| {
+            let active = section == Some(current);
             let fg = if active { theme.text } else { theme.text2 };
+            let id = format!("nav-{}", label.to_lowercase().replace(' ', "-"));
             div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
                 .h(px(42.))
                 .px(px(14.))
                 .flex()
@@ -807,8 +812,13 @@ fn sidebar(theme: &Theme) -> impl IntoElement {
                 } else {
                     FontWeight::MEDIUM
                 })
-                .child(icon(name, 18., fg))
+                .child(icon(glyph, 18., fg))
                 .child(label)
+                .when_some(section, |d, section| {
+                    d.cursor_pointer().on_click(
+                        cx.listener(move |this, _, window, cx| this.show(section, window, cx)),
+                    )
+                })
         }))
 }
 
@@ -934,6 +944,21 @@ mod tests {
             cx.debug_bounds("import-putty").is_none(),
             "nothing is left to import"
         );
+    }
+
+    #[gpui::test]
+    fn the_sidebar_switches_screens(cx: &mut TestAppContext) {
+        let (_, cx, _) = open_vault(cx);
+        assert!(cx.debug_bounds("host-bastion").is_some());
+        // Screens not built yet do nothing.
+        click(cx, "nav-history");
+        assert!(cx.debug_bounds("host-bastion").is_some());
+
+        click(cx, "nav-known-hosts");
+        assert!(cx.debug_bounds("known-hosts").is_some());
+        assert!(cx.debug_bounds("host-bastion").is_none());
+        click(cx, "nav-hosts");
+        assert!(cx.debug_bounds("host-bastion").is_some());
     }
 
     #[gpui::test]

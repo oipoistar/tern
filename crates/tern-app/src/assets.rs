@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         Server,
         Shield,
         ShieldCheck,
+        Trash,
         Zap
     ]
 );

@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
 use tern_core::randomart::Randomart;
 
@@ -84,6 +85,56 @@ pub fn ink_button(id: impl Into<ElementId>, theme: &Theme) -> Stateful<Div> {
         .border_color(theme.text)
         .bg(theme.text)
         .text_color(theme.card)
+}
+
+/// A screen's search box: the field in a soft well, with a round search
+/// glyph. It grows to fill a toolbar row.
+pub fn search_field(id: &'static str, search: &Entity<InputState>, theme: &Theme) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .h(px(46.))
+        .pl(px(10.))
+        .pr(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .rounded(px(16.))
+        .bg(theme.card2)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(search).id(id).appearance(false)),
+        )
+        .child(
+            div()
+                .size(px(38.))
+                .flex_none()
+                .rounded_full()
+                .bg(theme.card)
+                .shadow(theme.shadow_sm())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(IconName::Search, 17., theme.text2)),
+        )
+}
+
+/// A group's name, then a hairline to the right edge.
+pub fn group_heading(name: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .px(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name.into()),
+        )
+        .child(div().flex_1().h(px(1.)).bg(theme.line))
 }
 
 /// A live session's glyph: a solid ink dot.

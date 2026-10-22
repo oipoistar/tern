@@ -1,6 +1,7 @@
 mod assets;
 mod bench;
 mod host_editor;
+mod known_hosts;
 mod live;
 mod marks;
 mod terminal;

@@ -33,6 +33,9 @@ claude.ai account). Each item below names the artboard it comes from.
       (TCP plus SSH greeting) every 30 s while the vault shows in the
       active window, four at a time, a host behind a jump host at the jump
       host; cards draw the last 40 measured samples
+- [x] Known hosts screen (item 4): every trusted key with its art, hosts,
+      type and fingerprint, searchable; hashed OpenSSH names show as hashed;
+      Tern's keys can be forgotten, OpenSSH's are read only
 
 ## Known gaps in what's built
 
@@ -40,13 +43,6 @@ claude.ai account). Each item below names the artboard it comes from.
 - Only tested on Windows so far (item 23).
 
 ## Next, in order
-
-### 4. Known hosts screen (sidebar "Known hosts")
-- Every trusted key: host[:port], key art, type, fingerprint. Hashed OpenSSH
-  entries show as hashed.
-- Tern's own entries can be forgotten. `~/.ssh/known_hosts` entries are shown
-  read only.
-- Core: list entries from both files. Removing rewrites Tern's file only.
 
 ### 5. Keychain screen (sidebar "Keychain"; Keychain artboard)
 - Key cards: art, name, type. The selected card is inverted. A "Hardware key"

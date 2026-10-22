@@ -3,6 +3,7 @@
 
 pub mod draft;
 pub mod host;
+pub mod known_hosts;
 pub mod paths;
 pub mod putty;
 pub mod randomart;
