@@ -3,6 +3,7 @@
 
 pub mod host;
 pub mod paths;
+pub mod randomart;
 pub mod ssh;
 
 pub use host::{Host, HostGroup, HostStatus};

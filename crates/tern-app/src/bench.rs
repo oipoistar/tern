@@ -1,8 +1,8 @@
 //! `tern --bench <seconds>`: open the window off-screen and unfocused, keep the
-//! glass animating, then print how long each frame's work took and quit.
+//! latency traces moving, then print how long each frame's work took and quit.
 //!
 //! A frame is timed with the high-resolution clock from the start of the
-//! vault's render to the end of the glass layer's paint, which covers render,
+//! root's render to the end of the live layer's paint, which covers render,
 //! layout, prepaint and paint of the whole tree (not the GPU or present). OS
 //! CPU-time counters are no use here: Windows charges them in 15.6 ms ticks.
 //! Median and 90th percentile keep the odd slow frame from swinging results.
@@ -37,7 +37,7 @@ pub fn enabled() -> bool {
 }
 
 /// `--bench-uncached` re-renders the whole screen every frame, as Tern did
-/// before the glass layer existed, so both can be compared in one binary.
+/// before the live layer existed, so both can be compared in one binary.
 pub fn uncached() -> bool {
     enabled() && std::env::args().any(|arg| arg == "--bench-uncached")
 }

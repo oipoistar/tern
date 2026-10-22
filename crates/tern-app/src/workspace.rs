@@ -1,8 +1,8 @@
 //! The window's root: a header with tabs, the active screen (vault or a
-//! terminal session), and the glass layer painted over both.
+//! terminal session), and the live layer painted over it.
 //!
 //! Screens are cached views; only this thin root re-renders each animation
-//! frame, so the glass can move without redrawing the screens.
+//! frame, so the latency traces can move without redrawing the screens.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,13 +13,13 @@ use gpui_kit::*;
 use tern_core::ssh::{Target, parse_command};
 
 use crate::bench;
-use crate::glass::{GlassSlots, glass_layer};
+use crate::live::{LiveSlots, live_layer};
 use crate::terminal::{Phase, TerminalView};
-use crate::theme::{self, Milk, Tone};
-use crate::ui::{Ui, icon, status_dot, tern_mark};
+use crate::theme::{self, Theme};
+use crate::ui::{icon, status_dot, tern_mark};
 use crate::vault::{VaultContent, VaultEvent};
 
-/// Voxel glass drifts slowly, so 20 fps is plenty; nothing else animates.
+/// Latency traces scroll slowly, so 20 fps is plenty; nothing else animates.
 const FRAME: Duration = Duration::from_millis(50);
 
 pub struct Workspace {
@@ -27,10 +27,8 @@ pub struct Workspace {
     sessions: Vec<Entity<TerminalView>>,
     /// `None` shows the vault; `Some(i)` the i-th session.
     active: Option<usize>,
-    /// Glass in the header, which re-registers every frame.
-    header_slots: GlassSlots,
-    /// Glass on the vault screen, re-registered whenever the vault renders.
-    screen_slots: GlassSlots,
+    /// Moving marks on the vault screen, re-registered whenever it renders.
+    live: LiveSlots,
     started: Instant,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -38,8 +36,8 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let screen_slots = GlassSlots::default();
-        let vault = cx.new(|cx| VaultContent::new(screen_slots.clone(), window, cx));
+        let live = LiveSlots::default();
+        let vault = cx.new(|cx| VaultContent::new(live.clone(), window, cx));
         let connect =
             cx.subscribe_in(
                 &vault,
@@ -53,9 +51,13 @@ impl Workspace {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(FRAME).await;
-                // Freeze the glass while another app has focus.
-                let alive = this.update_in(cx, |_, window, cx| {
-                    if (window.is_window_active() || bench::enabled()) && !cx.reduce_motion() {
+                // Redraw only while something moves: not on a terminal
+                // tab, and frozen while another app has focus.
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if (window.is_window_active() || bench::enabled())
+                        && !cx.reduce_motion()
+                        && !this.live.is_empty()
+                    {
                         cx.notify();
                     }
                 });
@@ -68,8 +70,7 @@ impl Workspace {
             vault,
             sessions: Vec::new(),
             active: None,
-            header_slots: GlassSlots::default(),
-            screen_slots,
+            live,
             started: Instant::now(),
             _ticker: ticker,
             _subscriptions: vec![connect],
@@ -104,11 +105,15 @@ impl Workspace {
 
     fn activate(&mut self, tab: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.active = tab;
-        // Surfaces from the previous screen must not linger over the new one.
-        self.screen_slots.clear();
+        // Marks from the previous screen must not linger over the new one.
+        self.live.clear();
         match tab {
-            // The cached vault re-renders so its glass registers again.
-            None => self.vault.update(cx, |_, cx| cx.notify()),
+            // The cached vault re-renders so its marks register again, with
+            // art for any key trusted in a session meanwhile.
+            None => self.vault.update(cx, |vault, cx| {
+                vault.refresh_keys();
+                cx.notify();
+            }),
             Some(index) => {
                 self.sessions[index].update(cx, |terminal, cx| terminal.focus(window, cx))
             }
@@ -129,8 +134,7 @@ impl Workspace {
         self.activate(next, window, cx);
     }
 
-    fn header(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
-        let theme = ui.theme;
+    fn header(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let dark = theme.dark;
         div()
             .flex()
@@ -142,22 +146,12 @@ impl Workspace {
             .border_color(theme.line)
             .child(
                 div()
+                    .pl(px(4.))
+                    .pr(px(8.))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .child(
-                        ui.glass("logo", Tone::Brand, Milk::Regular, 11., theme.win, 0., {
-                            let mark = theme.glass_text;
-                            move || {
-                                div()
-                                    .size(px(34.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(tern_mark(mark))
-                            }
-                        }),
-                    )
+                    .gap(px(8.))
+                    .child(tern_mark(theme.text))
                     .child(
                         div()
                             .text_size(px(16.))
@@ -165,24 +159,21 @@ impl Workspace {
                             .child("Tern"),
                     ),
             )
-            .child(self.tabs(ui, cx))
+            .child(self.tabs(theme, cx))
             .child(div().flex_1())
+            // A state, not a control, so it gets no surface of its own.
             .child(
-                ui.glass("synced", Tone::Ok, Milk::Strong, 12., theme.win, 1.4, {
-                    let check = theme.ok_glyph;
-                    move || {
-                        div()
-                            .h(px(34.))
-                            .px(px(14.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(icon(IconName::Check, 14., check))
-                            .child("Synced")
-                    }
-                }),
+                div()
+                    .h(px(34.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text2)
+                    .child(icon(IconName::Check, 14., theme.text))
+                    .child("Synced"),
             )
             .child(
                 div()
@@ -206,8 +197,7 @@ impl Workspace {
             )
     }
 
-    fn tabs(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
-        let theme = ui.theme;
+    fn tabs(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let tab = |id: SharedString, active: bool| {
             div()
                 .id(id)
@@ -262,7 +252,7 @@ impl Workspace {
                         .border_1()
                         .border_color(theme.text3)
                         .into_any_element(),
-                    _ => icon(IconName::LoaderCircle, 12., theme.info_glyph).into_any_element(),
+                    _ => icon(IconName::LoaderCircle, 12., theme.text2).into_any_element(),
                 };
                 tab(
                     SharedString::from(format!("tab-{}", session.entity_id())),
@@ -302,10 +292,6 @@ impl Render for Workspace {
             self.started.elapsed().as_secs_f32()
         };
         let theme = theme::current(cx);
-        let ui = Ui {
-            theme: &theme,
-            slots: &self.header_slots,
-        };
         let cached = StyleRefinement::default().size_full();
         let body = match self.active {
             None if bench::uncached() => self.vault.clone().into_any_element(),
@@ -324,8 +310,8 @@ impl Render for Workspace {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(self.header(&ui, cx))
+            .child(self.header(&theme, cx))
             .child(div().flex_1().min_h_0().child(body))
-            .child(glass_layer(&[&self.header_slots, &self.screen_slots], time))
+            .child(live_layer(&self.live, time))
     }
 }

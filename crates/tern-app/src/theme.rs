@@ -1,8 +1,11 @@
 //! Tern's colour tokens, mirroring the mockup canvas (light and dark).
+//!
+//! The chrome is monochrome: ink (`text`) on paper (`card`). Solid ink marks
+//! only what is selected or primary; colour is left to terminal content.
 
 use std::rc::Rc;
 
-use gpui_kit::{App, BoxShadow, Global, Hsla, Rgba, hsla, point, px, rgb, rgba};
+use gpui_kit::{App, BoxShadow, Global, Hsla, Rgba, hsla, px, rgb, rgba};
 
 /// Light or dark, shared by every view. Change it with [`set_dark`].
 #[derive(Clone, Copy)]
@@ -35,8 +38,8 @@ pub fn set_dark(dark: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Colours for terminal content. The dark-teal ground matches the mockup's
-/// terminal in both appearances.
+/// Colours for terminal content: a neutral ink ground in both appearances,
+/// with the usual ANSI hues for what programs print.
 pub struct TermPalette {
     pub background: Hsla,
     pub foreground: Hsla,
@@ -48,16 +51,16 @@ pub struct TermPalette {
 impl TermPalette {
     pub fn for_theme(theme: &Theme) -> Self {
         let ansi = [
-            0x1B3A3B, 0xF07178, 0x7FE0B4, 0xFFCB6B, 0x82AAFF, 0xC792EA, 0x89DDFF,
-            0xD3E6E3, // normal
-            0x557774, 0xFF8A8A, 0xA6F0CD, 0xFFDD8E, 0xA6C4FF, 0xDDB3F5, 0xB2EBFF,
+            0x2A2A2D, 0xF07178, 0x8CD3A5, 0xFFCB6B, 0x82AAFF, 0xC792EA, 0x89DDFF,
+            0xD9D9DC, // normal
+            0x6E6E73, 0xFF8A8A, 0xB4E6C4, 0xFFDD8E, 0xA6C4FF, 0xDDB3F5, 0xB2EBFF,
             0xFFFFFF, // bright
         ]
         .map(|hex| c(rgb(hex)));
         Self {
-            background: c(rgb(if theme.dark { 0x0A1A1B } else { 0x10292A })),
-            foreground: c(rgb(0xD3E6E3)),
-            cursor: c(rgb(0x7FE0B4)),
+            background: c(rgb(if theme.dark { 0x0E0E10 } else { 0x141414 })),
+            foreground: c(rgb(0xE6E6E8)),
+            cursor: c(rgb(0xE6E6E8)),
             ansi,
         }
     }
@@ -76,34 +79,6 @@ fn c(color: Rgba) -> Hsla {
     color.into()
 }
 
-/// Voxel colour family for a glass surface: brand / primary action, healthy,
-/// or in progress. (The mockup's orange "warn" tone joins with the keychain.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tone {
-    Brand,
-    Ok,
-    Info,
-}
-
-impl Tone {
-    /// Base hue (degrees) and saturation (0..1) the voxels are drawn around.
-    pub fn hue_sat(self) -> (f32, f32) {
-        match self {
-            Tone::Brand => (250., 0.72),
-            Tone::Ok => (150., 0.50),
-            Tone::Info => (214., 0.80),
-        }
-    }
-}
-
-/// How opaque the milky layer over the voxels is. Chips use `Strong` so text
-/// stays readable at small sizes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Milk {
-    Regular,
-    Strong,
-}
-
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub dark: bool,
@@ -114,12 +89,7 @@ pub struct Theme {
     pub text2: Hsla,
     pub text3: Hsla,
     pub line: Hsla,
-    pub glass_text: Hsla,
-    pub ok_glyph: Hsla,
-    pub ok_halo: Hsla,
-    pub info_glyph: Hsla,
     pub danger: Hsla,
-    pub selection: Hsla,
 }
 
 impl Theme {
@@ -132,13 +102,8 @@ impl Theme {
             text: c(rgb(0x141414)),
             text2: c(rgb(0x5E5E5E)),
             text3: c(rgb(0x737373)),
-            line: c(rgba(0x00000012)),
-            glass_text: c(rgb(0x15151C)),
-            ok_glyph: c(rgb(0x13804A)),
-            ok_halo: c(rgba(0x13804A29)),
-            info_glyph: c(rgb(0x1D5FD1)),
+            line: c(rgba(0x00000017)),
             danger: c(rgb(0xC4321F)),
-            selection: c(rgb(0x6C63FF)),
         }
     }
 
@@ -151,13 +116,37 @@ impl Theme {
             text: c(rgb(0xF2F2F3)),
             text2: c(rgb(0xA6A6AE)),
             text3: c(rgb(0x8E8E96)),
-            line: c(rgba(0xFFFFFF12)),
-            glass_text: c(rgb(0xF6F6F8)),
-            ok_glyph: c(rgb(0x6BE39A)),
-            ok_halo: c(rgba(0x6BE39A38)),
-            info_glyph: c(rgb(0x8DBBFF)),
+            line: c(rgba(0xFFFFFF1A)),
             danger: c(rgb(0xFF8A80)),
-            selection: c(rgb(0x8F86FF)),
+        }
+    }
+
+    /// Colours for something shown inverted, like the selected host: ink
+    /// becomes the surface and paper the text.
+    pub fn inverse(&self) -> Self {
+        // Secondary text and hairlines are the paper (or ink) at reduced
+        // strength, so they sit on the inverted surface the way the normal
+        // ones sit on a card.
+        let (text2, text3, line) = if self.dark {
+            (
+                c(rgba(0x141416A0)),
+                c(rgba(0x14141666)),
+                c(rgba(0x00000024)),
+            )
+        } else {
+            (
+                c(rgba(0xFFFFFFA3)),
+                c(rgba(0xFFFFFF6B)),
+                c(rgba(0xFFFFFF2E)),
+            )
+        };
+        Self {
+            card: self.text,
+            text: self.card,
+            text2,
+            text3,
+            line,
+            ..self.clone()
         }
     }
 
@@ -178,72 +167,5 @@ impl Theme {
     pub fn shadow_sm(&self) -> Vec<BoxShadow> {
         let alpha = if self.dark { 0.5 } else { 0.06 };
         vec![BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., alpha)).blur_radius(px(2.))]
-    }
-
-    /// Outer shadow for a glass surface; slightly tinted so it reads as lit.
-    pub fn glass_shadow(&self) -> Vec<BoxShadow> {
-        if self.dark {
-            vec![BoxShadow::new(px(0.), px(4.), hsla(0., 0., 0., 0.4)).blur_radius(px(12.))]
-        } else {
-            vec![
-                BoxShadow::new(px(0.), px(3.), hsla(240. / 360., 0.38, 0.25, 0.12))
-                    .blur_radius(px(10.)),
-                BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., 0.05)).blur_radius(px(1.)),
-            ]
-        }
-    }
-
-    /// Liquid-glass rim: a bright top edge, a thin all-round ring and a soft
-    /// inner glow (light) or inner shade (dark).
-    pub fn glass_edge(&self) -> Vec<BoxShadow> {
-        if self.dark {
-            vec![
-                BoxShadow::new(px(0.), px(1.), hsla(0., 0., 1., 0.30)).inset(),
-                BoxShadow::new(px(0.), px(0.), hsla(0., 0., 1., 0.10))
-                    .spread_radius(px(1.))
-                    .inset(),
-                BoxShadow::new(px(0.), px(-10.), hsla(0., 0., 0., 0.22))
-                    .blur_radius(px(18.))
-                    .inset(),
-            ]
-        } else {
-            vec![
-                BoxShadow::new(px(0.), px(1.), hsla(0., 0., 1., 0.95)).inset(),
-                BoxShadow::new(px(0.), px(0.), hsla(0., 0., 1., 0.45))
-                    .spread_radius(px(1.))
-                    .inset(),
-                BoxShadow::new(px(0.), px(-8.), hsla(0., 0., 1., 0.28))
-                    .blur_radius(px(16.))
-                    .inset(),
-            ]
-        }
-    }
-
-    /// The milky layer laid over the voxels.
-    pub fn milk(&self, milk: Milk) -> Hsla {
-        match (self.dark, milk) {
-            (false, Milk::Regular) => hsla(0., 0., 1., 0.42),
-            (false, Milk::Strong) => hsla(0., 0., 1., 0.62),
-            (true, Milk::Regular) => hsla(240. / 360., 0.12, 0.10, 0.30),
-            (true, Milk::Strong) => hsla(240. / 360., 0.12, 0.10, 0.50),
-        }
-    }
-
-    /// Selection ring around the chosen card.
-    pub fn selected_shadow(&self) -> Vec<BoxShadow> {
-        let mut shadows =
-            vec![BoxShadow::new(px(0.), px(0.), self.selection).spread_radius(px(2.))];
-        shadows.extend(self.shadow());
-        shadows
-    }
-
-    pub fn status_dot_halo(&self) -> BoxShadow {
-        BoxShadow {
-            color: self.ok_halo,
-            offset: point(px(0.), px(0.)),
-            blur_radius: px(0.),
-            spread_radius: px(3.),
-            inset: false,
-        }
     }
 }

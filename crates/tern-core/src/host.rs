@@ -3,9 +3,20 @@ use std::path::PathBuf;
 /// Reachability of a saved host, as last observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostStatus {
-    Online,
+    /// Answering; with the round trip in milliseconds when it was measured.
+    Online {
+        latency_ms: Option<u32>,
+    },
     Connecting,
     Offline,
+}
+
+impl HostStatus {
+    pub const fn online(latency_ms: u32) -> Self {
+        Self::Online {
+            latency_ms: Some(latency_ms),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,16 +67,6 @@ impl Host {
             .split_whitespace()
             .all(|term| haystack.contains(&term.to_lowercase()))
     }
-
-    /// Two-letter monogram for the host tile, taken from the name's parts.
-    pub fn monogram(&self) -> String {
-        let pick = self
-            .name
-            .split(['-', '_', '.'])
-            .rfind(|p| p.chars().any(char::is_alphabetic))
-            .unwrap_or(&self.name);
-        pick.chars().take(2).collect::<String>().to_uppercase()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +99,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Ubuntu 24.04",
                     &["postgres", "eu-west"],
-                    HostStatus::Online,
+                    HostStatus::online(14),
                 ),
                 host(
                     "prod-web-01",
@@ -107,7 +108,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Debian 12",
                     &["nginx", "eu-west"],
-                    HostStatus::Online,
+                    HostStatus::online(9),
                 ),
                 host(
                     "prod-web-02",
@@ -125,7 +126,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     2222,
                     "Alpine 3.20",
                     &["jump host"],
-                    HostStatus::Online,
+                    HostStatus::online(38),
                 ),
             ],
         },
@@ -139,7 +140,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Ubuntu 22.04",
                     &["docker"],
-                    HostStatus::Online,
+                    HostStatus::online(3),
                 ),
                 host(
                     "stage-worker",
@@ -157,7 +158,7 @@ pub fn sample_groups() -> Vec<HostGroup> {
                     22,
                     "Raspberry Pi OS",
                     &["raspberry pi"],
-                    HostStatus::Online,
+                    HostStatus::online(1),
                 ),
             ],
         },
@@ -176,7 +177,7 @@ mod tests {
             port,
             os: String::new(),
             tags: vec![],
-            status: HostStatus::Online,
+            status: HostStatus::Offline,
             identity: None,
         }
     }
@@ -185,13 +186,6 @@ mod tests {
     fn target_hides_default_port() {
         assert_eq!(host("a", 22).target(), "deploy@10.0.0.1");
         assert_eq!(host("a", 2222).target(), "deploy@10.0.0.1:2222");
-    }
-
-    #[test]
-    fn monogram_prefers_last_alphabetic_part() {
-        assert_eq!(host("prod-db-01", 22).monogram(), "DB");
-        assert_eq!(host("bastion", 22).monogram(), "BA");
-        assert_eq!(host("pi-homelab", 22).monogram(), "HO");
     }
 
     #[test]

@@ -43,7 +43,7 @@ run, and the app then lists it under "Local dev server".
 ```sh
 cargo test --workspace                     # includes an end-to-end SSH test
 cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi"
-cargo run -p tern-app --release -- --bench 10                    # frame cost of the glass animation
+cargo run -p tern-app --release -- --bench 10                    # frame cost of the vault's latency traces
 cargo run -p tern-app --release -- --bench 10 --bench-uncached   # same, re-rendering everything
 ```
 

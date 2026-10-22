@@ -11,12 +11,15 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate, known_hosts};
+use russh::keys::{
+    Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate, known_hosts,
+};
 use russh::{ChannelMsg, client};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::paths;
+use crate::randomart::Randomart;
 
 /// A server's host key, as offered for the user to trust.
 pub type HostKey = PublicKey;
@@ -335,11 +338,7 @@ pub fn check_host_key(
     trust: Option<&PublicKey>,
 ) -> Result<(), ConnectError> {
     let ours = paths::known_hosts();
-    let files: Vec<PathBuf> = paths::system_known_hosts()
-        .into_iter()
-        .chain([ours.clone()])
-        .collect();
-    for file in &files {
+    for file in &known_hosts_files() {
         match known_hosts::check_known_hosts_path(host, port, key, file) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -368,8 +367,43 @@ pub fn check_host_key(
     })
 }
 
+/// The OpenSSH user's file (read only), then Tern's own.
+fn known_hosts_files() -> Vec<PathBuf> {
+    paths::system_known_hosts()
+        .into_iter()
+        .chain([paths::known_hosts()])
+        .collect()
+}
+
+/// The key a known_hosts file already holds for `host:port`, if any. Reads
+/// only. When several are listed, picks the type Tern asks servers for first
+/// (Ed25519, then ECDSA, then RSA), which is the key a connection would see.
+pub fn known_host_key(host: &str, port: u16) -> Option<HostKey> {
+    known_host_key_in(&known_hosts_files(), host, port)
+}
+
+fn known_host_key_in(files: &[PathBuf], host: &str, port: u16) -> Option<HostKey> {
+    files
+        .iter()
+        // An unreadable or malformed file only means no key to show here;
+        // connecting reports the real error.
+        .flat_map(|file| known_hosts::known_host_keys_path(host, port, file).unwrap_or_default())
+        .map(|(_, key)| key)
+        .min_by_key(|key| match key.algorithm() {
+            Algorithm::Ed25519 => 0,
+            Algorithm::Ecdsa { .. } => 1,
+            Algorithm::Rsa { .. } => 2,
+            _ => 3,
+        })
+}
+
 pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+/// The drunken-bishop picture of a key's SHA-256 fingerprint.
+pub fn key_art(key: &PublicKey) -> Randomart {
+    Randomart::new(key.fingerprint(HashAlg::Sha256).as_bytes())
 }
 
 async fn authenticate(
@@ -617,5 +651,36 @@ mod tests {
             ("pi", "homelab")
         );
         assert_eq!(key, Some(PathBuf::from("k")));
+    }
+
+    #[test]
+    fn known_host_key_prefers_the_type_tern_negotiates_first() {
+        use russh::keys::PrivateKey;
+
+        const RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDCx/wi6QiCzaJnLo5+/N5/gFeq8j3snfGj74PO9kwQHot1iA70yIoXHhzXQ7JhkeTWLVsoAXU2QYbLCbZPTK2FtBUp7sYNCedtyyA/tj8DNXm3CWP/kotBULqeKuCAVNcmGAWolHjzDPbfK9J4rIeMErZ2FH4l9M7be3RCW0xvpsTTbK6FbRDdfmivyJ0WzlAb9QZ1snQrbSwxoxlask1OgGL8bX3WisKFY92lalJV2M1WFDwUwAs6EGJNp5+16JzjhtrpJuc49OPRXEKBhd8WI+9zYaM2lPbgkh+ylx/y5kat7EDg/yXOMWrQQ5o/8Qlzzke91FfnVX7+EK/iSoW/";
+        let ed25519 = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .clone();
+        let dir = std::env::temp_dir().join(format!("tern-known-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (system, ours) = (dir.join("system"), dir.join("ours"));
+        std::fs::write(&system, format!("[db.example]:2222 {RSA}\nother {RSA}\n")).unwrap();
+        std::fs::write(
+            &ours,
+            format!("[db.example]:2222 {}\n", ed25519.to_openssh().unwrap()),
+        )
+        .unwrap();
+        let files = [system, ours.clone(), dir.join("missing")];
+
+        let found = known_host_key_in(&files, "db.example", 2222).unwrap();
+        assert_eq!(found, ed25519);
+        assert!(known_host_key_in(&files, "db.example", 22).is_none());
+        let rsa_only = known_host_key_in(&files[..1], "db.example", 2222).unwrap();
+        assert!(matches!(rsa_only.algorithm(), Algorithm::Rsa { .. }));
+        // The art follows the key.
+        assert_ne!(key_art(&found), key_art(&rsa_only));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

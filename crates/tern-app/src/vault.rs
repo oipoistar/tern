@@ -1,6 +1,7 @@
 //! The hosts vault: Tern's home screen. It asks the workspace to open a
 //! session with [`VaultEvent::Connect`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -9,15 +10,21 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::host::sample_groups;
-use tern_core::ssh::{Target, quick_destination};
+use tern_core::randomart::Randomart;
+use tern_core::ssh::{Target, key_art, known_host_key, quick_destination};
 use tern_core::{Host, HostGroup, HostStatus};
 
-use crate::glass::GlassSlots;
-use crate::theme::{self, MONO, Milk, Theme, Tone};
-use crate::ui::{Ui, icon, status_dot};
+use crate::live::LiveSlots;
+use crate::marks;
+use crate::theme::{self, MONO, Theme};
+use crate::ui::{Ui, icon};
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
+
+/// Wide enough for `user@host` and two tags; three fit beside the sidebar
+/// in the default window.
+const CARD_WIDTH: f32 = 320.;
 
 pub enum VaultEvent {
     Connect {
@@ -28,11 +35,14 @@ pub enum VaultEvent {
 
 impl EventEmitter<VaultEvent> for VaultContent {}
 
-/// Everything on the vault screen except the header and the animation.
+/// Everything on the vault screen except the header.
 pub struct VaultContent {
     groups: Vec<HostGroup>,
     selected: String,
-    slots: GlassSlots,
+    live: LiveSlots,
+    /// Art for each host whose key a known_hosts file already trusts, by
+    /// (address, port).
+    keys: HashMap<(String, u16), Randomart>,
     search: Entity<InputState>,
     query: SharedString,
     /// Set when the search text is itself an SSH destination.
@@ -41,7 +51,7 @@ pub struct VaultContent {
 }
 
 impl VaultContent {
-    pub fn new(slots: GlassSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(live: LiveSlots, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe_in(
             &search,
@@ -72,15 +82,32 @@ impl VaultContent {
             groups.insert(0, dev_server_group());
         }
         let selected = groups[0].hosts[0].name.clone();
-        Self {
+        let mut vault = Self {
             groups,
             selected,
-            slots,
+            live,
+            keys: HashMap::new(),
             search,
             query: SharedString::default(),
             destination: None,
             _subscription: subscription,
-        }
+        };
+        vault.refresh_keys();
+        vault
+    }
+
+    /// Re-reads which hosts have a trusted key (known_hosts files only, read
+    /// never written), so a key trusted in a session shows up here.
+    pub fn refresh_keys(&mut self) {
+        self.keys = self
+            .groups
+            .iter()
+            .flat_map(|group| &group.hosts)
+            .filter_map(|host| {
+                let key = known_host_key(&host.address, host.port)?;
+                Some(((host.address.clone(), host.port), key_art(&key)))
+            })
+            .collect();
     }
 
     /// Hosts the search matches, in vault order; none while search is empty,
@@ -106,7 +133,7 @@ impl VaultContent {
     }
 
     fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
-        let mut seed = 3.;
+        let theme = ui.theme;
         div()
             .id("hosts")
             .flex_1()
@@ -116,9 +143,9 @@ impl VaultContent {
             .flex()
             .flex_col()
             .gap(px(22.))
-            .child(self.toolbar(ui))
+            .child(self.toolbar(theme))
             .when_some(self.destination.clone(), |d, (target, identity)| {
-                d.child(self.destination_card(target, identity, ui, cx))
+                d.child(destination_card(target, identity, theme, cx))
             })
             .children(self.groups.iter().filter_map(|group| {
                 let hosts: Vec<&Host> = group
@@ -133,80 +160,31 @@ impl VaultContent {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(12.))
+                        .gap(px(14.))
                         .child(
                             div()
                                 .px(px(4.))
-                                .text_size(px(15.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(group.name.clone()),
+                                .flex()
+                                .items_center()
+                                .gap(px(14.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(group.name.clone()),
+                                )
+                                .child(div().flex_1().h(px(1.)).bg(theme.line)),
                         )
-                        .child(div().flex().flex_wrap().gap(px(14.)).children(
-                            hosts.into_iter().map(|host| {
-                                seed += 1.37;
-                                self.host_card(host, ui, seed, cx)
-                            }),
-                        )),
+                        .child(
+                            div().flex().flex_wrap().gap(px(14.)).children(
+                                hosts.into_iter().map(|host| self.host_card(host, ui, cx)),
+                            ),
+                        ),
                 )
             }))
     }
 
-    /// The typed destination, shaped like a host card so it reads as one.
-    fn destination_card(
-        &self,
-        target: Target,
-        identity: Option<PathBuf>,
-        ui: &Ui,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let theme = ui.theme;
-        let label = format!("{}@{}:{}", target.user, target.host, target.port);
-        div()
-            .id("destination")
-            .w(px(268.))
-            .p(px(14.))
-            .rounded(px(22.))
-            .bg(theme.card)
-            .shadow(theme.selected_shadow())
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.connect(target.clone(), identity.clone(), window, cx);
-            }))
-            .child(ui.glass(
-                "destination-tile",
-                Tone::Brand,
-                Milk::Regular,
-                14.,
-                theme.card,
-                1.9,
-                {
-                    let color = theme.glass_text;
-                    move || {
-                        div()
-                            .size(px(44.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(IconName::SquareTerminal, 20., color))
-                    }
-                },
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .font_family(MONO)
-                    .text_size(px(13.))
-                    .truncate()
-                    .child(label),
-            )
-    }
-
-    fn toolbar(&self, ui: &Ui) -> impl IntoElement {
-        let theme = ui.theme;
+    fn toolbar(&self, theme: &Theme) -> impl IntoElement {
         div()
             .flex()
             .items_center()
@@ -242,59 +220,54 @@ impl VaultContent {
                             .child(icon(IconName::Search, 17., theme.text2)),
                     ),
             )
-            .child(ui.glass(
-                "new-host",
-                Tone::Brand,
-                Milk::Regular,
-                16.,
-                theme.win,
-                0.7,
-                {
-                    let color = theme.glass_text;
-                    move || {
-                        div()
-                            .h(px(46.))
-                            .px(px(20.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(icon(IconName::Plus, 16., color))
-                            .child("New host")
-                    }
-                },
-            ))
+            // The screen's primary action, so the one solid ink button.
+            .child(
+                div()
+                    .h(px(46.))
+                    .px(px(20.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(16.))
+                    .bg(theme.text)
+                    .text_color(theme.card)
+                    .shadow(theme.shadow_sm())
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(icon(IconName::Plus, 16., theme.card))
+                    .child("New host"),
+            )
     }
 
-    fn host_card(&self, host: &Host, ui: &Ui, seed: f32, cx: &Context<Self>) -> impl IntoElement {
-        let theme = ui.theme;
+    fn host_card(&self, host: &Host, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
         let selected = host.name == self.selected;
-        let name = host.name.clone();
-        let monogram = host.monogram();
-        let tile = move || {
-            div()
-                .size(px(44.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(13.))
-                .font_weight(FontWeight::BOLD)
-                .child(monogram.clone())
+        // The selected card is drawn inverted: an ink surface with paper text.
+        let t = if selected {
+            Rc::new(ui.theme.inverse())
+        } else {
+            ui.theme.clone()
         };
+        let art = self.keys.get(&(host.address.clone(), host.port)).cloned();
+        let latency = match host.status {
+            HostStatus::Online {
+                latency_ms: Some(ms),
+            } => format!("{ms} ms"),
+            _ => String::new(),
+        };
+        let name = host.name.clone();
         let (target, identity) = (host.ssh_target(), host.identity.clone());
 
         div()
             .id(SharedString::from(format!("host-{}", host.name)))
-            .w(px(268.))
-            .p(px(14.))
+            .w(px(CARD_WIDTH))
+            .pt(px(14.))
+            .pb(px(12.))
+            .pl(px(14.))
+            .pr(px(16.))
             .rounded(px(22.))
-            .bg(theme.card)
-            .shadow(if selected {
-                theme.selected_shadow()
-            } else {
-                theme.shadow()
-            })
+            .bg(t.card)
+            .text_color(t.text)
+            .shadow(ui.theme.shadow())
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -307,35 +280,19 @@ impl VaultContent {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.))
-                    .child(if selected {
-                        ui.glass(
-                            format!("tile-{}", host.name),
-                            Tone::Brand,
-                            Milk::Regular,
-                            14.,
-                            theme.card,
-                            seed,
-                            tile,
-                        )
-                        .into_any_element()
-                    } else {
-                        tile()
-                            .rounded(px(14.))
-                            .bg(theme.card2)
-                            .text_color(theme.text2)
-                            .into_any_element()
-                    })
+                    .gap(px(14.))
+                    .child(art_tile(art, &t))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(3.))
+                            .gap(px(2.))
                             .child(
                                 div()
                                     .text_size(px(15.))
+                                    .line_height(px(19.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .truncate()
                                     .child(host.name.clone()),
@@ -344,48 +301,24 @@ impl VaultContent {
                                 div()
                                     .font_family(MONO)
                                     .text_size(px(12.))
-                                    .text_color(theme.text2)
+                                    .line_height(px(16.))
+                                    .text_color(t.text2)
                                     .truncate()
                                     .child(host.target()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO)
+                                    .text_size(px(11.5))
+                                    .line_height(px(15.))
+                                    .text_color(t.text3)
+                                    .truncate()
+                                    .child(host.tags.join(" / ")),
                             ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(status_chip(
-                        ui,
-                        format!("status-{}", host.name),
-                        host.status,
-                        seed + 0.6,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .text_color(theme.text2)
-                            .truncate()
-                            .child(host.tags.join(" · ")),
                     )
                     .child(
-                        div()
-                            .id(SharedString::from(format!("connect-{}", host.name)))
-                            .h(px(34.))
-                            .px(px(14.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(11.))
-                            .border_1()
-                            .border_color(theme.line)
-                            .bg(theme.card)
-                            .shadow(theme.shadow_sm())
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .child("Connect")
+                        connect_button(format!("connect-{}", host.name), selected, &t)
+                            .self_start()
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
                                 cx.emit(VaultEvent::Connect {
@@ -395,17 +328,44 @@ impl VaultContent {
                             })),
                     ),
             )
+            .child(
+                div()
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        ui.trace(
+                            format!("trace-{}", host.name),
+                            host.status,
+                            marks::seed(&host.name),
+                            t.text,
+                            t.text3,
+                        )
+                        .flex_1()
+                        .h_full(),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(36.))
+                            .flex()
+                            .justify_end()
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .child(latency),
+                    ),
+            )
     }
 }
 
 impl Render for VaultContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Placeholders re-record their surfaces during this frame's prepaint.
-        self.slots.clear();
+        // Placeholders re-record their marks during this frame's prepaint.
+        self.live.clear();
         let theme = theme::current(cx);
         let ui = Ui {
             theme: &theme,
-            slots: &self.slots,
+            live: &self.live,
         };
         div()
             .size_full()
@@ -415,9 +375,97 @@ impl Render for VaultContent {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(sidebar(&ui))
+            .child(sidebar(&theme))
             .child(self.hosts(&ui, cx))
     }
+}
+
+/// The typed destination, shaped like a host card so it reads as one; its
+/// arrow is ink because Enter goes there.
+fn destination_card(
+    target: Target,
+    identity: Option<PathBuf>,
+    theme: &Theme,
+    cx: &Context<VaultContent>,
+) -> impl IntoElement {
+    let label = format!("{}@{}:{}", target.user, target.host, target.port);
+    div()
+        .id("destination")
+        .w(px(CARD_WIDTH))
+        .p(px(14.))
+        .rounded(px(22.))
+        .bg(theme.card)
+        .shadow(theme.shadow())
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.connect(target.clone(), identity.clone(), window, cx);
+        }))
+        .child(
+            div()
+                .size(px(52.))
+                .flex_none()
+                .rounded(px(15.))
+                .border_1()
+                .border_color(theme.line)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(IconName::SquareTerminal, 20., theme.text)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .font_family(MONO)
+                .text_size(px(13.))
+                .truncate()
+                .child(label),
+        )
+        .child(connect_button("destination-connect".into(), true, theme))
+}
+
+/// Host-key art in a hairline tile; blank until the host's key is trusted.
+fn art_tile(art: Option<Randomart>, theme: &Theme) -> impl IntoElement {
+    let (ink, faint) = (theme.text, theme.text3);
+    div()
+        .size(px(52.))
+        .flex_none()
+        .rounded(px(15.))
+        .border_1()
+        .border_color(theme.line)
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    marks::paint_art(bounds, art.as_ref(), ink, faint, window)
+                },
+            )
+            .size_full(),
+        )
+}
+
+/// A round arrow button; `filled` makes it solid ink for the primary choice.
+fn connect_button(id: String, filled: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id))
+        .size(px(36.))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.line)
+        .when(filled, |d| d.bg(theme.text))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .child(icon(
+            IconName::ArrowRight,
+            16.,
+            if filled { theme.card } else { theme.text },
+        ))
 }
 
 /// The local dev server from `tern-devserver`, shown only when its key exists.
@@ -431,14 +479,13 @@ fn dev_server_group() -> HostGroup {
             port: 2222,
             os: "This computer".into(),
             tags: vec!["dev".into()],
-            status: HostStatus::Online,
+            status: HostStatus::Online { latency_ms: None },
             identity: Some(PathBuf::from(DEV_KEY)),
         }],
     }
 }
 
-fn sidebar(ui: &Ui) -> impl IntoElement {
-    let theme = ui.theme;
+fn sidebar(theme: &Theme) -> impl IntoElement {
     let items = [
         (IconName::Server, "Hosts"),
         (IconName::KeyRound, "Keychain"),
@@ -475,68 +522,6 @@ fn sidebar(ui: &Ui) -> impl IntoElement {
         }))
 }
 
-fn status_chip(ui: &Ui, id: String, status: HostStatus, seed: f32) -> AnyElement {
-    let theme = ui.theme;
-    fn chip(glyph: AnyElement, label: &'static str) -> Div {
-        div()
-            .h(px(28.))
-            .px(px(11.))
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .text_size(px(12.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(glyph)
-            .child(label)
-    }
-    match status {
-        HostStatus::Online => {
-            let theme: Rc<Theme> = theme.clone();
-            ui.glass(
-                id,
-                Tone::Ok,
-                Milk::Strong,
-                10.,
-                ui.theme.card,
-                seed,
-                move || chip(status_dot(&theme).into_any_element(), "Online"),
-            )
-            .into_any_element()
-        }
-        HostStatus::Connecting => {
-            let spinner = theme.info_glyph;
-            ui.glass(
-                id,
-                Tone::Info,
-                Milk::Strong,
-                10.,
-                theme.card,
-                seed,
-                move || {
-                    chip(
-                        icon(IconName::LoaderCircle, 13., spinner).into_any_element(),
-                        "Connecting",
-                    )
-                },
-            )
-            .into_any_element()
-        }
-        HostStatus::Offline => chip(
-            div()
-                .size(px(7.))
-                .rounded_full()
-                .border_1()
-                .border_color(theme.text2)
-                .into_any_element(),
-            "Offline",
-        )
-        .rounded(px(10.))
-        .bg(theme.card2)
-        .text_color(theme.text2)
-        .into_any_element(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
@@ -547,13 +532,13 @@ mod tests {
     use tern_core::ssh::Target;
 
     use super::{VaultContent, VaultEvent};
-    use crate::glass::GlassSlots;
+    use crate::live::LiveSlots;
 
     #[gpui::test]
     fn search_filters_hosts_and_connects_to_a_typed_destination(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (vault, cx) =
-            cx.add_window_view(|window, cx| VaultContent::new(GlassSlots::default(), window, cx));
+            cx.add_window_view(|window, cx| VaultContent::new(LiveSlots::default(), window, cx));
         let connects: Rc<RefCell<Vec<Target>>> = Rc::default();
         let _subscription = cx.update(|_, cx| {
             let connects = connects.clone();

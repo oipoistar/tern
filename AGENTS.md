@@ -25,29 +25,39 @@ Performance-sensitive changes: compare `--bench 10` with and without them
   fingerprint, an error reason, a value, a control's name.
 - **Errors and prompts are one line.** The exception is a changed host key,
   which names the `known_hosts` line because the user needs it to respond.
-- **No colour-gradient fills and no pills with tinted backgrounds.** Accents
-  and statuses use voxel glass (`glass.rs`); neutral states use plain or clear
-  surfaces. Status colour lives in a small glyph (dot, check, ring).
+- **Monochrome chrome: ink on paper.** No colour-gradient fills, no pills with
+  tinted backgrounds, no coloured glass. Solid ink (the theme's `text` as a
+  fill) marks only what is selected or primary: the selected card renders
+  with `Theme::inverse()`, and a group's primary button is ink. Everything
+  else is plain, or outlined with a `line` hairline. Colour belongs to terminal
+  content (ANSI) and to the `danger` error border, nothing else.
+- **Draw state instead of labelling it.** A host card shows its key as
+  drunken-bishop art (`marks::paint_art`), only for a key a known_hosts file
+  already trusts, and blank otherwise. Reachability is a latency trace
+  (`marks::paint_trace`), not an "Online" chip.
 - Light and dark must both work; colours come from `theme.rs`, never inline.
 
 ## Architecture in one breath
 
 `tern-core` has no UI: hosts, SSH sessions (`ssh.rs`, russh on its own Tokio
-runtime, talking to callers through channels) and paths. `tern-app` is GPUI:
-`workspace.rs` is the window root (header, tabs, glass layer), `vault.rs` and
-`terminal.rs` are the screens. `tern-devserver` is a local SSH server with a
-real shell for manual testing.
+runtime, talking to callers through channels), host-key art (`randomart.rs`)
+and paths. `tern-app` is GPUI: `workspace.rs` is the window root (header,
+tabs, live layer), `vault.rs` and `terminal.rs` are the screens, and
+`marks.rs` draws the art and traces. `tern-devserver` is a local SSH server
+with a real shell for manual testing.
 
 ## Gotchas that cost time before
 
-- **Glass is painted by one layer on top**, not inside screens. Screens are
-  cached views; GPUI re-renders every ancestor of a notified view, so
-  animating inside them would redraw everything. Screens register glass
-  placeholders (`ui.glass(...)`) into a `GlassSlots`; each independently
-  rendering part (header, screen) owns its own `GlassSlots` so one clearing
-  never wipes another.
-- **GPUI only clips to rectangles.** Rounded glass is masked by painting the
-  underlay colour around it; pass the right `underlay`.
+- **Anything that moves is painted by one layer on top**, not inside screens.
+  Screens are cached views; GPUI re-renders every ancestor of a notified
+  view, so animating inside them would redraw everything. Screens register
+  placeholders (`ui.trace(...)`, built on `live::live`) into a `LiveSlots`,
+  and `live_layer` paints them each frame. The frame ticker stops while no
+  placeholder is registered (a terminal tab is showing). Static drawings
+  like the art paint inline.
+- **Prefer quads to paths for small repeated shapes.** GPUI draws rounded
+  quads on the GPU, while paths are tessellated on the CPU. Dots are quads;
+  only the trace's line is a path.
 - **Typed text arrives through `EntityInputHandler`**, not key-down events.
   Key-down handles only keys that produce control sequences.
 - **`use gpui_kit::*` shadows Rust's `#[test]`** with GPUI's macro. In test

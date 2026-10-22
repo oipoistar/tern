@@ -5,36 +5,32 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::*;
+use tern_core::HostStatus;
 
-use crate::glass::{Glass, GlassSlots, glass};
-use crate::theme::{Milk, Theme, Tone};
+use crate::live::{LiveSlots, live};
+use crate::marks;
+use crate::theme::Theme;
 
-/// What every builder needs: the theme and where glass surfaces register.
+/// What a screen's builders need: the theme and where live marks register.
 pub struct Ui<'a> {
     pub theme: &'a Rc<Theme>,
-    pub slots: &'a GlassSlots,
+    pub live: &'a LiveSlots,
 }
 
 impl Ui<'_> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn glass<E: IntoElement>(
+    /// A latency trace in `ink`, animated by the live layer. Size it like
+    /// any element.
+    pub fn trace(
         &self,
         id: impl Into<SharedString>,
-        tone: Tone,
-        milk: Milk,
-        radius: f32,
-        underlay: Hsla,
-        seed: f32,
-        content: impl Fn() -> E + 'static,
-    ) -> Div {
-        let spec = Glass {
-            tone,
-            milk,
-            radius: px(radius),
-            underlay,
-            seed,
-        };
-        glass(self.slots, id, spec, self.theme, content)
+        status: HostStatus,
+        seed: u32,
+        ink: Hsla,
+        faint: Hsla,
+    ) -> Canvas<()> {
+        live(self.live, id, move |bounds, time, window| {
+            marks::paint_trace(bounds, status, seed, time, ink, faint, window)
+        })
     }
 }
 
@@ -42,12 +38,9 @@ pub fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).w(px(size)).h(px(size)).text_color(color)
 }
 
+/// A live session's glyph: a solid ink dot.
 pub fn status_dot(theme: &Theme) -> Div {
-    div()
-        .size(px(7.))
-        .rounded_full()
-        .bg(theme.ok_glyph)
-        .shadow(vec![theme.status_dot_halo()])
+    div().size(px(7.)).rounded_full().bg(theme.text)
 }
 
 /// The Tern mark: wings and a forked tail, stroked on a 24-unit grid.
@@ -75,5 +68,5 @@ pub fn tern_mark(color: Hsla) -> impl IntoElement {
             }
         },
     )
-    .size(px(20.))
+    .size(px(22.))
 }
