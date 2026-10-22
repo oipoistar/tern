@@ -1,7 +1,7 @@
 //! What the end-to-end tests share: a russh server running in this
-//! process (password and key sign-in, an echoing shell, direct-tcpip as a
-//! jump host, remote forwarding, and SFTP over a folder) and helpers for
-//! reading a session.
+//! process (password, key and certificate sign-in, an echoing shell,
+//! direct-tcpip as a jump host, remote forwarding, SFTP over a folder, and
+//! a host certificate) and helpers for reading a session.
 
 // Each test file uses its own share of this.
 #![allow(dead_code)]
@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use russh::keys::{PrivateKey, PublicKey};
+use russh::keys::ssh_key::certificate::CertType;
+use russh::keys::{Certificate, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Msg, Server as _, Session as ServerSession};
 use russh::{Channel, ChannelId};
 use tern_core::ssh::{ConnectRequest, Credential, Event, Session, Target, TermSize};
@@ -34,6 +35,8 @@ pub struct TestServer {
     /// it went in the shell's output.
     probe_agent: bool,
     agent_offered: bool,
+    /// Accepts user certificates this authority signed.
+    user_ca: Option<PublicKey>,
 }
 
 impl Clone for TestServer {
@@ -45,6 +48,7 @@ impl Clone for TestServer {
             channels: HashMap::new(),
             probe_agent: self.probe_agent,
             agent_offered: false,
+            user_ca: self.user_ca.clone(),
         }
     }
 }
@@ -69,6 +73,28 @@ impl russh::server::Handler for TestServer {
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         Ok(if user == USER && key == &self.client_key {
+            Auth::Accept
+        } else {
+            reject()
+        })
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &Certificate,
+    ) -> Result<Auth, Self::Error> {
+        let vouched = self.user_ca.as_ref().is_some_and(|ca| {
+            certificate
+                .validate([&ca.fingerprint(HashAlg::Sha256)])
+                .is_ok()
+                && certificate.cert_type() == CertType::User
+                && certificate
+                    .valid_principals()
+                    .iter()
+                    .any(|name| name == user)
+        });
+        Ok(if user == USER && vouched {
             Auth::Accept
         } else {
             reject()
@@ -262,7 +288,15 @@ pub async fn start_server(host_key: PrivateKey, client_key: PublicKey) -> u16 {
 /// Like [`start_server`], also trying each client's agent (see
 /// `TestServer::probe_agent`).
 pub async fn start_server_probing_agent(host_key: PrivateKey, client_key: PublicKey) -> u16 {
-    serve(host_key, client_key, None, true).await
+    start_server_with(
+        host_key,
+        client_key,
+        Setup {
+            probe_agent: true,
+            ..Setup::default()
+        },
+    )
+    .await
 }
 
 /// Like [`start_server`], also serving SFTP over `sftp_root`.
@@ -271,17 +305,39 @@ pub async fn start_server_with_sftp(
     client_key: PublicKey,
     sftp_root: Option<PathBuf>,
 ) -> u16 {
-    serve(host_key, client_key, sftp_root, false).await
+    start_server_with(
+        host_key,
+        client_key,
+        Setup {
+            sftp_root,
+            ..Setup::default()
+        },
+    )
+    .await
 }
 
-async fn serve(
-    host_key: PrivateKey,
-    client_key: PublicKey,
-    sftp_root: Option<PathBuf>,
-    probe_agent: bool,
-) -> u16 {
+/// What a test server does beyond the basics.
+#[derive(Default)]
+pub struct Setup {
+    pub sftp_root: Option<PathBuf>,
+    pub probe_agent: bool,
+    /// A host certificate, presented to clients that ask for one.
+    pub certificate: Option<Certificate>,
+    /// Sign-in with user certificates this authority signed.
+    pub user_ca: Option<PublicKey>,
+}
+
+/// Like [`start_server`], doing what `setup` adds.
+pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setup: Setup) -> u16 {
+    let Setup {
+        sftp_root,
+        probe_agent,
+        certificate,
+        user_ca,
+    } = setup;
     let config = Arc::new(russh::server::Config {
         keys: vec![host_key],
+        certificates: certificate.into_iter().collect(),
         auth_rejection_time: Duration::from_millis(10),
         auth_rejection_time_initial: Some(Duration::ZERO),
         ..Default::default()
@@ -296,6 +352,7 @@ async fn serve(
             channels: HashMap::new(),
             probe_agent,
             agent_offered: false,
+            user_ca,
         }
         .run_on_socket(config, &listener)
         .await;

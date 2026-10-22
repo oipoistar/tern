@@ -18,6 +18,7 @@ use russh::{ChannelMsg, ChannelStream, client};
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::certs;
 use crate::forward::{Forward, ForwardState, Forwarder, RemoteTargets, serve_remote};
 use crate::host::Auth;
 use crate::paths;
@@ -379,10 +380,6 @@ async fn run(
         forwards,
         agent_forwarding,
     } = request;
-    let config = Arc::new(client::Config {
-        keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
-        ..Default::default()
-    });
 
     // Through jump hosts: sign in to each, then run the next one's SSH over
     // a channel it forwards, and so on to the target. Every jump
@@ -391,7 +388,7 @@ async fn run(
     let mut tunnel = None;
     for (at, (jump, jump_credentials)) in jumps.iter().enumerate() {
         let mut jump_handle = open(
-            config.clone(),
+            keep_alive,
             jump,
             trust.clone(),
             tunnel.take(),
@@ -418,7 +415,7 @@ async fn run(
     // Where the host sends connections for remote forwarding rules.
     let remote = RemoteTargets::default();
     let mut handle = open(
-        config,
+        keep_alive,
         &target,
         trust,
         tunnel,
@@ -495,20 +492,31 @@ async fn run(
 }
 
 /// Connects to `target` and verifies its host key, over TCP or, through
-/// jump hosts, over `tunnel`.
+/// jump hosts, over `tunnel`. Host certificates are asked for only when a
+/// known_hosts file names an authority for the host, as OpenSSH does.
 async fn open(
-    config: Arc<client::Config>,
+    keep_alive: bool,
     target: &Target,
     trust: Option<PublicKey>,
     tunnel: Option<ChannelStream<client::Msg>>,
     remote: RemoteTargets,
     agent_forwarding: bool,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
+    let authorities = certs::authorities(&known_hosts_files(), &target.host, target.port);
+    let mut config = client::Config {
+        keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
+        ..Default::default()
+    };
+    if !authorities.is_empty() {
+        config.preferred.host_key_certificates = config.preferred.key.clone();
+    }
+    let config = Arc::new(config);
     let verdict = Arc::new(Mutex::new(None));
     let handler = Verifier {
         host: target.host.clone(),
         port: target.port,
         trust,
+        authorities,
         verdict: verdict.clone(),
         remote,
         agent_forwarding,
@@ -532,12 +540,15 @@ fn other(error: impl std::fmt::Display) -> ConnectError {
 }
 
 /// Checks the server's host key against `~/.ssh/known_hosts` (read only) and
-/// Tern's own known hosts, learning a key the user explicitly trusted. Also
-/// answers the channels the server opens for remote forwarding rules.
+/// Tern's own known hosts, learning a key the user explicitly trusted, or
+/// its host certificate against the authorities they name. Also answers
+/// the channels the server opens for remote forwarding rules.
 struct Verifier {
     host: String,
     port: u16,
     trust: Option<PublicKey>,
+    /// The certificate authorities the known_hosts files name for the host.
+    authorities: Vec<PublicKey>,
     verdict: Arc<Mutex<Option<ConnectError>>>,
     remote: RemoteTargets,
     /// Agent channels from the server are answered only when this is on.
@@ -551,13 +562,15 @@ impl client::Handler for Verifier {
         &mut self,
         server: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let PublicKeyOrCertificate::PublicKey { key, .. } = server else {
-            *self.verdict.lock().unwrap() = Some(ConnectError::Other(
-                "host certificates aren't supported yet".into(),
-            ));
-            return Ok(false);
+        let verdict = match server {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                check_host_key(&self.host, self.port, key, self.trust.as_ref())
+            }
+            PublicKeyOrCertificate::Certificate(cert) => {
+                check_host_certificate(&self.host, self.port, cert, &self.authorities)
+            }
         };
-        match check_host_key(&self.host, self.port, key, self.trust.as_ref()) {
+        match verdict {
             Ok(()) => Ok(true),
             Err(error) => {
                 *self.verdict.lock().unwrap() = Some(error);
@@ -588,6 +601,28 @@ impl client::Handler for Verifier {
     ) -> Result<(), Self::Error> {
         crate::agent::serve(self.agent_forwarding, channel, reply);
         Ok(())
+    }
+}
+
+/// A host certificate is good when an authority known_hosts names for the
+/// host vouches for it. Otherwise, as OpenSSH does, the key inside counts
+/// as a plain host key, already trusted or not; it isn't offered for trust,
+/// because a host that has an authority shouldn't need it.
+fn check_host_certificate(
+    host: &str,
+    port: u16,
+    cert: &russh::keys::Certificate,
+    authorities: &[PublicKey],
+) -> Result<(), ConnectError> {
+    let Err(reason) = certs::check_host(cert, host, authorities, certs::now()) else {
+        return Ok(());
+    };
+    let key = PublicKey::from(cert.public_key().clone());
+    match check_host_key(host, port, &key, None) {
+        Err(ConnectError::UnknownHostKey { .. }) => {
+            Err(other(format!("the host certificate {reason}")))
+        }
+        known => known,
     }
 }
 
@@ -807,11 +842,22 @@ async fn with_key_file(
     path: &Path,
     passphrase: Option<&str>,
 ) -> Result<bool> {
-    let key = russh::keys::load_secret_key(path, passphrase)
-        .with_context(|| format!("can't load {}", path.display()))?;
+    let key = Arc::new(
+        russh::keys::load_secret_key(path, passphrase)
+            .with_context(|| format!("can't load {}", path.display()))?,
+    );
+    // With a certificate beside it, that's tried first, then the bare key.
+    if let Some(cert) = certs::user_certificate(path)
+        && handle
+            .authenticate_openssh_cert(user, key.clone(), cert)
+            .await?
+            .success()
+    {
+        return Ok(true);
+    }
     let hash = handle.best_supported_rsa_hash().await?.flatten();
     let result = handle
-        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key, hash))
         .await?;
     Ok(result.success())
 }
@@ -846,14 +892,17 @@ where
 {
     let hash = handle.best_supported_rsa_hash().await?.flatten();
     for identity in agent.request_identities().await? {
-        let AgentIdentity::PublicKey { key, .. } = identity else {
-            continue;
+        let signed_in = match identity {
+            AgentIdentity::PublicKey { key, .. } => handle
+                .authenticate_publickey_with(user, key, hash, &mut agent)
+                .await?
+                .success(),
+            AgentIdentity::Certificate { certificate, .. } => handle
+                .authenticate_certificate_with(user, certificate, hash, &mut agent)
+                .await?
+                .success(),
         };
-        if handle
-            .authenticate_publickey_with(user, key, hash, &mut agent)
-            .await?
-            .success()
-        {
+        if signed_in {
             return Ok(true);
         }
     }

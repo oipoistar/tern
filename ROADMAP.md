@@ -15,7 +15,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Vault of host cards: search, quick connect from a typed `ssh` command,
       host-key art, latency traces, inverted selection
 - [x] SSH sessions in tabs: host-key trust (Tern's own known_hosts; OpenSSH's
-      is read only), key / agent (OpenSSH agent, Pageant) / password sign-in
+      is read only), key / agent (OpenSSH agent, Pageant) / password sign-in;
+      OpenSSH certificates: host certificates vouched for by known_hosts'
+      `@cert-authority` lines, user certificates beside a key file
+      (`id_ed25519-cert.pub`) or held by the agent
 - [x] Host editor: add, edit, delete, groups, tags, test connection
 - [x] Jump hosts (`ssh -J` style, chains of any length: a jump host can
       go through another), keep-alive, command after login
@@ -115,8 +118,6 @@ claude.ai account). Each item below names the artboard it comes from.
 - No Tern servers and no accounts, ever.
 
 ### 18. More SSH
-- OpenSSH host and user certificates (refused today with "host certificates
-  aren't supported yet").
 - Reconnect automatically after a dropped connection.
 
 ### 19. macOS and Linux
