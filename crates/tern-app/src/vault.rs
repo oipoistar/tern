@@ -1,5 +1,9 @@
 //! The hosts vault: Tern's home screen.
+//!
+//! [`Vault`] is a thin shell that animates: each frame it re-renders only the
+//! glass layer and reuses [`VaultContent`], the cached static UI.
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
@@ -9,38 +13,30 @@ use gpui_kit::*;
 use tern_core::host::sample_groups;
 use tern_core::{Host, HostGroup, HostStatus};
 
-use crate::glass::{Glass, glass};
+use crate::bench;
+use crate::glass::{Glass, GlassSlots, glass, glass_layer};
 use crate::theme::{MONO, Milk, Theme, Tone};
 
 /// Voxel glass drifts slowly, so 20 fps is plenty; nothing else animates.
 const FRAME: Duration = Duration::from_millis(50);
 
 pub struct Vault {
-    dark: bool,
-    groups: Vec<HostGroup>,
-    selected: String,
+    content: Entity<VaultContent>,
+    slots: GlassSlots,
     started: Instant,
     _ticker: Task<()>,
 }
 
 impl Vault {
-    /// Starts in the system's light/dark appearance; `TERN_THEME=light|dark`
-    /// overrides it (handy for screenshots).
     pub fn new(window: &Window, cx: &mut Context<Self>) -> Self {
-        let dark = match std::env::var("TERN_THEME").as_deref() {
-            Ok("dark") => true,
-            Ok("light") => false,
-            _ => matches!(
-                window.appearance(),
-                WindowAppearance::Dark | WindowAppearance::VibrantDark
-            ),
-        };
+        let slots = GlassSlots::default();
+        let content = cx.new(|_| VaultContent::new(window, slots.clone()));
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(FRAME).await;
                 // Freeze the glass while another app has focus.
                 let alive = this.update_in(cx, |_, window, cx| {
-                    if window.is_window_active() && !cx.reduce_motion() {
+                    if (window.is_window_active() || bench::enabled()) && !cx.reduce_motion() {
                         cx.notify();
                     }
                 });
@@ -50,15 +46,68 @@ impl Vault {
             }
         });
         Self {
-            dark,
-            groups: sample_groups(),
-            selected: "prod-db-01".into(),
+            content,
+            slots,
             started: Instant::now(),
             _ticker: ticker,
         }
     }
+}
 
-    fn header(&self, theme: &Theme, time: f32, cx: &Context<Self>) -> impl IntoElement {
+impl Render for Vault {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        bench::frame_start();
+        let time = if cx.reduce_motion() {
+            0.
+        } else {
+            self.started.elapsed().as_secs_f32()
+        };
+        let content = if bench::uncached() {
+            self.content.clone().into_any_element()
+        } else {
+            self.content
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        };
+        div()
+            .size_full()
+            .relative()
+            .child(content)
+            .child(glass_layer(&self.slots, time))
+    }
+}
+
+/// Everything on the vault screen except the animation.
+pub struct VaultContent {
+    dark: bool,
+    groups: Vec<HostGroup>,
+    selected: String,
+    slots: GlassSlots,
+}
+
+impl VaultContent {
+    /// Starts in the system's light/dark appearance; `TERN_THEME=light|dark`
+    /// overrides it (handy for screenshots).
+    fn new(window: &Window, slots: GlassSlots) -> Self {
+        let dark = match std::env::var("TERN_THEME").as_deref() {
+            Ok("dark") => true,
+            Ok("light") => false,
+            _ => matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            ),
+        };
+        Self {
+            dark,
+            groups: sample_groups(),
+            selected: "prod-db-01".into(),
+            slots,
+        }
+    }
+
+    fn header(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
+        let theme = ui.theme;
         div()
             .flex()
             .items_center()
@@ -72,23 +121,19 @@ impl Vault {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(glass(
-                        Glass {
-                            tone: Tone::Brand,
-                            milk: Milk::Regular,
-                            radius: px(11.),
-                            underlay: theme.win,
-                            seed: 0.,
-                        },
-                        theme,
-                        time,
-                        div()
-                            .size(px(34.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(tern_mark(theme.glass_text)),
-                    ))
+                    .child(
+                        ui.glass("logo", Tone::Brand, Milk::Regular, 11., theme.win, 0., {
+                            let mark = theme.glass_text;
+                            move || {
+                                div()
+                                    .size(px(34.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(tern_mark(mark))
+                            }
+                        }),
+                    )
                     .child(
                         div()
                             .text_size(px(16.))
@@ -98,27 +143,23 @@ impl Vault {
             )
             .child(tabs(theme))
             .child(div().flex_1())
-            .child(glass(
-                Glass {
-                    tone: Tone::Ok,
-                    milk: Milk::Strong,
-                    radius: px(12.),
-                    underlay: theme.win,
-                    seed: 1.4,
-                },
-                theme,
-                time,
-                div()
-                    .h(px(34.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(icon(IconName::Check, 14., theme.ok_glyph))
-                    .child("Synced · Google Drive"),
-            ))
+            .child(
+                ui.glass("synced", Tone::Ok, Milk::Strong, 12., theme.win, 1.4, {
+                    let check = theme.ok_glyph;
+                    move || {
+                        div()
+                            .h(px(34.))
+                            .px(px(14.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(icon(IconName::Check, 14., check))
+                            .child("Synced · Google Drive")
+                    }
+                }),
+            )
             .child(
                 div()
                     .id("theme-toggle")
@@ -148,7 +189,8 @@ impl Vault {
             )
     }
 
-    fn hosts(&self, theme: &Theme, time: f32, cx: &Context<Self>) -> impl IntoElement {
+    fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
+        let theme = ui.theme;
         let mut seed = 3.;
         div()
             .id("hosts")
@@ -159,7 +201,7 @@ impl Vault {
             .flex()
             .flex_col()
             .gap(px(22.))
-            .child(toolbar(theme, time))
+            .child(toolbar(ui))
             .children(self.groups.iter().map(|group| {
                 div()
                     .flex()
@@ -191,30 +233,27 @@ impl Vault {
                             .gap(px(14.))
                             .children(group.hosts.iter().map(|host| {
                                 seed += 1.37;
-                                self.host_card(host, theme, time, seed, cx)
+                                self.host_card(host, ui, seed, cx)
                             })),
                     )
             }))
     }
 
-    fn host_card(
-        &self,
-        host: &Host,
-        theme: &Theme,
-        time: f32,
-        seed: f32,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    fn host_card(&self, host: &Host, ui: &Ui, seed: f32, cx: &Context<Self>) -> impl IntoElement {
+        let theme = ui.theme;
         let selected = host.name == self.selected;
         let name = host.name.clone();
-        let tile = div()
-            .size(px(44.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(13.))
-            .font_weight(FontWeight::BOLD)
-            .child(host.monogram());
+        let monogram = host.monogram();
+        let tile = move || {
+            div()
+                .size(px(44.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(13.))
+                .font_weight(FontWeight::BOLD)
+                .child(monogram.clone())
+        };
 
         div()
             .id(SharedString::from(format!("host-{}", host.name)))
@@ -241,21 +280,19 @@ impl Vault {
                     .items_center()
                     .gap(px(12.))
                     .child(if selected {
-                        glass(
-                            Glass {
-                                tone: Tone::Brand,
-                                milk: Milk::Regular,
-                                radius: px(14.),
-                                underlay: theme.card,
-                                seed,
-                            },
-                            theme,
-                            time,
+                        ui.glass(
+                            format!("tile-{}", host.name),
+                            Tone::Brand,
+                            Milk::Regular,
+                            14.,
+                            theme.card,
+                            seed,
                             tile,
                         )
                         .into_any_element()
                     } else {
-                        tile.rounded(px(14.))
+                        tile()
+                            .rounded(px(14.))
                             .bg(theme.card2)
                             .text_color(theme.text2)
                             .into_any_element()
@@ -289,7 +326,12 @@ impl Vault {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(status_chip(host.status, theme, time, seed + 0.6))
+                    .child(status_chip(
+                        ui,
+                        format!("status-{}", host.name),
+                        host.status,
+                        seed + 0.6,
+                    ))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -329,17 +371,18 @@ impl Vault {
     }
 }
 
-impl Render for Vault {
+impl Render for VaultContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = if self.dark {
+        // Placeholders re-record their surfaces during this frame's prepaint.
+        self.slots.clear();
+        let theme = Rc::new(if self.dark {
             Theme::dark()
         } else {
             Theme::light()
-        };
-        let time = if cx.reduce_motion() {
-            0.
-        } else {
-            self.started.elapsed().as_secs_f32()
+        });
+        let ui = Ui {
+            theme: &theme,
+            slots: &self.slots,
         };
         div()
             .size_full()
@@ -348,7 +391,7 @@ impl Render for Vault {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(self.header(&theme, time, cx))
+            .child(self.header(&ui, cx))
             .child(
                 div()
                     .flex()
@@ -356,9 +399,38 @@ impl Render for Vault {
                     .min_h_0()
                     .gap(px(20.))
                     .p(px(20.))
-                    .child(sidebar(&theme, time))
-                    .child(self.hosts(&theme, time, cx)),
+                    .child(sidebar(&ui))
+                    .child(self.hosts(&ui, cx)),
             )
+    }
+}
+
+/// What every builder needs: the theme and where glass surfaces register.
+struct Ui<'a> {
+    theme: &'a Rc<Theme>,
+    slots: &'a GlassSlots,
+}
+
+impl Ui<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn glass<E: IntoElement>(
+        &self,
+        id: impl Into<SharedString>,
+        tone: Tone,
+        milk: Milk,
+        radius: f32,
+        underlay: Hsla,
+        seed: f32,
+        content: impl Fn() -> E + 'static,
+    ) -> Div {
+        let spec = Glass {
+            tone,
+            milk,
+            radius: px(radius),
+            underlay,
+            seed,
+        };
+        glass(self.slots, id, spec, self.theme, content)
     }
 }
 
@@ -411,7 +483,8 @@ fn tabs(theme: &Theme) -> impl IntoElement {
         )
 }
 
-fn sidebar(theme: &Theme, time: f32) -> impl IntoElement {
+fn sidebar(ui: &Ui) -> impl IntoElement {
+    let theme = ui.theme;
     let items = [
         (IconName::Server, "Hosts", "7"),
         (IconName::KeyRound, "Keychain", "4"),
@@ -458,10 +531,11 @@ fn sidebar(theme: &Theme, time: f32) -> impl IntoElement {
                 }),
         )
         .child(div().flex_1())
-        .child(sync_card(theme, time))
+        .child(sync_card(ui))
 }
 
-fn sync_card(theme: &Theme, time: f32) -> impl IntoElement {
+fn sync_card(ui: &Ui) -> impl IntoElement {
+    let theme = ui.theme;
     div()
         .p(px(14.))
         .rounded(px(20.))
@@ -475,22 +549,24 @@ fn sync_card(theme: &Theme, time: f32) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(glass(
-                    Glass {
-                        tone: Tone::Ok,
-                        milk: Milk::Regular,
-                        radius: px(12.),
-                        underlay: theme.card,
-                        seed: 2.1,
+                .child(ui.glass(
+                    "sync-tile",
+                    Tone::Ok,
+                    Milk::Regular,
+                    12.,
+                    theme.card,
+                    2.1,
+                    {
+                        let color = theme.glass_text;
+                        move || {
+                            div()
+                                .size(px(36.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(IconName::Cloud, 18., color))
+                        }
                     },
-                    theme,
-                    time,
-                    div()
-                        .size(px(36.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(IconName::Cloud, 18., theme.glass_text)),
                 ))
                 .child(
                     div()
@@ -523,7 +599,8 @@ fn sync_card(theme: &Theme, time: f32) -> impl IntoElement {
         )
 }
 
-fn toolbar(theme: &Theme, time: f32) -> impl IntoElement {
+fn toolbar(ui: &Ui) -> impl IntoElement {
+    let theme = ui.theme;
     div()
         .flex()
         .items_center()
@@ -570,31 +647,34 @@ fn toolbar(theme: &Theme, time: f32) -> impl IntoElement {
                         .child(icon(IconName::Search, 17., theme.text2)),
                 ),
         )
-        .child(glass(
-            Glass {
-                tone: Tone::Brand,
-                milk: Milk::Regular,
-                radius: px(16.),
-                underlay: theme.win,
-                seed: 0.7,
+        .child(ui.glass(
+            "new-host",
+            Tone::Brand,
+            Milk::Regular,
+            16.,
+            theme.win,
+            0.7,
+            {
+                let color = theme.glass_text;
+                move || {
+                    div()
+                        .h(px(46.))
+                        .px(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(icon(IconName::Plus, 16., color))
+                        .child("New host")
+                }
             },
-            theme,
-            time,
-            div()
-                .h(px(46.))
-                .px(px(20.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .text_size(px(15.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(icon(IconName::Plus, 16., theme.glass_text))
-                .child("New host"),
         ))
 }
 
-fn status_chip(status: HostStatus, theme: &Theme, time: f32, seed: f32) -> AnyElement {
-    let chip = |glyph: AnyElement, label: &'static str| {
+fn status_chip(ui: &Ui, id: String, status: HostStatus, seed: f32) -> AnyElement {
+    let theme = ui.theme;
+    fn chip(glyph: AnyElement, label: &'static str) -> Div {
         div()
             .h(px(28.))
             .px(px(11.))
@@ -605,32 +685,39 @@ fn status_chip(status: HostStatus, theme: &Theme, time: f32, seed: f32) -> AnyEl
             .font_weight(FontWeight::SEMIBOLD)
             .child(glyph)
             .child(label)
-    };
-    let on_glass = |tone| Glass {
-        tone,
-        milk: Milk::Strong,
-        radius: px(10.),
-        underlay: theme.card,
-        seed,
-    };
+    }
     match status {
-        HostStatus::Online => glass(
-            on_glass(Tone::Ok),
-            theme,
-            time,
-            chip(status_dot(theme).into_any_element(), "Online"),
-        )
-        .into_any_element(),
-        HostStatus::Connecting => glass(
-            on_glass(Tone::Info),
-            theme,
-            time,
-            chip(
-                icon(IconName::LoaderCircle, 13., theme.info_glyph).into_any_element(),
-                "Connecting",
-            ),
-        )
-        .into_any_element(),
+        HostStatus::Online => {
+            let theme = theme.clone();
+            ui.glass(
+                id,
+                Tone::Ok,
+                Milk::Strong,
+                10.,
+                ui.theme.card,
+                seed,
+                move || chip(status_dot(&theme).into_any_element(), "Online"),
+            )
+            .into_any_element()
+        }
+        HostStatus::Connecting => {
+            let spinner = theme.info_glyph;
+            ui.glass(
+                id,
+                Tone::Info,
+                Milk::Strong,
+                10.,
+                theme.card,
+                seed,
+                move || {
+                    chip(
+                        icon(IconName::LoaderCircle, 13., spinner).into_any_element(),
+                        "Connecting",
+                    )
+                },
+            )
+            .into_any_element()
+        }
         HostStatus::Offline => chip(
             div()
                 .size(px(7.))
