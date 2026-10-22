@@ -61,6 +61,10 @@ claude.ai account). Each item below names the artboard it comes from.
       Up, Upload and Refresh, names with sizes or item counts; clicking a
       file copies it to the other side, dropped files upload, transfers
       show an ink progress bar and a check, and never replace a file
+- [x] Vault side panel (item 11): for the selected host, a live preview of
+      its open session (painted by the live layer, so the vault doesn't
+      re-render), Open terminal (shows the open session if there is one),
+      SFTP, and its port forwarding switches
 
 ## Known gaps in what's built
 
@@ -74,10 +78,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 11. Vault side panel (Main artboard right column)
-- For the selected host: a live preview of its open session (if any), Open
-  terminal and SFTP buttons, and its port-forward switches (item 8).
 
 ### 12. Settings (Sync artboard tabs: General, Terminal, Appearance, Sync)
 - Appearance: light, dark or system.

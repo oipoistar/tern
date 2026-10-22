@@ -5,6 +5,7 @@
 //! Screens are cached views; only this thin root re-renders each animation
 //! frame, so the latency traces can move without redrawing the screens.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
@@ -111,6 +112,9 @@ impl Workspace {
                     VaultEvent::Connect(connection) => {
                         this.open_session(connection.clone(), window, cx)
                     }
+                    VaultEvent::Open { connection, files } => {
+                        this.show_session(connection.clone(), *files, window, cx)
+                    }
                     VaultEvent::Forward { host, forward, on } => {
                         for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
                             let terminal = pane.read(cx);
@@ -161,6 +165,51 @@ impl Workspace {
         self.add_session(terminal, window, cx);
     }
 
+    /// Shows the tab with a session to `connection`'s saved host, or opens
+    /// one, then its Files panel when `files`.
+    fn show_session(
+        &mut self,
+        connection: Connection,
+        files: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = connection.host.as_deref().and_then(|host| {
+            self.tabs.iter().position(|tab| {
+                tab.panes
+                    .iter()
+                    .any(|pane| pane.read(cx).is_live() && pane.read(cx).host() == Some(host))
+            })
+        });
+        match open {
+            Some(index) => self.activate(Some(index), window, cx),
+            None => self.open_session(connection, window, cx),
+        }
+        if let Some(index) = self.active
+            && files
+            && !self.tabs[index].files_open
+        {
+            self.toggle_files(cx);
+        }
+    }
+
+    /// Tells the vault which saved hosts have a live session, for its side
+    /// panel's previews.
+    fn share_sessions(&self, cx: &mut Context<Self>) {
+        let sessions: HashMap<String, _> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|pane| {
+                let terminal = pane.read(cx);
+                let host = terminal.host().filter(|_| terminal.is_live())?;
+                Some((host.to_string(), terminal.preview()))
+            })
+            .collect();
+        self.vault
+            .update(cx, |vault, cx| vault.set_open_sessions(sessions, cx));
+    }
+
     /// Adds a tab for `terminal` and shows it.
     fn add_session(
         &mut self,
@@ -197,6 +246,7 @@ impl Workspace {
                         }
                         vault.record_visit(visit, cx);
                     });
+                    this.share_sessions(cx);
                 }
                 TerminalEvent::Forwarding {
                     host,
@@ -236,10 +286,13 @@ impl Workspace {
         match tab {
             // The cached vault re-renders so its marks register again, with
             // art for any key trusted in a session meanwhile.
-            None => self.vault.update(cx, |vault, cx| {
-                vault.refresh_keys();
-                cx.notify();
-            }),
+            None => {
+                self.share_sessions(cx);
+                self.vault.update(cx, |vault, cx| {
+                    vault.refresh_keys();
+                    cx.notify();
+                });
+            }
             Some(index) => self.tabs[index]
                 .focused()
                 .update(cx, |terminal, cx| terminal.focus(window, cx)),
@@ -942,8 +995,8 @@ mod tests {
     use crate::vault::VaultContent;
 
     /// Panes that don't connect.
-    fn offline(_: Connection, cx: &mut Context<TerminalView>) -> TerminalView {
-        TerminalView::offline(cx)
+    fn offline(connection: Connection, cx: &mut Context<TerminalView>) -> TerminalView {
+        TerminalView::offline_to(connection, cx)
     }
 
     /// A window with the sample vault and one session tab.
@@ -992,6 +1045,39 @@ mod tests {
         click(cx, "new-snippet");
         workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
         assert!(cx.debug_bounds("save-snippet").is_some());
+    }
+
+    #[gpui::test]
+    fn opening_a_host_shows_its_session(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let vault = Vault::sample();
+        let to = |name: &str| {
+            let host = vault.find(name).unwrap();
+            vault.connection(host).unwrap()
+        };
+        let tabs = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| (workspace.tabs.len(), workspace.active))
+        };
+        let show = |cx: &mut VisualTestContext, connection: Connection, files: bool| {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_session(connection, files, window, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+
+        // No session to bastion yet: one opens, in a tab of its own.
+        show(cx, to("bastion"), false);
+        assert_eq!(tabs(cx), (2, Some(1)));
+        cx.update(|window, cx| workspace.update(cx, |w, cx| w.activate(Some(0), window, cx)));
+
+        // Now it's shown again, with its Files panel.
+        show(cx, to("bastion"), true);
+        assert_eq!(tabs(cx), (2, Some(1)));
+        workspace.read_with(cx, |workspace, _| assert!(workspace.tabs[1].files_open));
+        show(cx, to("prod-db-01"), false);
+        assert_eq!(tabs(cx), (3, Some(2)));
     }
 
     #[gpui::test]

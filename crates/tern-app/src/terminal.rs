@@ -34,6 +34,11 @@ const FONT_SIZE: f32 = 13.5;
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.35;
 const SCROLLBACK: usize = 10_000;
+/// Lines a session's preview keeps: those ending at the cursor.
+const PREVIEW_LINES: i32 = 9;
+
+/// The last lines of a session, shared with the vault's side panel.
+pub type Preview = Rc<RefCell<Vec<String>>>;
 
 /// Where the connection stands.
 pub enum Phase {
@@ -94,6 +99,7 @@ pub struct TerminalView {
     started: u64,
     /// Since when the shell has been up.
     live_since: Option<Instant>,
+    preview: Preview,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -146,17 +152,46 @@ impl TerminalView {
             port: 22,
             user: "me".into(),
         };
-        let mut view = Self::idle(Connection::typed(target, None), cx);
+        Self::offline_to(Connection::typed(target, None), cx)
+    }
+
+    /// A live pane for `connection` with nothing behind it, for tests.
+    #[cfg(test)]
+    pub fn offline_to(connection: Connection, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::idle(connection, cx);
         view.on_session_event(Event::Connected, cx);
         view
     }
 
-    /// An SFTP session on this pane's connection, once it's live.
+    /// An SFTP session on this pane's connection; asked while connecting,
+    /// it opens once the shell does.
     pub fn open_sftp(&self) -> Pin<Box<dyn Future<Output = Result<Sftp, String>>>> {
         match &self.input {
-            Some(input) if self.is_live() => Box::pin(input.open_sftp()),
-            _ => Box::pin(async { Err("Not connected".to_string()) }),
+            Some(input) => Box::pin(input.open_sftp()),
+            None => Box::pin(async { Err("Not connected".to_string()) }),
         }
+    }
+
+    /// The session's last lines, kept current as output arrives.
+    pub fn preview(&self) -> Preview {
+        self.preview.clone()
+    }
+
+    /// Copies the lines up to the cursor into the preview: a few rows of
+    /// the grid, cheap enough for every chunk of output.
+    fn update_preview(&self) {
+        let grid = self.term.grid();
+        let bottom = grid.cursor.point.line.0;
+        let top = (bottom - PREVIEW_LINES + 1).max(-(grid.history_size() as i32));
+        let columns = grid.columns();
+        let lines = (top..=bottom)
+            .map(|line| {
+                let row = &grid[alacritty_terminal::index::Line(line)];
+                let text: String = (0..columns).map(|column| row[Column(column)].c).collect();
+                text.trim_end().to_string()
+            })
+            .collect();
+        *self.preview.borrow_mut() = lines;
     }
 
     /// Types `bytes` into the shell, as if from the keyboard. Ignored
@@ -198,6 +233,7 @@ impl TerminalView {
             selecting: false,
             started: history::now(),
             live_since: None,
+            preview: Preview::default(),
             #[cfg(test)]
             sent: RefCell::default(),
         }
@@ -326,6 +362,7 @@ impl TerminalView {
             Event::Output(bytes) => {
                 self.parser.advance(&mut self.term, &bytes);
                 self.answer_terminal_events(cx);
+                self.update_preview();
             }
             Event::Forwarding { forward, state } => {
                 if let Some(host) = self.connection.host.clone() {

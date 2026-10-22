@@ -31,8 +31,11 @@ use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
 use crate::snippets::{SnippetEvent, SnippetsView};
-use crate::theme::{self, MONO, Theme};
-use crate::ui::{Ui, art_tile, button, group_heading, icon, search_field};
+use crate::terminal::Preview;
+use crate::theme::{self, MONO, TermPalette, Theme};
+use crate::ui::{
+    Ui, art_tile, button, group_heading, icon, ink_button, search_field, status_dot, switch,
+};
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -43,6 +46,12 @@ const CARD_WIDTH: f32 = 320.;
 
 pub enum VaultEvent {
     Connect(Connection),
+    /// Show the session for this connection's saved host, opening one if
+    /// none is open, with its Files panel when `files`.
+    Open {
+        connection: Connection,
+        files: bool,
+    },
     /// Start or stop a rule in any open session to the saved host `host`.
     Forward {
         host: String,
@@ -101,6 +110,8 @@ pub struct VaultContent {
     history_file: Option<PathBuf>,
     /// How each rule is doing in open sessions.
     forward_states: States,
+    /// The open sessions' previews, by saved host.
+    open_sessions: HashMap<String, Preview>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
     /// file this Tern mustn't overwrite).
@@ -350,6 +361,7 @@ impl VaultContent {
             history: History::default(),
             history_file: None,
             forward_states: States::default(),
+            open_sessions: HashMap::new(),
             vault,
             file,
             notice: None,
@@ -469,6 +481,202 @@ impl VaultContent {
     pub fn clear_forward_states(&mut self, host: &str, cx: &mut Context<Self>) {
         self.forward_states.retain(|(of, _), _| of != host);
         self.refresh_forwards(cx);
+    }
+
+    /// Which saved hosts have a session open, with its preview.
+    pub fn set_open_sessions(
+        &mut self,
+        sessions: HashMap<String, Preview>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_sessions = sessions;
+        cx.notify();
+    }
+
+    /// Switches a rule from the side panel, as the Port forwarding screen
+    /// does.
+    fn switch_forward(&mut self, host: &str, forward: &Forward, on: bool, cx: &mut Context<Self>) {
+        self.vault.switch_forward(host, &forward.id(), on);
+        self.persist();
+        self.refresh_forwards(cx);
+        cx.emit(VaultEvent::Forward {
+            host: host.to_string(),
+            forward: forward.clone(),
+            on,
+        });
+        cx.notify();
+    }
+
+    /// Asks for the selected host's session, opening one if needed.
+    fn open_selected(&mut self, files: bool, cx: &mut Context<Self>) {
+        let Some(host) = self.vault.find(&self.selected) else {
+            return;
+        };
+        if let Ok(connection) = self.vault.connection(host) {
+            cx.emit(VaultEvent::Open { connection, files });
+        }
+    }
+
+    /// Beside the cards, for the selected host: its open session's last
+    /// lines, Open terminal and SFTP, and its port forwarding switches.
+    fn side_panel(&self, host: &Host, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
+        let t = ui.theme;
+        let palette = TermPalette::for_theme(t);
+        let art = self.keys.get(&(host.address.clone(), host.port)).cloned();
+        let preview = self.open_sessions.get(&host.name).cloned();
+        div()
+            .id("host-panel")
+            .debug_selector(|| "host-panel".into())
+            .w(px(300.))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .rounded(px(22.))
+                    .bg(t.card)
+                    .shadow(t.shadow())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(art_tile(art, 46., 14., t))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .child(host.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(MONO)
+                                            .text_size(px(12.))
+                                            .text_color(t.text2)
+                                            .truncate()
+                                            .child(host.target()),
+                                    ),
+                            ),
+                    )
+                    .when_some(preview, |d, lines| {
+                        d.child(
+                            div()
+                                .h(px(150.))
+                                .p(px(10.))
+                                .rounded(px(14.))
+                                .bg(palette.background)
+                                .child(
+                                    div()
+                                        .id("host-preview")
+                                        .debug_selector(|| "host-preview".into())
+                                        .size_full()
+                                        .child(
+                                            ui.preview(
+                                                format!("preview-{}", host.name),
+                                                lines,
+                                                palette.foreground,
+                                            )
+                                            .size_full(),
+                                        ),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                ink_button("side-terminal", t)
+                                    .debug_selector(|| "side-terminal".into())
+                                    .flex_1()
+                                    .justify_center()
+                                    .h(px(40.))
+                                    .rounded(px(13.))
+                                    .child(icon(IconName::SquareTerminal, 15., t.card))
+                                    .child("Open terminal")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_selected(false, cx)),
+                                    ),
+                            )
+                            .child(
+                                button("side-sftp", t)
+                                    .debug_selector(|| "side-sftp".into())
+                                    .h(px(40.))
+                                    .rounded(px(13.))
+                                    .child(icon(IconName::FolderOpen, 15., t.text))
+                                    .child("SFTP")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_selected(true, cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            .when(!host.forwards.is_empty(), |d| {
+                d.child(
+                    div()
+                        .p(px(8.))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(22.))
+                        .bg(t.card)
+                        .shadow(t.shadow())
+                        .children(host.forwards.iter().enumerate().map(|(index, forward)| {
+                            let running = matches!(
+                                self.forward_states.get(&(host.name.clone(), forward.id())),
+                                Some(ForwardState::Running)
+                            );
+                            let id = format!("side-switch-{index}");
+                            let (name, toggled) = (host.name.clone(), forward.clone());
+                            div()
+                                .h(px(44.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .w(px(22.))
+                                        .flex_none()
+                                        .font_family(MONO)
+                                        .text_size(px(12.))
+                                        .text_color(t.text3)
+                                        .child(forward.flag()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .font_family(MONO)
+                                        .text_size(px(12.))
+                                        .truncate()
+                                        .child(forward.route()),
+                                )
+                                .when(running, |d| d.child(status_dot(t)))
+                                .child(
+                                    switch(SharedString::from(id.clone()), forward.on, t)
+                                        .debug_selector(move || id)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.switch_forward(&name, &toggled, !toggled.on, cx)
+                                        })),
+                                )
+                        })),
+                )
+            })
     }
 
     /// Applies a change from the Port forwarding screen, saves it, and
@@ -939,7 +1147,11 @@ impl Render for VaultContent {
             .child(sidebar(self.section, &theme, cx))
             .map(|d| match screen {
                 Some(view) => d.child(view),
-                None => d.child(self.hosts(&ui, cx)),
+                None => d
+                    .child(self.hosts(&ui, cx))
+                    .when_some(self.vault.find(&self.selected), |d, host| {
+                        d.child(self.side_panel(host, &ui, cx))
+                    }),
             })
             .when_some(self.editor.clone(), |d, editor| {
                 d.child(
@@ -1402,6 +1614,55 @@ mod tests {
         );
         vault.update(cx, |vault, cx| vault.clear_forward_states("bastion", cx));
         assert!(vault.read_with(cx, |vault, _| vault.forward_states.is_empty()));
+    }
+
+    #[gpui::test]
+    fn the_side_panel_opens_sessions_and_switches_rules(cx: &mut TestAppContext) {
+        use std::collections::HashMap;
+
+        use tern_core::forward::{Forward, ForwardKind};
+
+        let (vault, cx, _) = open_vault(cx);
+        let opened: Rc<RefCell<Vec<(String, bool)>>> = Rc::default();
+        let switched: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let (seen_open, seen_switch) = (opened.clone(), switched.clone());
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| match event {
+                VaultEvent::Open { connection, files } => seen_open
+                    .borrow_mut()
+                    .push((connection.host.clone().unwrap_or_default(), *files)),
+                VaultEvent::Forward { on, .. } => seen_switch.borrow_mut().push(*on),
+                VaultEvent::Connect(_) => {}
+            })
+            .detach()
+        });
+        let rule = Forward::typed(ForwardKind::Local, "8080", "localhost:80").unwrap();
+        vault.update(cx, |vault, cx| {
+            vault.vault.save_forward("bastion", None, rule).unwrap();
+            let preview = Rc::new(RefCell::new(vec!["admin@bastion:~$ uptime".to_string()]));
+            vault.set_open_sessions(HashMap::from([("bastion".to_string(), preview)]), cx);
+        });
+
+        // A host without a session shows no preview; bastion has one.
+        assert!(cx.debug_bounds("host-panel").is_some());
+        assert!(cx.debug_bounds("host-preview").is_none());
+        click(cx, "host-bastion");
+        assert!(cx.debug_bounds("host-preview").is_some());
+
+        click(cx, "side-terminal");
+        click(cx, "side-sftp");
+        assert_eq!(
+            *opened.borrow(),
+            [
+                ("bastion".to_string(), false),
+                ("bastion".to_string(), true)
+            ]
+        );
+        click(cx, "side-switch-0");
+        assert_eq!(*switched.borrow(), [false]);
+        vault.read_with(cx, |vault, _| {
+            assert!(!vault.vault.find("bastion").unwrap().forwards[0].on)
+        });
     }
 
     #[gpui::test]

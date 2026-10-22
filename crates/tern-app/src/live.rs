@@ -15,7 +15,7 @@ use gpui_kit::*;
 use crate::bench;
 
 /// Draws a mark into its bounds at `time` seconds into the animation.
-type Painter = Rc<dyn Fn(Bounds<Pixels>, f32, &mut Window)>;
+type Painter = Rc<dyn Fn(Bounds<Pixels>, f32, &mut Window, &mut App)>;
 
 /// Where a screen placed one mark during its last prepaint.
 struct Slot {
@@ -55,7 +55,7 @@ impl LiveSlots {
 pub fn live(
     slots: &LiveSlots,
     id: impl Into<SharedString>,
-    paint: impl Fn(Bounds<Pixels>, f32, &mut Window) + 'static,
+    paint: impl Fn(Bounds<Pixels>, f32, &mut Window, &mut App) + 'static,
 ) -> Canvas<()> {
     let (slots, id) = (slots.clone(), id.into());
     let paint: Painter = Rc::new(paint);
@@ -81,10 +81,10 @@ pub fn live_layer(slots: &LiveSlots, time: f32) -> impl IntoElement {
     let slots = slots.clone();
     canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |_, _, window, cx| {
             for (_, slot) in slots.0.borrow().iter() {
                 window.with_content_mask(Some(slot.mask), |window| {
-                    (slot.paint)(slot.bounds, time, window)
+                    (slot.paint)(slot.bounds, time, window, cx)
                 });
             }
             bench::frame_end();

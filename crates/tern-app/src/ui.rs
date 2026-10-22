@@ -10,7 +10,8 @@ use tern_core::randomart::Randomart;
 
 use crate::live::{LiveSlots, live};
 use crate::marks::{self, Trace};
-use crate::theme::Theme;
+use crate::terminal::Preview;
+use crate::theme::{MONO, Theme};
 
 /// What a screen's builders need: the theme and where live marks register.
 pub struct Ui<'a> {
@@ -29,8 +30,39 @@ impl Ui<'_> {
         ink: Hsla,
         faint: Hsla,
     ) -> Canvas<()> {
-        live(self.live, id, move |bounds, time, window| {
+        live(self.live, id, move |bounds, time, window, _| {
             marks::paint_trace(bounds, &trace, seed, time, ink, faint, window)
+        })
+    }
+
+    /// The last lines of a session, in terminal colours, kept current by
+    /// the live layer as output arrives.
+    pub fn preview(&self, id: impl Into<SharedString>, lines: Preview, ink: Hsla) -> Canvas<()> {
+        live(self.live, id, move |bounds, _, window, cx| {
+            let line_height = px(14.);
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for (row, text) in lines.borrow().iter().enumerate() {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let run = TextRun {
+                        len: text.len(),
+                        font: font(MONO),
+                        color: ink,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(
+                        text.clone().into(),
+                        px(10.5),
+                        &[run],
+                        None,
+                    );
+                    let origin = point(bounds.origin.x, bounds.origin.y + line_height * row as f32);
+                    let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                }
+            });
         })
     }
 }
