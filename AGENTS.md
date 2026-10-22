@@ -47,7 +47,8 @@ russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
-(`history.rs`), the vault's filter (`filter.rs`), port forwarding
+(`history.rs`), the vault's filter (`filter.rs`), links in terminal
+text (`links.rs`), port forwarding
 (`forward.rs`), agent forwarding (`agent.rs`), SFTP (`sftp.rs`), settings
 (`settings.rs`), sync (`sync.rs`), the system's credential store
 (`secrets.rs`), reading
@@ -59,7 +60,8 @@ settings in effect and their dialog, `sync.rs` sync's state and runs,
 `vault.rs` is the
 vault tab (sidebar and the hosts screen), `keychain.rs`, `snippets.rs`,
 `forwarding.rs`, `known_hosts.rs` and `history.rs` are its other screens, `terminal.rs` is a
-session, `host_editor.rs` is the dialog the vault opens over itself, and
+session (with `term_input.rs` encoding its keys and mouse for the remote
+program), `host_editor.rs` is the dialog the vault opens over itself, and
 `marks.rs` draws the art and traces.
 `tern-devserver` is a local SSH server with a real shell and SFTP for
 manual testing; its SFTP server (`sftp.rs`, a library module) also serves

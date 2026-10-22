@@ -11,6 +11,7 @@ mod marks;
 mod settings;
 mod snippets;
 mod sync;
+mod term_input;
 mod terminal;
 mod theme;
 mod ui;

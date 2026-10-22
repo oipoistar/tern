@@ -9,6 +9,7 @@ pub mod history;
 pub mod host;
 pub mod keys;
 pub mod known_hosts;
+pub mod links;
 pub mod paths;
 pub mod putty;
 pub mod randomart;

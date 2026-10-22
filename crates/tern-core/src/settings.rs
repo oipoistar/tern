@@ -81,6 +81,17 @@ impl TerminalSettings {
         self.scrollback = self.scrollback.min(Self::MAX_SCROLLBACK);
         self
     }
+
+    /// Font zoom (Ctrl+= and Ctrl+-): `steps` points larger or smaller,
+    /// kept in range; `None` goes back to the default size.
+    pub fn zoom(&mut self, steps: Option<i8>) {
+        self.font_size = match steps {
+            Some(steps) => {
+                (self.font_size + f32::from(steps)).clamp(Self::MIN_FONT_SIZE, Self::MAX_FONT_SIZE)
+            }
+            None => Self::default().font_size,
+        };
+    }
 }
 
 impl Default for TerminalSettings {
@@ -167,5 +178,24 @@ mod tests {
             ..TerminalSettings::default()
         };
         assert_eq!(tiny.clamped().font_size, TerminalSettings::MIN_FONT_SIZE);
+    }
+
+    #[test]
+    fn zooms_a_point_at_a_time_within_range() {
+        let mut terminal = TerminalSettings::default();
+        terminal.zoom(Some(1));
+        assert_eq!(terminal.font_size, 14.5);
+        terminal.zoom(Some(-3));
+        assert_eq!(terminal.font_size, 11.5);
+        terminal.zoom(None);
+        assert_eq!(terminal.font_size, 13.5);
+        for _ in 0..40 {
+            terminal.zoom(Some(1));
+        }
+        assert_eq!(terminal.font_size, TerminalSettings::MAX_FONT_SIZE);
+        for _ in 0..40 {
+            terminal.zoom(Some(-1));
+        }
+        assert_eq!(terminal.font_size, TerminalSettings::MIN_FONT_SIZE);
     }
 }

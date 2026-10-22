@@ -85,6 +85,14 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Agent forwarding (item 15): "Forward the SSH agent" in the host
       editor; the server's agent channels are piped to the local agent
       (`SSH_AUTH_SOCK`, OpenSSH's pipe or Pageant) only when it's on
+- [x] Terminal niceties (item 17): Ctrl+Shift+F / Cmd+F finds in the
+      scrollback (plain text, case-sensitive only with capitals; the match
+      selected, the others on screen lit faintly; Enter older, Shift+Enter
+      newer); Ctrl+click / Cmd+click opens a link (underlined while the key
+      is held); Ctrl+= / Ctrl+- / Ctrl+0 zoom the font; programs that ask
+      get the mouse (clicks, drags, motion, wheel; SGR and UTF-8), Shift
+      keeps it for selecting, and the wheel sends arrows to full-screen
+      programs that don't take it; the visual bell came with Settings
 
 ## Known gaps in what's built
 
@@ -104,10 +112,6 @@ claude.ai account). Each item below names the artboard it comes from.
   page (Google Drive, Dropbox, OneDrive, iCloud Drive) where a folder isn't
   enough.
 - No Tern servers and no accounts, ever.
-
-### 17. Terminal niceties
-- Find in scrollback, clickable URLs, font zoom (Ctrl +/-), visual bell.
-- Mouse reporting for programs that want it (vim, htop).
 
 ### 18. More SSH
 - Jump chains (more than one hop; the editor refuses them today).

@@ -6,24 +6,30 @@
 //!
 //! Dragging selects text (double-click a word, triple-click a line,
 //! Shift+click extends), painted inverted; Ctrl+Shift+C (Cmd+C on macOS)
-//! copies it.
+//! copies it. Ctrl+Shift+F (Cmd+F) finds text in the scrollback,
+//! Ctrl+click (Cmd+click) opens a link, and Ctrl+= / Ctrl+- / Ctrl+0 zoom
+//! the font. Programs that ask for the mouse (vim, htop) get it, except
+//! while Shift is held, which keeps it for selecting.
 
 use std::cell::{Cell, RefCell};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, CursorStyle as TermCursorStyle, NamedColor, Processor, Rgb,
 };
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::forward::{Forward, ForwardState};
@@ -33,7 +39,9 @@ use tern_core::sftp::Sftp;
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
 use crate::settings;
+use crate::term_input::{MouseReport, encode_key, encode_mouse, wheel_keys};
 use crate::theme::{self, MONO, TermPalette, Theme};
+use crate::ui::icon;
 
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.35;
@@ -109,9 +117,39 @@ pub struct TerminalView {
     configured: (usize, CursorStyle),
     /// The visual bell lights the pane until then.
     flash_until: Option<Instant>,
+    /// The find bar, while it's open.
+    find: Option<Find>,
+    /// The link under the pointer while Ctrl (Cmd on macOS) is held.
+    link: Option<Link>,
+    /// A button the program was told went down, until it's told it came up.
+    pressed: Option<MouseButton>,
+    /// The cell the program last heard the pointer was in.
+    reported_cell: Option<(usize, usize)>,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
+}
+
+/// Find in scrollback: the field, and the search for what's typed in it.
+/// The match it's on is the terminal's selection, which moves with the
+/// text as output scrolls it.
+struct Find {
+    input: Entity<InputState>,
+    /// What was last searched for.
+    query: String,
+    /// `None` while the field is empty.
+    regex: Option<RegexSearch>,
+    /// Which match is selected, counting from the oldest, and how many
+    /// there are, as of the last search or step.
+    count: (usize, usize),
+    _subscription: Subscription,
+}
+
+/// A link on screen, from its first cell to its last.
+#[derive(Clone, Debug, PartialEq)]
+struct Link {
+    cells: RangeInclusive<GridPoint>,
+    url: String,
 }
 
 /// Where the grid sits in the window, as of the last paint.
@@ -267,6 +305,10 @@ impl TerminalView {
             preview: Preview::default(),
             configured: (terminal.scrollback, terminal.cursor),
             flash_until: None,
+            find: None,
+            link: None,
+            pressed: None,
+            reported_cell: None,
             #[cfg(test)]
             sent: RefCell::default(),
         }
@@ -502,8 +544,27 @@ impl TerminalView {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // Keys typed in the find bar pass through here too: only closing
+        // it is ours, the rest is the field's.
+        if !self.focus.is_focused(window) {
+            if keystroke.key == "escape" && self.find.is_some() {
+                self.close_find(window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if is_find(keystroke) {
+            self.open_find(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(steps) = zoom_steps(keystroke) {
+            settings::update(cx, |settings| settings.terminal.zoom(steps));
+            cx.stop_propagation();
+            return;
+        }
         if is_copy(keystroke) {
             self.copy(cx);
             cx.stop_propagation();
@@ -574,8 +635,9 @@ impl TerminalView {
         self.send_typed(bytes.into_bytes(), cx);
     }
 
-    /// The cell under `position` in the window, and which half of it.
-    fn cell_at(&self, position: Point<Pixels>) -> (GridPoint, Side) {
+    /// The screen cell under `position` in the window as (line, column)
+    /// from the top left, and which half of it.
+    fn screen_cell(&self, position: Point<Pixels>) -> (usize, usize, Side) {
         let grid = self.grid.get();
         let x = ((position.x - grid.origin.x) / grid.cell_width.max(px(1.))).max(0.);
         let y = ((position.y - grid.origin.y) / grid.line_height.max(px(1.))).max(0.);
@@ -588,6 +650,12 @@ impl TerminalView {
             Side::Left
         };
         let line = (y as usize).min(usize::from(self.size.rows).saturating_sub(1));
+        (line, column, side)
+    }
+
+    /// The cell under `position` in the window, and which half of it.
+    fn cell_at(&self, position: Point<Pixels>) -> (GridPoint, Side) {
+        let (line, column, side) = self.screen_cell(position);
         let offset = self.term.grid().display_offset();
         (
             viewport_to_point(offset, GridPoint::new(line, Column(column))),
@@ -595,10 +663,120 @@ impl TerminalView {
         )
     }
 
-    /// Starts a selection: by character, by word on a double-click, by line
-    /// on a triple-click. Shift+click extends the current one instead.
+    /// Whether `position` is over the grid itself.
+    fn over_grid(&self, position: Point<Pixels>) -> bool {
+        let grid = self.grid.get();
+        let size = size(
+            grid.cell_width * f32::from(self.size.cols),
+            grid.line_height * f32::from(self.size.rows),
+        );
+        Bounds::new(grid.origin, size).contains(&position)
+    }
+
+    /// The program asked for the mouse, and Shift isn't keeping it for
+    /// selecting.
+    fn reports_mouse(&self, modifiers: &Modifiers) -> bool {
+        self.is_live() && self.term.mode().intersects(TermMode::MOUSE_MODE) && !modifiers.shift
+    }
+
+    /// Tells the program about `report` at `position`, if it asked for
+    /// that kind.
+    fn report_mouse(
+        &mut self,
+        report: MouseReport,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+    ) {
+        let (line, column, _) = self.screen_cell(position);
+        if let Some(bytes) = encode_mouse(report, column, line, modifiers, *self.term.mode()) {
+            self.send(bytes);
+        }
+        self.reported_cell = Some((line, column));
+    }
+
+    /// The link through `point`, if there's one. Links are found in the
+    /// whole wrapped line, so one broken across rows still opens.
+    fn link_at(&self, point: GridPoint) -> Option<Link> {
+        let grid = self.term.grid();
+        let last = self.term.last_column();
+        let wraps = |line: i32| grid[Line(line)][last].flags.contains(Flags::WRAPLINE);
+        let (mut top, mut bottom) = (point.line.0, point.line.0);
+        while top > self.term.topmost_line().0 && wraps(top - 1) {
+            top -= 1;
+        }
+        while bottom < self.term.bottommost_line().0 && wraps(bottom) {
+            bottom += 1;
+        }
+        let mut text = String::new();
+        // Where each character starts in `text`, and its cell.
+        let mut cells = Vec::new();
+        for line in top..=bottom {
+            for column in 0..=last.0 {
+                let cell = &grid[Line(line)][Column(column)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                cells.push((text.len(), GridPoint::new(Line(line), Column(column))));
+                text.push(cell.c);
+            }
+        }
+        // A wide character's spacer belongs to the character before it.
+        let at = cells[cells.iter().rposition(|(_, cell)| *cell <= point)?].0;
+        let range = tern_core::links::find(&text)
+            .into_iter()
+            .find(|range| range.contains(&at))?;
+        let first = cells.iter().find(|(start, _)| *start == range.start)?.1;
+        let last = cells.iter().rev().find(|(start, _)| *start < range.end)?.1;
+        Some(Link {
+            cells: first..=last,
+            url: text[range].to_string(),
+        })
+    }
+
+    /// Underlines the link under the pointer while Ctrl (Cmd) is held.
+    fn hover_link(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let link = (modifiers.secondary() && !self.selecting && self.over_grid(position))
+            .then(|| self.link_at(self.cell_at(position).0))
+            .flatten();
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
+    }
+
+    /// Opens a link on Ctrl+click (Cmd+click), passes the button to a
+    /// program that asked for the mouse, or starts a selection: by
+    /// character, by word on a double-click, by line on a triple-click.
+    /// Shift+click extends the current one instead.
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus(window, cx);
+        if event.modifiers.secondary()
+            && self.over_grid(event.position)
+            && let Some(link) = self.link_at(self.cell_at(event.position).0)
+        {
+            cx.open_url(&link.url);
+            return;
+        }
+        if self.reports_mouse(&event.modifiers) {
+            self.pressed = Some(event.button);
+            self.report_mouse(
+                MouseReport::Press(event.button),
+                event.position,
+                &event.modifiers,
+            );
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
         let (point, side) = self.cell_at(event.position);
         let kind = match event.click_count {
             0 | 1 => SelectionType::Simple,
@@ -624,6 +802,40 @@ impl TerminalView {
             selection.update(point, side);
             cx.notify();
         }
+    }
+
+    /// A button comes up: the program hears it if it heard it go down;
+    /// otherwise a selection ends.
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pressed == Some(event.button) {
+            self.pressed = None;
+            self.report_mouse(
+                MouseReport::Release(event.button),
+                event.position,
+                &event.modifiers,
+            );
+        } else if event.button == MouseButton::Left {
+            self.end_selection(cx);
+        }
+    }
+
+    /// Motion: a program that asked hears drags (or all motion) once per
+    /// cell; with Ctrl (Cmd) held, a link under the pointer is underlined.
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.reports_mouse(&event.modifiers) {
+            let report = match event.pressed_button {
+                Some(button) if self.pressed == Some(button) => Some(MouseReport::Drag(button)),
+                Some(_) => None,
+                None => Some(MouseReport::Move),
+            };
+            let (line, column, _) = self.screen_cell(event.position);
+            if let Some(report) = report
+                && self.reported_cell != Some((line, column))
+            {
+                self.report_mouse(report, event.position, &event.modifiers);
+            }
+        }
+        self.hover_link(event.position, event.modifiers, cx);
     }
 
     /// A drag or click ends; with copy on select, the selection goes to
@@ -664,17 +876,236 @@ impl TerminalView {
         self.term.selection = Some(all);
     }
 
+    /// The wheel goes to a program that asked for the mouse, turns into
+    /// arrow keys for a full-screen one that didn't, and otherwise scrolls
+    /// back.
     fn scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let line_height = px(settings::current(cx).terminal.font_size * LINE_SPACING);
         let lines = (event.delta.pixel_delta(line_height).y / line_height).round() as i32;
-        if lines != 0 {
+        if lines == 0 {
+            return;
+        }
+        let mode = *self.term.mode();
+        if self.reports_mouse(&event.modifiers) {
+            let report = if lines > 0 {
+                MouseReport::WheelUp
+            } else {
+                MouseReport::WheelDown
+            };
+            for _ in 0..lines.unsigned_abs() {
+                self.report_mouse(report, event.position, &event.modifiers);
+            }
+        } else if self.is_live()
+            && mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+            && !event.modifiers.shift
+        {
+            self.send(wheel_keys(lines, mode));
+        } else {
             self.term.scroll_display(Scroll::Delta(lines));
             cx.notify();
         }
     }
 
-    /// Copies the visible grid into plain data the paint pass can own.
-    fn frame(&self, palette: &TermPalette, focused: bool) -> Frame {
+    /// Opens the find bar, or puts the cursor back in it.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let subscription = cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event: &InputEvent, _, cx| match event {
+                    // Also raised by keys that leave the text as it was.
+                    InputEvent::Change => {
+                        let query = input.read(cx).value().to_string();
+                        if this.find.as_ref().is_some_and(|find| find.query != query) {
+                            this.search(query, cx);
+                        }
+                    }
+                    // Enter goes back in time, Shift+Enter forward.
+                    InputEvent::PressEnter { shift, .. } => this.step(
+                        if *shift {
+                            Direction::Right
+                        } else {
+                            Direction::Left
+                        },
+                        cx,
+                    ),
+                    _ => {}
+                },
+            );
+            self.find = Some(Find {
+                input,
+                query: String::new(),
+                regex: None,
+                count: (0, 0),
+                _subscription: subscription,
+            });
+        }
+        if let Some(find) = &self.find {
+            find.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Closes the find bar, leaving the match it was on selected.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Searches for `query` (plain text; case matters only if it has
+    /// capitals) and goes to the newest match.
+    fn search(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        find.regex = (!query.is_empty())
+            .then(|| RegexSearch::new(&literal(&query)).ok())
+            .flatten();
+        find.query = query;
+        self.term.selection = None;
+        self.step(Direction::Left, cx);
+    }
+
+    /// Goes to the next match back in time (`Left`) or forward (`Right`)
+    /// from the one selected, wrapping around; from the bottom when none
+    /// is.
+    fn step(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let current = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
+        let origin = match current {
+            Some(range) if direction == Direction::Left => {
+                range.start.sub(&self.term, Boundary::None, 1)
+            }
+            Some(range) => range.end.add(&self.term, Boundary::None, 1),
+            None => GridPoint::new(self.term.bottommost_line(), self.term.last_column()),
+        };
+        let found = find.regex.as_mut().and_then(|regex| {
+            self.term
+                .search_next(regex, origin, direction, Side::Left, None)
+        });
+        self.term.selection = found.as_ref().map(|found| {
+            let mut selection = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
+            selection.update(*found.end(), Side::Right);
+            selection
+        });
+        if let Some(found) = &found {
+            self.term.scroll_to_point(*found.start());
+        }
+        // Counted afresh each time: output may have added matches since.
+        find.count = match (&mut find.regex, &found) {
+            (Some(regex), Some(found)) => {
+                let top = GridPoint::new(self.term.topmost_line(), Column(0));
+                let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
+                let all: Vec<Match> =
+                    RegexIter::new(top, bottom, Direction::Right, &self.term, regex).collect();
+                let at = all
+                    .iter()
+                    .position(|each| each == found)
+                    .map_or(0, |at| at + 1);
+                (at, all.len())
+            }
+            _ => (0, 0),
+        };
+        cx.notify();
+    }
+
+    /// The matches on screen, for painting.
+    fn visible_matches(&mut self) -> Vec<Match> {
+        let Some(regex) = self.find.as_mut().and_then(|find| find.regex.as_mut()) else {
+            return Vec::new();
+        };
+        let offset = self.term.grid().display_offset();
+        let rows = usize::from(self.size.rows);
+        let top = viewport_to_point(offset, GridPoint::new(0, Column(0)));
+        let bottom = viewport_to_point(
+            offset,
+            GridPoint::new(rows.saturating_sub(1), self.term.last_column()),
+        );
+        RegexIter::new(top, bottom, Direction::Right, &self.term, regex).collect()
+    }
+
+    fn find_bar(&self, find: &Find, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let (at, total) = find.count;
+        let typed = find.regex.is_some();
+        let control = |id: &'static str, name: IconName| {
+            div()
+                .id(id)
+                .size(px(30.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(10.))
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.card2))
+                .child(icon(name, 15., theme.text2))
+        };
+        div()
+            .absolute()
+            .top(px(10.))
+            .right(px(10.))
+            // Clicks here are for the bar, not a selection.
+            .occlude()
+            .w(px(340.))
+            .h(px(44.))
+            .pl(px(12.))
+            .pr(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .rounded(px(14.))
+            .bg(theme.card)
+            .border_1()
+            .border_color(if typed && total == 0 {
+                theme.danger
+            } else {
+                theme.line
+            })
+            .shadow(theme.shadow_sm())
+            .text_color(theme.text)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&find.input).id("find-input").appearance(false)),
+            )
+            .when(total > 0, |d| {
+                d.child(
+                    div()
+                        .px(px(6.))
+                        .flex_none()
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .text_color(theme.text2)
+                        .child(format!("{at}/{total}")),
+                )
+            })
+            .child(
+                control("find-older", IconName::ChevronUp)
+                    .on_click(cx.listener(|this, _, _, cx| this.step(Direction::Left, cx))),
+            )
+            .child(
+                control("find-newer", IconName::ChevronDown)
+                    .on_click(cx.listener(|this, _, _, cx| this.step(Direction::Right, cx))),
+            )
+            .child(
+                control("find-close", IconName::Close)
+                    .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Copies the visible grid into plain data the paint pass can own,
+    /// with `matches` of a search lit.
+    fn frame(&self, palette: &TermPalette, focused: bool, matches: &[Match]) -> Frame {
         let content = self.term.renderable_content();
         let offset = content.display_offset as i32;
         let rows = usize::from(self.size.rows);
@@ -711,10 +1142,13 @@ impl TerminalView {
             if cell.flags.contains(Flags::HIDDEN) {
                 fg = bg;
             }
-            // Selected text is ink on paper, whatever its own colours.
+            // Selected text is ink on paper, whatever its own colours; the
+            // other matches of a search are lit faintly.
             if selection.is_some_and(|range| range.contains(indexed.point)) {
                 fg = palette.background;
                 bg = palette.foreground;
+            } else if matches.iter().any(|lit| lit.contains(&indexed.point)) {
+                bg = palette.foreground.opacity(0.25);
             }
             if block_cursor && cursor_at == Some((row, col)) {
                 fg = palette.background;
@@ -742,7 +1176,11 @@ impl TerminalView {
                 color: fg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+                underline: cell.flags.intersects(Flags::ALL_UNDERLINES)
+                    || self
+                        .link
+                        .as_ref()
+                        .is_some_and(|link| link.cells.contains(&indexed.point)),
                 strike: cell.flags.contains(Flags::STRIKEOUT),
             };
             let wide = cell.flags.contains(Flags::WIDE_CHAR);
@@ -927,7 +1365,8 @@ impl Render for TerminalView {
             self.configured = (terminal.scrollback, terminal.cursor);
         }
         let flashing = self.flash_until.is_some_and(|until| Instant::now() < until);
-        let frame = Rc::new(self.frame(&palette, focused));
+        let matches = self.visible_matches();
+        let frame = Rc::new(self.frame(&palette, focused, &matches));
         let entity = cx.entity();
         let this = entity.downgrade();
         let dragging = this.clone();
@@ -942,14 +1381,21 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.end_selection(cx)),
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    this.hover_link(window.mouse_position(), event.modifiers, cx)
+                }),
             )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.end_selection(cx)),
-            )
+            .when(self.link.is_some(), |d| d.cursor_pointer())
             .relative()
             .size_full()
             .p(px(14.))
@@ -997,6 +1443,11 @@ impl Render for TerminalView {
                         .bg(palette.foreground.opacity(0.14)),
                 )
             })
+            .children(
+                self.find
+                    .as_ref()
+                    .map(|find| self.find_bar(find, &theme, cx)),
+            )
             .children(self.overlay(&theme, cx))
     }
 }
@@ -1332,97 +1783,49 @@ fn is_select_all(keystroke: &Keystroke) -> bool {
     is_shortcut(keystroke, "a")
 }
 
-/// Encodes a key press as the bytes an xterm-compatible terminal would send.
-fn encode_key(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+fn is_find(keystroke: &Keystroke) -> bool {
+    is_shortcut(keystroke, "f")
+}
+
+/// Font zoom: Ctrl+= or Ctrl++ a point larger, Ctrl+- smaller, Ctrl+0
+/// back to the default (`None`); Cmd instead of Ctrl on macOS.
+fn zoom_steps(keystroke: &Keystroke) -> Option<Option<i8>> {
     let m = &keystroke.modifiers;
-    let key = keystroke.key.as_str();
-    // xterm's modifier parameter: 1 + shift + 2·alt + 4·ctrl.
-    let modifier = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.control);
-    let app_cursor = mode.contains(TermMode::APP_CURSOR);
-    let csi = |code: &str, final_byte: char| -> Vec<u8> {
-        if modifier > 1 {
-            format!("\x1b[{code};{modifier}{final_byte}").into_bytes()
-        } else {
-            format!("\x1b[{code}{final_byte}").into_bytes()
+    if !m.secondary() || m.alt {
+        return None;
+    }
+    match keystroke.key.as_str() {
+        "=" | "+" => Some(Some(1)),
+        "-" if !m.shift => Some(Some(-1)),
+        "0" if !m.shift => Some(None),
+        _ => None,
+    }
+}
+
+/// `text` as a pattern that matches only itself.
+fn literal(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len());
+    for c in text.chars() {
+        if r"\.+*?()|[]{}^$#&-~".contains(c) {
+            pattern.push('\\');
         }
-    };
-    let arrow = |letter: char| -> Vec<u8> {
-        if modifier > 1 {
-            format!("\x1b[1;{modifier}{letter}").into_bytes()
-        } else if app_cursor {
-            format!("\x1bO{letter}").into_bytes()
-        } else {
-            format!("\x1b[{letter}").into_bytes()
-        }
-    };
-    let bytes = match key {
-        "enter" => b"\r".to_vec(),
-        "tab" if m.shift => b"\x1b[Z".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "backspace" if m.alt => b"\x1b\x7f".to_vec(),
-        "backspace" => b"\x7f".to_vec(),
-        "escape" => b"\x1b".to_vec(),
-        "up" => arrow('A'),
-        "down" => arrow('B'),
-        "right" => arrow('C'),
-        "left" => arrow('D'),
-        "home" => arrow('H'),
-        "end" => arrow('F'),
-        "insert" => csi("2", '~'),
-        "delete" => csi("3", '~'),
-        "pageup" => csi("5", '~'),
-        "pagedown" => csi("6", '~'),
-        "f1" => b"\x1bOP".to_vec(),
-        "f2" => b"\x1bOQ".to_vec(),
-        "f3" => b"\x1bOR".to_vec(),
-        "f4" => b"\x1bOS".to_vec(),
-        "f5" => csi("15", '~'),
-        "f6" => csi("17", '~'),
-        "f7" => csi("18", '~'),
-        "f8" => csi("19", '~'),
-        "f9" => csi("20", '~'),
-        "f10" => csi("21", '~'),
-        "f11" => csi("23", '~'),
-        "f12" => csi("24", '~'),
-        "space" if m.control => vec![0],
-        _ if m.control && !m.alt && key.len() == 1 => {
-            let c = key.as_bytes()[0].to_ascii_lowercase();
-            match c {
-                b'a'..=b'z' => vec![c - b'a' + 1],
-                b'[' => vec![0x1b],
-                b'\\' => vec![0x1c],
-                b']' => vec![0x1d],
-                b'2' | b'@' => vec![0],
-                b'6' | b'^' => vec![0x1e],
-                b'-' | b'_' => vec![0x1f],
-                _ => return None,
-            }
-        }
-        // Alt+character is ESC then the character (meta key).
-        _ if m.alt && !m.control && !m.platform => {
-            let text = keystroke.key_char.as_deref().unwrap_or(key);
-            [b"\x1b".as_slice(), text.as_bytes()].concat()
-        }
-        // Plain text arrives through the input handler instead, which also
-        // covers IME and characters injected without a key code.
-        _ => return None,
-    };
-    Some(bytes)
+        pattern.push(c);
+    }
+    pattern
 }
 
 #[cfg(test)]
 mod tests {
     // Explicit imports: `gpui_kit::*` brings GPUI's own `test` macro, which
     // would shadow Rust's `#[test]`.
-    use alacritty_terminal::term::TermMode;
     use gpui::{
         MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, TestAppContext,
         VisualTestContext, point,
     };
-    use gpui_kit::{Entity, Keystroke, Modifiers};
+    use gpui_kit::{Entity, Modifiers};
     use tern_core::ssh::{Connection, Event, Target};
 
-    use super::{TerminalView, encode_key};
+    use super::TerminalView;
     use crate::theme::{self, TermPalette};
 
     /// A live pane showing `output` as a shell would print it, with no
@@ -1543,7 +1946,7 @@ mod tests {
         assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
         view.read_with(cx, |view, cx| {
             let palette = TermPalette::for_theme(&theme::current(cx));
-            let frame = view.frame(&palette, false);
+            let frame = view.frame(&palette, false, &[]);
             let span = &frame.rows[0].backgrounds[0];
             assert_eq!((span.start, span.end), (0, 5));
             assert_eq!(span.color, palette.foreground);
@@ -1575,61 +1978,134 @@ mod tests {
         assert_eq!(selected(&view, cx), None);
     }
 
-    fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
-        Keystroke {
-            modifiers,
-            key: key.into(),
-            key_char: key_char.map(Into::into),
+    /// Puts the keyboard in the pane.
+    fn focus(view: &Entity<TerminalView>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let focus = view.read(cx).focus.clone();
+            focus.focus(window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// The terminal's own shortcut for `key`: Ctrl+Shift, or Cmd on macOS.
+    fn shortcut(key: &str) -> String {
+        if cfg!(target_os = "macos") {
+            format!("cmd-{key}")
+        } else {
+            format!("ctrl-shift-{key}")
         }
     }
 
-    fn ctrl() -> Modifiers {
-        Modifiers {
-            control: true,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn encodes_common_keys() {
-        let none = TermMode::empty();
-        // Plain text is left to the input handler.
-        assert_eq!(
-            encode_key(&key("a", Some("a"), Modifiers::default()), none),
-            None
-        );
-        assert_eq!(
-            encode_key(&key("enter", None, Modifiers::default()), none),
-            Some(b"\r".to_vec())
-        );
-        assert_eq!(encode_key(&key("c", None, ctrl()), none), Some(vec![3]));
-        assert_eq!(
-            encode_key(&key("up", None, Modifiers::default()), none),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            encode_key(&key("up", None, Modifiers::default()), TermMode::APP_CURSOR),
-            Some(b"\x1bOA".to_vec())
-        );
-        assert_eq!(
-            encode_key(&key("right", None, ctrl()), none),
-            Some(b"\x1b[1;5C".to_vec())
-        );
-        assert_eq!(
-            encode_key(&key("delete", None, Modifiers::default()), none),
-            Some(b"\x1b[3~".to_vec())
-        );
-    }
-
-    #[test]
-    fn alt_prefixes_escape() {
-        let alt = Modifiers {
-            alt: true,
-            ..Default::default()
+    #[gpui::test]
+    fn finds_text_in_the_scrollback(cx: &mut TestAppContext) {
+        let (view, cx) = pane_with(cx, "alpha one\r\nbeta\r\nALPHA two\r\n");
+        let count = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.find.as_ref().map(|find| find.count))
         };
-        assert_eq!(
-            encode_key(&key("b", Some("b"), alt), TermMode::empty()),
-            Some(b"\x1bb".to_vec())
-        );
+        focus(&view, cx);
+        cx.simulate_keystrokes(&shortcut("f"));
+        cx.run_until_parked();
+        cx.simulate_input("alpha");
+
+        // Without capitals either case matches; the newest comes first, and
+        // the others on screen are lit.
+        assert_eq!(selected(&view, cx).as_deref(), Some("ALPHA"));
+        assert_eq!(count(cx), Some((2, 2)));
+        view.update(cx, |view, _| assert_eq!(view.visible_matches().len(), 2));
+
+        // Enter goes back, wrapping around; Shift+Enter forward.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(selected(&view, cx).as_deref(), Some("alpha"));
+        assert_eq!(count(cx), Some((1, 2)));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(count(cx), Some((2, 2)));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(count(cx), Some((1, 2)));
+
+        // Nothing typed in the bar reaches the shell.
+        view.read_with(cx, |view, _| assert!(view.sent.borrow().is_empty()));
+
+        cx.simulate_input("x");
+        assert_eq!(selected(&view, cx), None);
+        assert_eq!(count(cx), Some((0, 0)));
+
+        // Escape closes the bar and gives the keyboard back to the shell.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(count(cx), None);
+        cx.update(|window, cx| assert!(view.read(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn opens_links_on_ctrl_click(cx: &mut TestAppContext) {
+        let (view, cx) = pane_with(cx, "see https://example.com/a. ok");
+        let on_link = cell(&view, cx, 0, 12, false);
+        click(cx, on_link, 1, Modifiers::none());
+        assert_eq!(cx.opened_url(), None);
+
+        // With Ctrl (Cmd) held the link under the pointer is underlined,
+        // and a click opens it.
+        cx.simulate_mouse_move(on_link, None, Modifiers::secondary_key());
+        let url = view.read_with(cx, |view, _| view.link.clone().map(|link| link.url));
+        assert_eq!(url.as_deref(), Some("https://example.com/a"));
+        click(cx, on_link, 1, Modifiers::secondary_key());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/a"));
+
+        // Off the link, nothing is.
+        let off = cell(&view, cx, 0, 1, false);
+        cx.simulate_mouse_move(off, None, Modifiers::secondary_key());
+        view.read_with(cx, |view, _| assert_eq!(view.link, None));
+    }
+
+    #[gpui::test]
+    fn passes_the_mouse_to_programs_that_ask(cx: &mut TestAppContext) {
+        // 1000 asks for clicks, 1006 in SGR form.
+        let (view, cx) = pane_with(cx, "\x1b[?1000h\x1b[?1006hhello");
+        let sent = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                String::from_utf8(view.sent.take()).expect("reports are text")
+            })
+        };
+        let at = cell(&view, cx, 0, 2, false);
+        click(cx, at, 1, Modifiers::none());
+        assert_eq!(sent(cx), "\x1b[<0;3;1M\x1b[<0;3;1m");
+        assert_eq!(selected(&view, cx), None);
+
+        // Shift keeps the mouse for selecting.
+        let (from, to) = (cell(&view, cx, 0, 0, false), cell(&view, cx, 0, 4, true));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::shift());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::shift());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::shift());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
+        assert_eq!(sent(cx), "");
+
+        // Once the program lets go of the mouse, clicks select again.
+        view.update(cx, |view, cx| {
+            view.on_session_event(Event::Output(b"\x1b[?1000l".to_vec()), cx)
+        });
+        click(cx, at, 2, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
+        assert_eq!(sent(cx), "");
+    }
+
+    #[gpui::test]
+    fn zooms_the_font(cx: &mut TestAppContext) {
+        let (view, cx) = pane_with(cx, "");
+        let size = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| crate::settings::current(cx).terminal.font_size)
+        };
+        let ctrl = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        focus(&view, cx);
+        cx.simulate_keystrokes(&format!("{ctrl}-="));
+        assert_eq!(size(cx), 14.5);
+        cx.simulate_keystrokes(&format!("{ctrl}-- {ctrl}--"));
+        assert_eq!(size(cx), 12.5);
+        cx.simulate_keystrokes(&format!("{ctrl}-0"));
+        assert_eq!(size(cx), 13.5);
+        // The shell never sees them.
+        view.read_with(cx, |view, _| assert!(view.sent.borrow().is_empty()));
     }
 }
