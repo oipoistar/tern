@@ -82,6 +82,9 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Save passwords (item 16): a password field and "Save in the system
       keychain" in the host editor; sessions try a saved password before
       asking; never in `vault.json`, forgotten with the host
+- [x] Agent forwarding (item 15): "Forward the SSH agent" in the host
+      editor; the server's agent channels are piped to the local agent
+      (`SSH_AUTH_SOCK`, OpenSSH's pipe or Pageant) only when it's on
 
 ## Known gaps in what's built
 
@@ -101,13 +104,6 @@ claude.ai account). Each item below names the artboard it comes from.
   page (Google Drive, Dropbox, OneDrive, iCloud Drive) where a folder isn't
   enough.
 - No Tern servers and no accounts, ever.
-
-### 15. Agent forwarding (host editor option, left out for now)
-- A switch in the host editor's options card.
-- Core: request agent forwarding on the session channel, then answer
-  server-opened `auth-agent@openssh.com` channels by piping them to the local
-  agent (`SSH_AUTH_SOCK`, the OpenSSH agent pipe, or Pageant).
-- An end-to-end test.
 
 ### 17. Terminal niceties
 - Find in scrollback, clickable URLs, font zoom (Ctrl +/-), visual bell.

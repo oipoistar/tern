@@ -30,6 +30,10 @@ pub struct TestServer {
     sftp_root: Option<PathBuf>,
     /// Session channels until they ask for a subsystem; shells drop theirs.
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Try the client's agent on every shell, offered or not, and say how
+    /// it went in the shell's output.
+    probe_agent: bool,
+    agent_offered: bool,
 }
 
 impl Clone for TestServer {
@@ -39,6 +43,8 @@ impl Clone for TestServer {
             shells: self.shells.clone(),
             sftp_root: self.sftp_root.clone(),
             channels: HashMap::new(),
+            probe_agent: self.probe_agent,
+            agent_offered: false,
         }
     }
 }
@@ -118,12 +124,56 @@ impl russh::server::Handler for TestServer {
         Ok(())
     }
 
+    /// The client offers its agent: list what it holds, as `agent:<the
+    /// first key's comment>` in the shell's output.
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut ServerSession,
+    ) -> Result<bool, Self::Error> {
+        self.agent_offered = true;
+        let handle = session.handle();
+        tokio::spawn(async move {
+            let said = match handle.channel_open_agent().await {
+                Ok(agent) => {
+                    let mut client =
+                        russh::keys::agent::client::AgentClient::connect(agent.into_stream());
+                    match client.request_identities().await {
+                        Ok(identities) => match identities.first() {
+                            Some(russh::keys::agent::AgentIdentity::PublicKey {
+                                comment, ..
+                            }) => {
+                                format!("agent:{comment}")
+                            }
+                            _ => "agent:empty".to_string(),
+                        },
+                        Err(_) => "agent:unreadable".to_string(),
+                    }
+                }
+                Err(_) => "agent:refused".to_string(),
+            };
+            let _ = handle.data(channel, said.into_bytes()).await;
+        });
+        Ok(true)
+    }
+
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         self.channels.remove(&channel);
+        // A server mustn't reach an agent it wasn't offered.
+        if self.probe_agent && !self.agent_offered {
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let said = match handle.channel_open_agent().await {
+                    Ok(_) => "agent:opened",
+                    Err(_) => "agent:refused",
+                };
+                let _ = handle.data(channel, said.as_bytes().to_vec()).await;
+            });
+        }
         self.shells.push(channel);
         session.channel_success(channel)?;
         session.data(channel, b"ready\r\n".to_vec())?;
@@ -209,11 +259,26 @@ pub async fn start_server(host_key: PrivateKey, client_key: PublicKey) -> u16 {
     start_server_with_sftp(host_key, client_key, None).await
 }
 
+/// Like [`start_server`], also trying each client's agent (see
+/// `TestServer::probe_agent`).
+pub async fn start_server_probing_agent(host_key: PrivateKey, client_key: PublicKey) -> u16 {
+    serve(host_key, client_key, None, true).await
+}
+
 /// Like [`start_server`], also serving SFTP over `sftp_root`.
 pub async fn start_server_with_sftp(
     host_key: PrivateKey,
     client_key: PublicKey,
     sftp_root: Option<PathBuf>,
+) -> u16 {
+    serve(host_key, client_key, sftp_root, false).await
+}
+
+async fn serve(
+    host_key: PrivateKey,
+    client_key: PublicKey,
+    sftp_root: Option<PathBuf>,
+    probe_agent: bool,
 ) -> u16 {
     let config = Arc::new(russh::server::Config {
         keys: vec![host_key],
@@ -229,6 +294,8 @@ pub async fn start_server_with_sftp(
             shells: Vec::new(),
             sftp_root,
             channels: HashMap::new(),
+            probe_agent,
+            agent_offered: false,
         }
         .run_on_socket(config, &listener)
         .await;
@@ -253,6 +320,7 @@ pub fn request(
         trust,
         keep_alive: true,
         forwards: Vec::new(),
+        agent_forwarding: false,
     }
 }
 

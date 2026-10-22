@@ -48,7 +48,7 @@ russh on its own Tokio runtime, talking to callers through channels; a
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
 (`history.rs`), the vault's filter (`filter.rs`), port forwarding
-(`forward.rs`), SFTP (`sftp.rs`), settings
+(`forward.rs`), agent forwarding (`agent.rs`), SFTP (`sftp.rs`), settings
 (`settings.rs`), sync (`sync.rs`), the system's credential store
 (`secrets.rs`), reading
 PuTTY's saved sessions (`putty.rs`) and paths and safe writes

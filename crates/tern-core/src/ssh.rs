@@ -74,6 +74,8 @@ pub struct ConnectRequest {
     pub keep_alive: bool,
     /// Port forwarding rules to start once signed in.
     pub forwards: Vec<Forward>,
+    /// Let the server use this computer's SSH agent.
+    pub agent_forwarding: bool,
 }
 
 /// The host to go through first, and how to sign in there.
@@ -95,6 +97,8 @@ pub struct Connection {
     pub auth: Auth,
     pub jump: Option<Jump>,
     pub keep_alive: bool,
+    /// Let the server use this computer's SSH agent.
+    pub agent_forwarding: bool,
     /// Typed into the shell once it starts.
     pub on_login: Option<String>,
     /// Port forwarding rules switched on for the host.
@@ -111,6 +115,7 @@ impl Connection {
             auth: identity.map_or(Auth::Agent, Auth::Key),
             jump: None,
             keep_alive: true,
+            agent_forwarding: false,
             on_login: None,
             forwards: Vec::new(),
         }
@@ -135,6 +140,7 @@ impl Connection {
             trust,
             keep_alive: self.keep_alive,
             forwards: self.forwards.clone(),
+            agent_forwarding: self.agent_forwarding,
         }
     }
 }
@@ -368,6 +374,7 @@ async fn run(
         trust,
         keep_alive,
         forwards,
+        agent_forwarding,
     } = request;
     let config = Arc::new(client::Config {
         keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
@@ -380,7 +387,17 @@ async fn run(
     let remote = RemoteTargets::default();
     let mut via = None;
     let mut handle = match jump {
-        None => open(config, &target, trust, None, remote.clone()).await?,
+        None => {
+            open(
+                config,
+                &target,
+                trust,
+                None,
+                remote.clone(),
+                agent_forwarding,
+            )
+            .await?
+        }
         Some((jump, jump_credentials)) => {
             let mut jump_handle = open(
                 config.clone(),
@@ -388,6 +405,7 @@ async fn run(
                 trust.clone(),
                 None,
                 RemoteTargets::default(),
+                false,
             )
             .await?;
             authenticate(&mut jump_handle, &jump.user, &jump_credentials)
@@ -408,6 +426,7 @@ async fn run(
                 trust,
                 Some(channel.into_stream()),
                 remote.clone(),
+                agent_forwarding,
             )
             .await?;
             via = Some(jump_handle);
@@ -424,6 +443,9 @@ async fn run(
     }
 
     let channel = handle.channel_open_session().await.map_err(other)?;
+    if agent_forwarding {
+        channel.agent_forward(false).await.map_err(other)?;
+    }
     channel
         .request_pty(false, TERM, size.cols.into(), size.rows.into(), 0, 0, &[])
         .await
@@ -486,6 +508,7 @@ async fn open(
     trust: Option<PublicKey>,
     tunnel: Option<ChannelStream<client::Msg>>,
     remote: RemoteTargets,
+    agent_forwarding: bool,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
     let verdict = Arc::new(Mutex::new(None));
     let handler = Verifier {
@@ -494,6 +517,7 @@ async fn open(
         trust,
         verdict: verdict.clone(),
         remote,
+        agent_forwarding,
     };
     let connected = match tunnel {
         Some(stream) => client::connect_stream(config, stream, handler).await,
@@ -522,6 +546,8 @@ struct Verifier {
     trust: Option<PublicKey>,
     verdict: Arc<Mutex<Option<ConnectError>>>,
     remote: RemoteTargets,
+    /// Agent channels from the server are answered only when this is on.
+    agent_forwarding: bool,
 }
 
 impl client::Handler for Verifier {
@@ -557,6 +583,16 @@ impl client::Handler for Verifier {
         _: &mut client::Session,
     ) -> Result<(), Self::Error> {
         serve_remote(&self.remote, connected_port, channel, reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        crate::agent::serve(self.agent_forwarding, channel, reply);
         Ok(())
     }
 }

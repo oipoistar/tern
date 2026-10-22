@@ -7600,6 +7600,7 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "keyring",
+ "pageant",
  "rand 0.10.3",
  "russh",
  "russh-sftp",

@@ -17,6 +17,7 @@ pub struct HostDraft {
     pub jump: Option<String>,
     pub tags: Vec<String>,
     pub keep_alive: bool,
+    pub agent_forwarding: bool,
     pub on_login: String,
 }
 
@@ -51,6 +52,7 @@ impl HostDraft {
             jump: None,
             tags: Vec::new(),
             keep_alive: true,
+            agent_forwarding: false,
             on_login: String::new(),
         }
     }
@@ -66,6 +68,7 @@ impl HostDraft {
             jump: host.jump.clone(),
             tags: host.tags.clone(),
             keep_alive: host.keep_alive,
+            agent_forwarding: host.agent_forwarding,
             on_login: host.on_login.clone().unwrap_or_default(),
         }
     }
@@ -153,6 +156,7 @@ impl HostDraft {
             auth: self.auth.clone(),
             jump: self.jump.as_deref().map(|jump| jump.trim().to_string()),
             keep_alive: self.keep_alive,
+            agent_forwarding: self.agent_forwarding,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
             forwards: previous
                 .map(|host| host.forwards.clone())

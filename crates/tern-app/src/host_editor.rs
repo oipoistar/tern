@@ -90,6 +90,7 @@ pub struct HostEditor {
     jump: Option<String>,
     tags: Vec<String>,
     keep_alive: bool,
+    agent_forwarding: bool,
     menu: Option<Menu>,
     test: Test,
     problems: Vec<Problem>,
@@ -185,6 +186,7 @@ impl HostEditor {
             jump: draft.jump,
             tags: draft.tags,
             keep_alive: draft.keep_alive,
+            agent_forwarding: draft.agent_forwarding,
             menu: None,
             test: Test::Idle,
             problems: Vec::new(),
@@ -218,6 +220,7 @@ impl HostEditor {
             jump: self.jump.clone(),
             tags: self.tags.clone(),
             keep_alive: self.keep_alive,
+            agent_forwarding: self.agent_forwarding,
             on_login: text(&self.on_login),
         }
     }
@@ -842,6 +845,28 @@ impl HostEditor {
                             .debug_selector(|| "keep-alive-switch".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.keep_alive = !this.keep_alive;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_h(px(36.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Forward the SSH agent"),
+                    )
+                    .child(
+                        switch("agent-switch", self.agent_forwarding, t)
+                            .debug_selector(|| "agent-switch".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.agent_forwarding = !this.agent_forwarding;
                                 cx.notify();
                             })),
                     ),

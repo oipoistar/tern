@@ -61,6 +61,9 @@ pub struct Host {
     /// Ping the server every 30 seconds so idle connections stay up.
     #[serde(default = "on")]
     pub keep_alive: bool,
+    /// Let the server use this computer's SSH agent, as `ssh -A` does.
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub agent_forwarding: bool,
     /// Typed into the shell once it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
@@ -89,6 +92,10 @@ fn on() -> bool {
     true
 }
 
+fn is_off(value: &bool) -> bool {
+    !value
+}
+
 impl Host {
     /// A host with Tern's defaults for everything but where it is.
     pub fn new(name: &str, user: &str, address: &str, port: u16) -> Self {
@@ -103,6 +110,7 @@ impl Host {
             auth: Auth::Agent,
             jump: None,
             keep_alive: true,
+            agent_forwarding: false,
             on_login: None,
             forwards: Vec::new(),
             updated: 0,

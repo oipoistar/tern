@@ -31,6 +31,8 @@ russh-sftp = "3"
 tern-devserver = { path = "../tern-devserver" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 
-# Reading PuTTY's saved sessions, which live in the registry on Windows.
+# Reading PuTTY's saved sessions, which live in the registry on Windows,
+# and reaching Pageant for agent forwarding.
 [target.'cfg(windows)'.dependencies]
+pageant = "0.2"
 windows-registry = "0.6"

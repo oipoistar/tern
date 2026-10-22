@@ -201,6 +201,7 @@ impl Vault {
             auth: host.auth.clone(),
             jump,
             keep_alive: host.keep_alive,
+            agent_forwarding: host.agent_forwarding,
             on_login: host.on_login.clone(),
             forwards: host
                 .forwards
@@ -297,8 +298,9 @@ impl Vault {
 /// The vault file's shape. Bump it when a change would make an older Tern
 /// misread the file (dropping something it doesn't know when it saves);
 /// older versions then leave it alone instead. 2 added snippets, 3 port
-/// forwarding rules, 4 ids, change times and deletions for sync.
-pub const FILE_VERSION: u32 = 4;
+/// forwarding rules, 4 ids, change times and deletions for sync, 5 agent
+/// forwarding.
+pub const FILE_VERSION: u32 = 5;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -572,7 +574,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 4"), "{text}");
+        assert!(text.contains("\"version\": 5"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());
