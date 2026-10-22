@@ -10,16 +10,20 @@ anyhow = "1"
 rand = { version = "0.10", features = ["thread_rng"] }
 # `ring` instead of the default aws-lc backend: it builds with only the
 # platform C toolchain (no CMake/NASM on Windows).
-russh ={ version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "fs"] }
 
 [features]
 # Sample hosts for other crates' tests (`Vault::sample`).
 test-support = []
 
 [dev-dependencies]
+russh-sftp = "3"
+# Its SFTP server, for the end-to-end tests.
+tern-devserver = { path = "../tern-devserver" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 
 # Reading PuTTY's saved sessions, which live in the registry on Windows.

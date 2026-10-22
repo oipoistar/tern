@@ -47,14 +47,18 @@ russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump host included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
-(`history.rs`), port forwarding (`forward.rs`), reading PuTTY's saved
-sessions (`putty.rs`) and paths and safe writes (`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
-root (header, tabs, a session's snippet bar, live layer), `vault.rs` is the
+(`history.rs`), port forwarding (`forward.rs`), SFTP (`sftp.rs`), reading
+PuTTY's saved sessions (`putty.rs`) and paths and safe writes
+(`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
+root (header, tabs, a session tab's panes, toolbar and snippet bar, live
+layer), `files.rs` is a session tab's SFTP panel, `vault.rs` is the
 vault tab (sidebar and the hosts screen), `keychain.rs`, `snippets.rs`,
 `forwarding.rs`, `known_hosts.rs` and `history.rs` are its other screens, `terminal.rs` is a
 session, `host_editor.rs` is the dialog the vault opens over itself, and
 `marks.rs` draws the art and traces.
-`tern-devserver` is a local SSH server with a real shell for manual testing.
+`tern-devserver` is a local SSH server with a real shell and SFTP for
+manual testing; its SFTP server (`sftp.rs`, a library module) also serves
+the end-to-end tests.
 
 Rules live in tern-core with unit tests (what a draft needs, what a saved
 host connects through, which credentials a sign-in method tries); views

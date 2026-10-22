@@ -10,6 +10,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -24,6 +25,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor,
 use gpui_kit::*;
 use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{self, Visit};
+use tern_core::sftp::Sftp;
 use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
 use crate::theme::{self, MONO, TermPalette, Theme};
@@ -147,6 +149,14 @@ impl TerminalView {
         let mut view = Self::idle(Connection::typed(target, None), cx);
         view.on_session_event(Event::Connected, cx);
         view
+    }
+
+    /// An SFTP session on this pane's connection, once it's live.
+    pub fn open_sftp(&self) -> Pin<Box<dyn Future<Output = Result<Sftp, String>>>> {
+        match &self.input {
+            Some(input) if self.is_live() => Box::pin(input.open_sftp()),
+            _ => Box::pin(async { Err("Not connected".to_string()) }),
+        }
     }
 
     /// Types `bytes` into the shell, as if from the keyboard. Ignored

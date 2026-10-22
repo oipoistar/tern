@@ -1,10 +1,13 @@
 //! What the end-to-end tests share: a russh server running in this
 //! process (password and key sign-in, an echoing shell, direct-tcpip as a
-//! jump host, and remote forwarding) and helpers for reading a session.
+//! jump host, remote forwarding, and SFTP over a folder) and helpers for
+//! reading a session.
 
 // Each test file uses its own share of this.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,17 +15,32 @@ use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Auth, Msg, Server as _, Session as ServerSession};
 use russh::{Channel, ChannelId};
 use tern_core::ssh::{ConnectRequest, Credential, Event, Session, Target, TermSize};
+use tern_devserver::sftp::FsSftp;
 use tokio::net::TcpListener;
 
 pub const USER: &str = "tern";
 pub const PASSWORD: &str = "correct horse battery";
 
-#[derive(Clone)]
 pub struct TestServer {
     client_key: PublicKey,
     /// This connection's shell channels. Only these echo; a forwarded
     /// channel carries another SSH connection and must pass through intact.
     shells: Vec<ChannelId>,
+    /// Where SFTP is served from, if it is.
+    sftp_root: Option<PathBuf>,
+    /// Session channels until they ask for a subsystem; shells drop theirs.
+    channels: HashMap<ChannelId, Channel<Msg>>,
+}
+
+impl Clone for TestServer {
+    fn clone(&self) -> Self {
+        Self {
+            client_key: self.client_key.clone(),
+            shells: self.shells.clone(),
+            sftp_root: self.sftp_root.clone(),
+            channels: HashMap::new(),
+        }
+    }
 }
 
 impl russh::server::Server for TestServer {
@@ -53,11 +71,28 @@ impl russh::server::Handler for TestServer {
 
     async fn channel_open_session(
         &mut self,
-        _: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: russh::server::ChannelOpenHandle,
         _: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.channels.insert(channel.id(), channel);
         reply.accept().await;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        match (self.channels.remove(&channel), &self.sftp_root) {
+            (Some(opened), Some(root)) if name == "sftp" => {
+                session.channel_success(channel)?;
+                russh_sftp::server::run(opened.into_stream(), FsSftp::new(root.clone())).await;
+            }
+            _ => session.channel_failure(channel)?,
+        }
         Ok(())
     }
 
@@ -88,6 +123,7 @@ impl russh::server::Handler for TestServer {
         channel: ChannelId,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
         self.shells.push(channel);
         session.channel_success(channel)?;
         session.data(channel, b"ready\r\n".to_vec())?;
@@ -170,6 +206,15 @@ fn reject() -> Auth {
 
 /// Starts the server on a free local port and returns that port.
 pub async fn start_server(host_key: PrivateKey, client_key: PublicKey) -> u16 {
+    start_server_with_sftp(host_key, client_key, None).await
+}
+
+/// Like [`start_server`], also serving SFTP over `sftp_root`.
+pub async fn start_server_with_sftp(
+    host_key: PrivateKey,
+    client_key: PublicKey,
+    sftp_root: Option<PathBuf>,
+) -> u16 {
     let config = Arc::new(russh::server::Config {
         keys: vec![host_key],
         auth_rejection_time: Duration::from_millis(10),
@@ -182,6 +227,8 @@ pub async fn start_server(host_key: PrivateKey, client_key: PublicKey) -> u16 {
         let _ = TestServer {
             client_key,
             shells: Vec::new(),
+            sftp_root,
+            channels: HashMap::new(),
         }
         .run_on_socket(config, &listener)
         .await;

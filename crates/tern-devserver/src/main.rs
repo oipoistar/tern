@@ -7,8 +7,9 @@
 //!
 //! It also works as a jump host, but only towards addresses on this
 //! computer: enough to try jump hosts locally (through itself) without
-//! becoming a proxy to anywhere.
+//! becoming a proxy to anywhere. And it serves SFTP over your home folder.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
+use tern_devserver::sftp::FsSftp;
 use tokio::net::TcpListener;
 
 const USER: &str = "tern";
@@ -122,6 +124,7 @@ impl russh::server::Server for DevServer {
             server: self.clone(),
             size: PtySize::default(),
             pty: Arc::new(Mutex::new(None)),
+            channels: HashMap::new(),
         }
     }
 }
@@ -137,6 +140,10 @@ struct Connection {
     server: DevServer,
     size: PtySize,
     pty: Arc<Mutex<Option<Pty>>>,
+    /// Session channels until they ask for a shell or a subsystem. Kept
+    /// only that long: nobody reads a shell's channel object, and an unread
+    /// one would stall the connection once its buffer fills.
+    channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
 impl russh::server::Handler for Connection {
@@ -162,11 +169,31 @@ impl russh::server::Handler for Connection {
 
     async fn channel_open_session(
         &mut self,
-        _: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: russh::server::ChannelOpenHandle,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.channels.insert(channel.id(), channel);
         reply.accept().await;
+        Ok(())
+    }
+
+    /// SFTP over the home folder.
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        match self.channels.remove(&channel) {
+            Some(opened) if name == "sftp" => {
+                println!("sftp over {}", home.display());
+                session.channel_success(channel)?;
+                russh_sftp::server::run(opened.into_stream(), FsSftp::new(home)).await;
+            }
+            _ => session.channel_failure(channel)?,
+        }
         Ok(())
     }
 
@@ -195,6 +222,7 @@ impl russh::server::Handler for Connection {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
         match spawn_shell(self.size, channel, session.handle(), self.pty.clone()) {
             Ok(pty) => {
                 *self.pty.lock().unwrap() = Some(pty);

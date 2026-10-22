@@ -14,6 +14,7 @@ use tern_core::HostStatus;
 use tern_core::ssh::{Connection, parse_command};
 
 use crate::bench;
+use crate::files::FilesPanel;
 use crate::live::{LiveSlots, live_layer};
 use crate::marks;
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
@@ -40,6 +41,9 @@ struct Tab {
     maximized: Option<usize>,
     /// Typing in any pane goes to every pane.
     broadcast: bool,
+    /// The Files panel, made when first opened, on the pane focused then.
+    files: Option<Entity<FilesPanel>>,
+    files_open: bool,
 }
 
 impl Tab {
@@ -170,6 +174,8 @@ impl Workspace {
             focused: 0,
             maximized: None,
             broadcast: false,
+            files: None,
+            files_open: false,
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
     }
@@ -269,6 +275,21 @@ impl Workspace {
             tab.broadcast = !tab.broadcast;
             cx.notify();
         }
+    }
+
+    /// Shows or hides the Files panel, opening SFTP the first time.
+    fn toggle_files(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        if tab.files.is_none() {
+            let opening = tab.focused().read(cx).open_sftp();
+            tab.files =
+                Some(cx.new(|cx| FilesPanel::new(opening, FilesPanel::default_local_dir(), cx)));
+        }
+        tab.files_open = !tab.files_open;
+        cx.notify();
     }
 
     fn toggle_maximized(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -454,6 +475,47 @@ impl Workspace {
                                 ))
                             })
                     })),
+            )
+            .child(
+                div()
+                    .id("toggle-files")
+                    .debug_selector(|| "toggle-files".into())
+                    .h(px(40.))
+                    .px(px(14.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(13.))
+                    .border_1()
+                    .border_color(if tab.files_open {
+                        theme.text
+                    } else {
+                        theme.line
+                    })
+                    .bg(if tab.files_open {
+                        theme.text
+                    } else {
+                        theme.card
+                    })
+                    .text_color(if tab.files_open {
+                        theme.card
+                    } else {
+                        theme.text
+                    })
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .child(icon(
+                        IconName::FolderOpen,
+                        15.,
+                        if tab.files_open {
+                            theme.card
+                        } else {
+                            theme.text
+                        },
+                    ))
+                    .child("Files")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_files(cx))),
             )
             .child(
                 div()
@@ -842,7 +904,11 @@ impl Render for Workspace {
                             .flex_1()
                             .min_h_0()
                             .flex()
-                            .child(self.panes(tab, &theme, cx)),
+                            .gap(px(12.))
+                            .child(self.panes(tab, &theme, cx))
+                            .when_some(tab.files.clone().filter(|_| tab.files_open), |d, files| {
+                                d.child(files)
+                            }),
                     )
                     .child(self.snippet_bar(&theme, cx))
                     .into_any_element()

@@ -22,6 +22,7 @@ use crate::forward::{Forward, ForwardState, Forwarder, RemoteTargets, serve_remo
 use crate::host::Auth;
 use crate::paths;
 use crate::randomart::Randomart;
+use crate::sftp::{self, Sftp};
 
 /// A server's host key, as offered for the user to trust.
 pub type HostKey = PublicKey;
@@ -228,6 +229,8 @@ enum Input {
     Resize(TermSize),
     /// Start (`true`) or stop a port forwarding rule.
     Forward(Forward, bool),
+    /// Open an SFTP session on the connection.
+    OpenSftp(oneshot::Sender<Result<Sftp, String>>),
     Close,
 }
 
@@ -259,6 +262,17 @@ impl SessionInput {
 
     pub fn close(&self) {
         let _ = self.0.send(Input::Close);
+    }
+
+    /// An SFTP session on this session's connection, once it's signed in.
+    pub fn open_sftp(&self) -> impl Future<Output = Result<Sftp, String>> + 'static {
+        let (reply, opened) = oneshot::channel();
+        let _ = self.0.send(Input::OpenSftp(reply));
+        async move {
+            opened
+                .await
+                .unwrap_or_else(|_| Err("the session has ended".into()))
+        }
     }
 }
 
@@ -313,6 +327,17 @@ impl Session {
     pub fn into_parts(self) -> (SessionInput, SessionEvents) {
         (self.input, SessionEvents(self.events))
     }
+}
+
+/// Runs `work` on Tern's runtime, to be awaited from any executor.
+pub(crate) fn spawn<T: Send + 'static>(
+    work: impl Future<Output = Result<T, String>> + Send + 'static,
+) -> impl Future<Output = Result<T, String>> + 'static {
+    let (tx, rx) = oneshot::channel();
+    runtime().spawn(async move {
+        let _ = tx.send(work.await);
+    });
+    async move { rx.await.unwrap_or_else(|_| Err("the work stopped".into())) }
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -424,6 +449,12 @@ async fn run(
                     let _ = writer.window_change(size.cols.into(), size.rows.into(), 0, 0).await;
                 }
                 Some(Input::Forward(forward, on)) => forwarder.set(forward, on).await,
+                Some(Input::OpenSftp(reply)) => {
+                    let handle = handle.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(sftp::open(&handle).await);
+                    });
+                }
                 Some(Input::Close) | None => {
                     let _ = writer.close().await;
                     break;
@@ -659,11 +690,7 @@ pub struct Reached {
 /// runtime; await it from any executor. Errors are a few lowercase words.
 pub fn probe(host: &str, port: u16) -> impl Future<Output = Result<Reached, String>> + 'static {
     let host = host.to_string();
-    let (tx, rx) = oneshot::channel();
-    runtime().spawn(async move {
-        let _ = tx.send(probe_now(&host, port).await);
-    });
-    async move { rx.await.unwrap_or_else(|_| Err("the check stopped".into())) }
+    spawn(async move { probe_now(&host, port).await })
 }
 
 async fn probe_now(host: &str, port: u16) -> Result<Reached, String> {

@@ -56,6 +56,11 @@ claude.ai account). Each item below names the artboard it comes from.
       and Close; an ink ring on the focused pane, on all of them while
       Broadcast types (and runs snippets) into every pane; a toolbar with
       the focused host and its latency trace
+- [x] SFTP panel (item 10): Files beside a session's panes, over
+      `russh-sftp`: the host's folders or this computer's, a path bar with
+      Up, Upload and Refresh, names with sizes or item counts; clicking a
+      file copies it to the other side, dropped files upload, transfers
+      show an ink progress bar and a check, and never replace a file
 
 ## Known gaps in what's built
 
@@ -69,12 +74,6 @@ claude.ai account). Each item below names the artboard it comes from.
   switch in the Keychain toolbar.
 - The "Include in encrypted sync" switch in a key's details comes with sync
   (item 14).
-
-### 10. SFTP panel (Terminal artboard)
-- Uses the `russh-sftp` crate. A Remote / This computer switch; a path bar
-  with upload and refresh; a list with name and size (or item count).
-- Transfers with an ink progress bar and a check when done. Drag and drop to
-  upload.
 
 ### 11. Vault side panel (Main artboard right column)
 - For the selected host: a live preview of its open session (if any), Open

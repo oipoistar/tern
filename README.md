@@ -50,7 +50,7 @@ cargo run -p tern-devserver                # SSH server on 127.0.0.1:2222
 ```
 
 It creates a test key and password in `dev/test-ssh/` (git-ignored) on first
-run. When that key exists and there is no `vault.json` yet, the app starts
+run, and serves SFTP over your home folder for the Files panel. When that key exists and there is no `vault.json` yet, the app starts
 with a "Local dev server" group listing it once directly and once as
 `devserver-via-jump`, which goes through the dev server itself as a jump
 host (it forwards only to addresses on this computer).
