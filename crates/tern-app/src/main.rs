@@ -1,5 +1,6 @@
 mod assets;
 mod bench;
+mod host_editor;
 mod live;
 mod marks;
 mod terminal;

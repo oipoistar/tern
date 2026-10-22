@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use russh::keys::agent::AgentIdentity;
@@ -14,10 +14,11 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::{
     Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate, known_hosts,
 };
-use russh::{ChannelMsg, client};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use russh::{ChannelMsg, ChannelStream, client};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, BufReader};
+use tokio::sync::{mpsc, oneshot};
 
+use crate::host::Auth;
 use crate::paths;
 use crate::randomart::Randomart;
 
@@ -26,6 +27,10 @@ pub type HostKey = PublicKey;
 
 /// Terminal type announced to the server.
 const TERM: &str = "xterm-256color";
+/// How often an idle connection is pinged when keep-alive is on.
+const KEEP_ALIVE: Duration = Duration::from_secs(30);
+/// How long a reachability check waits for each step.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Who to connect to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,18 +62,98 @@ pub struct TermSize {
 pub struct ConnectRequest {
     pub target: Target,
     pub credentials: Vec<Credential>,
+    /// Sign in here first and reach the target through it (`ssh -J`).
+    pub jump: Option<(Target, Vec<Credential>)>,
     pub size: TermSize,
-    /// A host key the user has just accepted for this target. It's saved to
-    /// Tern's known hosts once the connection succeeds.
+    /// A host key the user has just accepted, for the target or the jump
+    /// host. It's saved to Tern's known hosts once that host is verified.
     pub trust: Option<PublicKey>,
+    /// Ping idle connections so routers and firewalls keep them open.
+    pub keep_alive: bool,
+}
+
+/// The host to go through first, and how to sign in there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Jump {
+    pub target: Target,
+    pub auth: Auth,
+}
+
+/// Everything needed to open a session: from a saved host
+/// (`Vault::connection`) or a typed command ([`Connection::typed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Connection {
+    pub target: Target,
+    pub auth: Auth,
+    pub jump: Option<Jump>,
+    pub keep_alive: bool,
+    /// Typed into the shell once it starts.
+    pub on_login: Option<String>,
+}
+
+impl Connection {
+    /// A destination typed or passed on the command line, with defaults.
+    pub fn typed(target: Target, identity: Option<PathBuf>) -> Self {
+        Self {
+            target,
+            auth: identity.map_or(Auth::Agent, Auth::Key),
+            jump: None,
+            keep_alive: true,
+            on_login: None,
+        }
+    }
+
+    /// The request that opens this connection. `password` is one the user
+    /// typed for the target; the jump host never gets a password.
+    pub fn request(
+        &self,
+        size: TermSize,
+        password: Option<&str>,
+        trust: Option<HostKey>,
+    ) -> ConnectRequest {
+        ConnectRequest {
+            target: self.target.clone(),
+            credentials: credentials_for(&self.auth, password),
+            jump: self
+                .jump
+                .as_ref()
+                .map(|jump| (jump.target.clone(), credentials_for(&jump.auth, None))),
+            size,
+            trust,
+            keep_alive: self.keep_alive,
+        }
+    }
+}
+
+/// What to try, in order, to sign in with `auth`. A key file comes first;
+/// a typed password replaces the agent and default keys, which already
+/// failed by the time one is asked for. Password sign-in with no password
+/// yet tries nothing, so the session asks for one.
+pub fn credentials_for(auth: &Auth, password: Option<&str>) -> Vec<Credential> {
+    let mut credentials = Vec::new();
+    if let Auth::Key(path) = auth {
+        credentials.push(Credential::KeyFile {
+            path: path.clone(),
+            passphrase: None,
+        });
+    }
+    match (auth, password) {
+        (_, Some(password)) => credentials.push(Credential::Password(password.into())),
+        (Auth::Password, None) => {}
+        _ => credentials.extend(default_credentials()),
+    }
+    credentials
 }
 
 /// Why a connection didn't get to a shell.
 #[derive(Clone, Debug)]
 pub enum ConnectError {
-    /// The server's key is in no known_hosts file. Ask the user, then retry
-    /// with [`ConnectRequest::trust`] set to `key`.
+    /// The key of `host` (the target or the jump host) is in no known_hosts
+    /// file. Ask the user, then retry with [`ConnectRequest::trust`] set to
+    /// `key`.
     UnknownHostKey {
+        host: String,
+        port: u16,
         key: Box<PublicKey>,
         fingerprint: String,
     },
@@ -88,7 +173,9 @@ pub enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownHostKey { fingerprint, .. } => write!(f, "unknown host key {fingerprint}"),
+            Self::UnknownHostKey {
+                host, fingerprint, ..
+            } => write!(f, "unknown host key {fingerprint} for {host}"),
             Self::HostKeyChanged {
                 fingerprint,
                 file,
@@ -221,31 +308,38 @@ async fn run(
     let ConnectRequest {
         target,
         credentials,
+        jump,
         size,
         trust,
+        keep_alive,
     } = request;
-    let verdict = Arc::new(Mutex::new(None));
-    let handler = Verifier {
-        host: target.host.clone(),
-        port: target.port,
-        trust,
-        verdict: verdict.clone(),
-    };
     let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
         ..Default::default()
     });
 
-    let connected = client::connect(config, (target.host.as_str(), target.port), handler).await;
-    let mut handle = match connected {
-        Ok(handle) => handle,
-        // A rejected host key surfaces as a generic russh error; report ours.
-        Err(error) => {
-            return Err(verdict
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| other(error)));
+    // Through a jump host: sign in there, then run the target's SSH over a
+    // forwarded channel. The jump connection must outlive the session.
+    let mut via = None;
+    let mut handle = match jump {
+        None => open(config, &target, trust, None).await?,
+        Some((jump, jump_credentials)) => {
+            let mut jump_handle = open(config.clone(), &jump, trust.clone(), None).await?;
+            authenticate(&mut jump_handle, &jump.user, &jump_credentials)
+                .await
+                .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
+            let channel = jump_handle
+                .channel_open_direct_tcpip(target.host.clone(), target.port.into(), "127.0.0.1", 0)
+                .await
+                .map_err(|error| {
+                    other(format!(
+                        "{} can't reach {}:{}: {error}",
+                        jump.host, target.host, target.port
+                    ))
+                })?;
+            let handle = open(config, &target, trust, Some(channel.into_stream())).await?;
+            via = Some(jump_handle);
+            handle
         }
     };
 
@@ -290,8 +384,42 @@ async fn run(
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
+    if let Some(via) = via {
+        let _ = via
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+    }
     let _ = events.send(Event::Closed { exit_status });
     Ok(())
+}
+
+/// Connects to `target` and verifies its host key, over TCP or, through a
+/// jump host, over `tunnel`.
+async fn open(
+    config: Arc<client::Config>,
+    target: &Target,
+    trust: Option<PublicKey>,
+    tunnel: Option<ChannelStream<client::Msg>>,
+) -> Result<client::Handle<Verifier>, ConnectError> {
+    let verdict = Arc::new(Mutex::new(None));
+    let handler = Verifier {
+        host: target.host.clone(),
+        port: target.port,
+        trust,
+        verdict: verdict.clone(),
+    };
+    let connected = match tunnel {
+        Some(stream) => client::connect_stream(config, stream, handler).await,
+        None => client::connect(config, (target.host.as_str(), target.port), handler).await,
+    };
+    // A rejected host key surfaces as a generic russh error; report ours.
+    connected.map_err(|error| {
+        verdict
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| other(error))
+    })
 }
 
 fn other(error: impl std::fmt::Display) -> ConnectError {
@@ -362,6 +490,8 @@ pub fn check_host_key(
         return Ok(());
     }
     Err(ConnectError::UnknownHostKey {
+        host: host.into(),
+        port,
         key: Box::new(key.clone()),
         fingerprint: fingerprint(key),
     })
@@ -404,6 +534,104 @@ pub fn fingerprint(key: &PublicKey) -> String {
 /// The drunken-bishop picture of a key's SHA-256 fingerprint.
 pub fn key_art(key: &PublicKey) -> Randomart {
     Randomart::new(key.fingerprint(HashAlg::Sha256).as_bytes())
+}
+
+/// What a private key file holds, for showing it: its kind, fingerprint and
+/// art.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub kind: String,
+    pub fingerprint: String,
+    pub art: Randomart,
+}
+
+/// Reads the `.pub` file next to a private key, or the key itself when it
+/// has no passphrase. `None` if neither works.
+pub fn key_file_info(path: &Path) -> Option<KeyInfo> {
+    let mut public = path.as_os_str().to_owned();
+    public.push(".pub");
+    let key = std::fs::read_to_string(public)
+        .ok()
+        .and_then(|text| PublicKey::from_openssh(text.trim()).ok())
+        .or_else(|| {
+            russh::keys::load_secret_key(path, None)
+                .ok()
+                .map(|key| key.public_key().clone())
+        })?;
+    let kind = match key.algorithm() {
+        Algorithm::Ed25519 => "ed25519".to_string(),
+        Algorithm::SkEd25519 => "ed25519-sk".to_string(),
+        Algorithm::Ecdsa { curve } => format!("ecdsa {curve}"),
+        Algorithm::Rsa { .. } => "rsa".to_string(),
+        other => other.to_string(),
+    };
+    Some(KeyInfo {
+        kind,
+        fingerprint: fingerprint(&key),
+        art: key_art(&key),
+    })
+}
+
+/// An SSH server that answered a reachability check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reached {
+    /// The TCP handshake's round trip, rounded up.
+    pub latency_ms: u32,
+    /// The server's greeting, like `SSH-2.0-OpenSSH_9.6`.
+    pub banner: String,
+}
+
+/// Checks that an SSH server answers at `host:port` without signing in: a
+/// TCP connection, timed, then the server's greeting. Runs on Tern's
+/// runtime; await it from any executor. Errors are a few lowercase words.
+pub fn probe(host: &str, port: u16) -> impl Future<Output = Result<Reached, String>> + 'static {
+    let host = host.to_string();
+    let (tx, rx) = oneshot::channel();
+    runtime().spawn(async move {
+        let _ = tx.send(probe_now(&host, port).await);
+    });
+    async move { rx.await.unwrap_or_else(|_| Err("the check stopped".into())) }
+}
+
+async fn probe_now(host: &str, port: u16) -> Result<Reached, String> {
+    let started = Instant::now();
+    let connect = tokio::net::TcpStream::connect((host, port));
+    let stream = tokio::time::timeout(PROBE_TIMEOUT, connect)
+        .await
+        .map_err(|_| "no answer".to_string())?
+        .map_err(|error| describe(&error))?;
+    let latency_ms = started.elapsed().as_micros().div_ceil(1000).max(1) as u32;
+    // Servers may send other lines before the version line (RFC 4253 4.2).
+    let mut lines = BufReader::new(stream).lines();
+    for _ in 0..5 {
+        let line = tokio::time::timeout(PROBE_TIMEOUT, lines.next_line())
+            .await
+            .map_err(|_| "no SSH greeting".to_string())?
+            .map_err(|error| describe(&error))?
+            .ok_or("closed without an SSH greeting")?;
+        if line.starts_with("SSH-") {
+            return Ok(Reached {
+                latency_ms,
+                banner: line.trim().into(),
+            });
+        }
+    }
+    Err("not an SSH server".into())
+}
+
+/// An I/O error in a few words, without the OS's error number.
+fn describe(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::ConnectionRefused => "connection refused".into(),
+        ErrorKind::TimedOut => "no answer".into(),
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => "unreachable".into(),
+        _ => {
+            let text = error.to_string();
+            let text = text.split(" (os error").next().unwrap_or(&text);
+            text.trim_end_matches('.').to_lowercase()
+        }
+    }
 }
 
 async fn authenticate(
@@ -651,6 +879,118 @@ mod tests {
             ("pi", "homelab")
         );
         assert_eq!(key, Some(PathBuf::from("k")));
+    }
+
+    #[test]
+    fn credentials_follow_the_sign_in_method() {
+        let kinds = |credentials: Vec<Credential>| -> Vec<&'static str> {
+            credentials
+                .iter()
+                .map(|credential| match credential {
+                    Credential::Agent => "agent",
+                    Credential::KeyFile { .. } => "key",
+                    Credential::Password(_) => "password",
+                })
+                .collect()
+        };
+        let key = Auth::Key("k".into());
+        assert!(credentials_for(&Auth::Password, None).is_empty());
+        assert_eq!(
+            kinds(credentials_for(&Auth::Password, Some("pw"))),
+            ["password"]
+        );
+        assert_eq!(
+            kinds(credentials_for(&key, Some("pw"))),
+            ["key", "password"]
+        );
+        assert_eq!(kinds(credentials_for(&key, None))[..2], ["key", "agent"]);
+        assert_eq!(kinds(credentials_for(&Auth::Agent, None))[0], "agent");
+    }
+
+    #[test]
+    fn the_jump_host_never_gets_the_typed_password() {
+        let target = Target {
+            host: "db".into(),
+            port: 22,
+            user: "deploy".into(),
+        };
+        let mut connection = Connection::typed(target.clone(), None);
+        connection.auth = Auth::Password;
+        connection.jump = Some(Jump {
+            target: Target {
+                host: "bastion".into(),
+                ..target
+            },
+            auth: Auth::Agent,
+        });
+        let request = connection.request(TermSize { cols: 80, rows: 24 }, Some("pw"), None);
+        assert!(matches!(request.credentials[..], [Credential::Password(_)]));
+        let (jump, jump_credentials) = request.jump.unwrap();
+        assert_eq!(jump.host, "bastion");
+        assert!(
+            jump_credentials
+                .iter()
+                .all(|credential| !matches!(credential, Credential::Password(_)))
+        );
+    }
+
+    #[test]
+    fn key_file_info_reads_the_public_half_or_the_key() {
+        use russh::keys::PrivateKey;
+        use russh::keys::ssh_key::LineEnding;
+
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let dir = std::env::temp_dir().join(format!("tern-key-info-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("id_test");
+        std::fs::write(&path, key.to_openssh(LineEnding::LF).unwrap()).unwrap();
+
+        let info = key_file_info(&path).unwrap();
+        assert_eq!(info.kind, "ed25519");
+        assert_eq!(info.fingerprint, fingerprint(key.public_key()));
+        assert_eq!(info.art, key_art(key.public_key()));
+
+        // The .pub file is enough, even when the key itself can't be read.
+        std::fs::write(&path, "not a key").unwrap();
+        assert!(key_file_info(&path).is_none());
+        let public = key.public_key().to_openssh().unwrap();
+        std::fs::write(dir.join("id_test.pub"), public).unwrap();
+        assert_eq!(key_file_info(&path).unwrap().art, info.art);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_wants_an_ssh_greeting() {
+        use std::io::Write as _;
+
+        let serve = |reply: &'static [u8]| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.write_all(reply);
+            });
+            port
+        };
+        let check = |port| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(probe("127.0.0.1", port))
+        };
+
+        let reached = check(serve(b"hello\r\nSSH-2.0-Test_1.0\r\n")).unwrap();
+        assert_eq!(reached.banner, "SSH-2.0-Test_1.0");
+        assert!(reached.latency_ms >= 1);
+        assert_eq!(
+            check(serve(b"HTTP/1.1 400 Bad Request\r\n\r\n")),
+            Err("closed without an SSH greeting".into())
+        );
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert_eq!(check(port), Err("connection refused".into()));
     }
 
     #[test]

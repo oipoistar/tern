@@ -4,13 +4,12 @@
 //! Screens are cached views; only this thin root re-renders each animation
 //! frame, so the latency traces can move without redrawing the screens.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tern_core::ssh::{Target, parse_command};
+use tern_core::ssh::{Connection, parse_command};
 
 use crate::bench;
 use crate::live::{LiveSlots, live_layer};
@@ -43,8 +42,8 @@ impl Workspace {
                 &vault,
                 window,
                 |this, _, event: &VaultEvent, window, cx| match event {
-                    VaultEvent::Connect { target, identity } => {
-                        this.open_session(target.clone(), identity.clone(), window, cx)
+                    VaultEvent::Connect(connection) => {
+                        this.open_session(connection.clone(), window, cx)
                     }
                 },
             );
@@ -81,21 +80,31 @@ impl Workspace {
             .skip(1);
         if let Some(command) = args.next() {
             match parse_command(&command) {
-                Ok((target, identity)) => workspace.open_session(target, identity, window, cx),
+                Ok((target, identity)) => {
+                    workspace.open_session(Connection::typed(target, identity), window, cx)
+                }
                 Err(error) => eprintln!("--connect: {error}"),
             }
+        }
+        // `tern --edit [host]` opens the host editor (a new host without a
+        // name), for screenshots and checks.
+        let mut args = std::env::args().skip_while(|arg| arg != "--edit");
+        if args.next().is_some() {
+            let host = args.next().filter(|arg| !arg.starts_with("--"));
+            workspace
+                .vault
+                .update(cx, |vault, cx| vault.open_editor(host, window, cx));
         }
         workspace
     }
 
     fn open_session(
         &mut self,
-        target: Target,
-        identity: Option<PathBuf>,
+        connection: Connection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let terminal = cx.new(|cx| TerminalView::new(target, identity, cx));
+        let terminal = cx.new(|cx| TerminalView::new(connection, cx));
         // Tabs show each session's state and title.
         self._subscriptions
             .push(cx.observe(&terminal, |_, _, cx| cx.notify()));

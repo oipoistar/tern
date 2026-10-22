@@ -1,5 +1,6 @@
 //! End-to-end checks of `tern_core::ssh` against a russh server running in
-//! this process: host-key trust, password and key auth, data, resize, close.
+//! this process: host-key trust, password and key auth, data, resize, close,
+//! and connecting through a jump host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,9 @@ const PASSWORD: &str = "correct horse battery";
 #[derive(Clone)]
 struct TestServer {
     client_key: PublicKey,
+    /// This connection's shell channels. Only these echo; a forwarded
+    /// channel carries another SSH connection and must pass through intact.
+    shells: Vec<ChannelId>,
 }
 
 impl russh::server::Server for TestServer {
@@ -57,11 +61,34 @@ impl russh::server::Handler for TestServer {
         Ok(())
     }
 
+    /// Acts as a jump host: forwards the channel to the requested address.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host: &str,
+        port: u32,
+        _: &str,
+        _: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        // Dropping `reply` without accepting refuses the channel.
+        if let Ok(mut tcp) = tokio::net::TcpStream::connect((host, port as u16)).await {
+            reply.accept().await;
+            tokio::spawn(async move {
+                let mut stream = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+            });
+        }
+        Ok(())
+    }
+
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.shells.push(channel);
         session.channel_success(channel)?;
         session.data(channel, b"ready\r\n".to_vec())?;
         Ok(())
@@ -73,6 +100,9 @@ impl russh::server::Handler for TestServer {
         data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        if !self.shells.contains(&channel) {
+            return Ok(());
+        }
         if data == b"exit" {
             session.exit_status_request(channel, 7)?;
             session.close(channel)?;
@@ -114,9 +144,12 @@ async fn start_server(host_key: PrivateKey, client_key: PublicKey) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let _ = TestServer { client_key }
-            .run_on_socket(config, &listener)
-            .await;
+        let _ = TestServer {
+            client_key,
+            shells: Vec::new(),
+        }
+        .run_on_socket(config, &listener)
+        .await;
     });
     port
 }
@@ -129,8 +162,10 @@ fn request(port: u16, credentials: Vec<Credential>, trust: Option<PublicKey>) ->
             user: USER.into(),
         },
         credentials,
+        jump: None,
         size: TermSize { cols: 80, rows: 24 },
         trust,
+        keep_alive: true,
     }
 }
 
@@ -174,7 +209,13 @@ async fn session_lifecycle() {
     // An unknown host key stops the connection and is reported for review.
     let mut session = Session::open(request(port, password(), None));
     let offered = match next(&mut session).await {
-        Event::Failed(ConnectError::UnknownHostKey { key, fingerprint }) => {
+        Event::Failed(ConnectError::UnknownHostKey {
+            host,
+            port: offered_port,
+            key,
+            fingerprint,
+        }) => {
+            assert_eq!((host.as_str(), offered_port), ("127.0.0.1", port));
             assert!(fingerprint.starts_with("SHA256:"));
             *key
         }
@@ -203,6 +244,35 @@ async fn session_lifecycle() {
             }
             other => panic!("expected the session to close, got {other:?}"),
         }
+    }
+
+    // Through a jump host (the same server, forwarding to itself): sign in
+    // there, then reach the target over the forwarded channel.
+    let mut through = request(port, password(), None);
+    through.jump = Some((through.target.clone(), password()));
+    let mut session = Session::open(through);
+    let event = next(&mut session).await;
+    assert!(matches!(event, Event::Connected), "{event:?}");
+    expect_output(&mut session, "ready").await;
+    session.write(b"via jump".to_vec());
+    expect_output(&mut session, "echo:via jump").await;
+    drop(session);
+
+    // A jump host that refuses the sign-in is named in the error.
+    let mut through = request(port, password(), None);
+    through.jump = Some((
+        through.target.clone(),
+        vec![Credential::Password("wrong".into())],
+    ));
+    let mut session = Session::open(through);
+    match next(&mut session).await {
+        Event::Failed(ConnectError::Other(message)) => {
+            assert!(
+                message.starts_with("can't sign in to 127.0.0.1"),
+                "{message}"
+            )
+        }
+        other => panic!("expected the jump sign-in to fail, got {other:?}"),
     }
 
     // The trusted key was saved, so a key-file login needs no prompt; a bad

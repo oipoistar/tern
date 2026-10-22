@@ -39,12 +39,20 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 
 ## Architecture in one breath
 
-`tern-core` has no UI: hosts, SSH sessions (`ssh.rs`, russh on its own Tokio
-runtime, talking to callers through channels), host-key art (`randomart.rs`)
-and paths. `tern-app` is GPUI: `workspace.rs` is the window root (header,
-tabs, live layer), `vault.rs` and `terminal.rs` are the screens, and
-`marks.rs` draws the art and traces. `tern-devserver` is a local SSH server
-with a real shell for manual testing.
+`tern-core` has no UI: hosts and the in-memory `Vault` (`host.rs`,
+`vault.rs`), the host editor's checks (`draft.rs`), SSH sessions (`ssh.rs`,
+russh on its own Tokio runtime, talking to callers through channels; a
+`Connection` resolves a saved host into what to dial, jump host included),
+host-key art (`randomart.rs`) and paths. `tern-app` is GPUI:
+`workspace.rs` is the window root (header, tabs, live layer), `vault.rs`
+and `terminal.rs` are the screens, `host_editor.rs` is the dialog the vault
+opens over itself, and `marks.rs` draws the art and traces.
+`tern-devserver` is a local SSH server with a real shell for manual testing.
+
+Rules live in tern-core with unit tests (what a draft needs, what a saved
+host connects through, which credentials a sign-in method tries); views
+only gather input and show results. `tern --edit [host]` opens the editor
+at startup, for looking at it without clicking.
 
 ## Gotchas that cost time before
 
@@ -62,6 +70,13 @@ with a real shell for manual testing.
   Key-down handles only keys that produce control sequences.
 - **`use gpui_kit::*` shadows Rust's `#[test]`** with GPUI's macro. In test
   modules, import what you need explicitly.
+- **UI tests click like a user**: tag elements with `.debug_selector(...)`,
+  find them with `cx.debug_bounds(...)` and `simulate_click` the centre (see
+  `vault.rs`). Focusing an input puts the cursor at the start, so select all
+  (`ctrl-a`, `cmd-a` on macOS) before typing a replacement.
+- **Jump hosts tunnel SSH inside an SSH channel.** A test server's `data`
+  hook sees forwarded channels too; echoing there corrupts the inner
+  connection ("Bad packet size" decodes as the echoed text).
 - **russh uses the `ring` backend**; the default aws-lc needs CMake and NASM on
   Windows.
 - **Windows ConPTY waits for a reply to its cursor-position query** before

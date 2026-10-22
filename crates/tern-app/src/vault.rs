@@ -1,5 +1,6 @@
 //! The hosts vault: Tern's home screen. It asks the workspace to open a
-//! session with [`VaultEvent::Connect`].
+//! session with [`VaultEvent::Connect`], and opens the host editor over
+//! itself to add or change hosts.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,15 +10,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tern_core::host::sample_groups;
 use tern_core::randomart::Randomart;
-use tern_core::ssh::{Target, key_art, known_host_key, quick_destination};
-use tern_core::{Host, HostGroup, HostStatus};
+use tern_core::ssh::{Connection, Target, key_art, known_host_key, quick_destination};
+use tern_core::{Auth, Host, HostGroup, HostStatus, Vault};
 
+use crate::host_editor::{EditorEvent, HostEditor};
 use crate::live::LiveSlots;
 use crate::marks;
 use crate::theme::{self, MONO, Theme};
-use crate::ui::{Ui, icon};
+use crate::ui::{Ui, art_tile, icon};
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -27,17 +28,14 @@ const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
 const CARD_WIDTH: f32 = 320.;
 
 pub enum VaultEvent {
-    Connect {
-        target: Target,
-        identity: Option<PathBuf>,
-    },
+    Connect(Connection),
 }
 
 impl EventEmitter<VaultEvent> for VaultContent {}
 
 /// Everything on the vault screen except the header.
 pub struct VaultContent {
-    groups: Vec<HostGroup>,
+    vault: Vault,
     selected: String,
     live: LiveSlots,
     /// Art for each host whose key a known_hosts file already trusts, by
@@ -47,7 +45,9 @@ pub struct VaultContent {
     query: SharedString,
     /// Set when the search text is itself an SSH destination.
     destination: Option<(Target, Option<PathBuf>)>,
+    editor: Option<Entity<HostEditor>>,
     _subscription: Subscription,
+    _editor_events: Option<Subscription>,
 }
 
 impl VaultContent {
@@ -64,45 +64,44 @@ impl VaultContent {
                 }
                 // A typed destination wins; otherwise open the first match.
                 InputEvent::PressEnter { .. } => {
-                    let next = this.destination.clone().or_else(|| {
-                        this.matching_hosts()
-                            .next()
-                            .map(|host| (host.ssh_target(), host.identity.clone()))
-                    });
-                    if let Some((target, identity)) = next {
-                        this.connect(target, identity, window, cx);
+                    let first = this.matching_hosts().next().map(|host| host.name.clone());
+                    if let Some((target, identity)) = this.destination.clone() {
+                        this.connect(Connection::typed(target, identity), window, cx);
+                    } else if let Some(name) = first {
+                        this.connect_saved(&name, window, cx);
                     }
                 }
                 _ => {}
             },
         );
 
-        let mut groups = sample_groups();
+        let mut vault = Vault::sample();
         if Path::new(DEV_KEY).exists() {
-            groups.insert(0, dev_server_group());
+            vault.groups.insert(0, dev_server_group());
         }
-        let selected = groups[0].hosts[0].name.clone();
-        let mut vault = Self {
-            groups,
+        let selected = vault.groups[0].hosts[0].name.clone();
+        let mut content = Self {
+            vault,
             selected,
             live,
             keys: HashMap::new(),
             search,
             query: SharedString::default(),
             destination: None,
+            editor: None,
             _subscription: subscription,
+            _editor_events: None,
         };
-        vault.refresh_keys();
-        vault
+        content.refresh_keys();
+        content
     }
 
     /// Re-reads which hosts have a trusted key (known_hosts files only, read
     /// never written), so a key trusted in a session shows up here.
     pub fn refresh_keys(&mut self) {
         self.keys = self
-            .groups
-            .iter()
-            .flat_map(|group| &group.hosts)
+            .vault
+            .hosts()
             .filter_map(|host| {
                 let key = known_host_key(&host.address, host.port)?;
                 Some(((host.address.clone(), host.port), key_art(&key)))
@@ -114,22 +113,93 @@ impl VaultContent {
     /// so Enter on an empty field does nothing.
     fn matching_hosts(&self) -> impl Iterator<Item = &Host> {
         let searching = !self.query.trim().is_empty();
-        self.groups
-            .iter()
-            .flat_map(|group| &group.hosts)
+        self.vault
+            .hosts()
             .filter(move |host| searching && host.matches(&self.query))
     }
 
-    fn connect(
+    fn connect(&mut self, connection: Connection, window: &mut Window, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.emit(VaultEvent::Connect(connection));
+    }
+
+    /// Connects to a saved host. If its settings can't work (its jump host
+    /// is gone), opens the editor on them instead.
+    fn connect_saved(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.vault.find(name) else {
+            return;
+        };
+        match self.vault.connection(host) {
+            Ok(connection) => self.connect(connection, window, cx),
+            Err(_) => {
+                self.open_editor(Some(name.to_string()), window, cx);
+                if let Some(editor) = &self.editor {
+                    editor.update(cx, |editor, cx| editor.show_problems(cx));
+                }
+            }
+        }
+    }
+
+    /// Opens the editor on the host called `editing`, or on a new host in
+    /// the selected host's group.
+    pub fn open_editor(
         &mut self,
-        target: Target,
-        identity: Option<PathBuf>,
+        editing: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        cx.emit(VaultEvent::Connect { target, identity });
+        let group = self
+            .vault
+            .group_of(&self.selected)
+            .unwrap_or("Hosts")
+            .to_string();
+        let art = editing
+            .as_deref()
+            .and_then(|name| self.vault.find(name))
+            .and_then(|host| self.keys.get(&(host.address.clone(), host.port)))
+            .cloned();
+        let (vault, live) = (self.vault.clone(), self.live.clone());
+        let editor =
+            cx.new(|cx| HostEditor::new(vault, editing.as_deref(), &group, art, live, window, cx));
+        self._editor_events = Some(cx.subscribe_in(&editor, window, Self::on_editor_event));
+        self.editor = Some(editor);
+        cx.notify();
+    }
+
+    fn on_editor_event(
+        &mut self,
+        _: &Entity<HostEditor>,
+        event: &EditorEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            EditorEvent::Save {
+                replacing,
+                host,
+                group,
+            } => {
+                self.vault
+                    .save(replacing.as_deref(), (**host).clone(), group);
+                self.selected = host.name.clone();
+                self.refresh_keys();
+            }
+            EditorEvent::Delete(name) => {
+                if self.vault.delete(name).is_ok() && self.selected == *name {
+                    self.selected = self
+                        .vault
+                        .hosts()
+                        .next()
+                        .map(|host| host.name.clone())
+                        .unwrap_or_default();
+                }
+            }
+            EditorEvent::Close => {}
+        }
+        self.editor = None;
+        self._editor_events = None;
+        cx.notify();
     }
 
     fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
@@ -143,11 +213,11 @@ impl VaultContent {
             .flex()
             .flex_col()
             .gap(px(22.))
-            .child(self.toolbar(theme))
+            .child(self.toolbar(theme, cx))
             .when_some(self.destination.clone(), |d, (target, identity)| {
                 d.child(destination_card(target, identity, theme, cx))
             })
-            .children(self.groups.iter().filter_map(|group| {
+            .children(self.vault.groups.iter().filter_map(|group| {
                 let hosts: Vec<&Host> = group
                     .hosts
                     .iter()
@@ -184,7 +254,7 @@ impl VaultContent {
             }))
     }
 
-    fn toolbar(&self, theme: &Theme) -> impl IntoElement {
+    fn toolbar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .items_center()
@@ -223,6 +293,8 @@ impl VaultContent {
             // The screen's primary action, so the one solid ink button.
             .child(
                 div()
+                    .id("new-host")
+                    .debug_selector(|| "new-host".into())
                     .h(px(46.))
                     .px(px(20.))
                     .flex()
@@ -234,8 +306,12 @@ impl VaultContent {
                     .shadow(theme.shadow_sm())
                     .text_size(px(15.))
                     .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
                     .child(icon(IconName::Plus, 16., theme.card))
-                    .child("New host"),
+                    .child("New host")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_editor(None, window, cx)),
+                    ),
             )
     }
 
@@ -254,11 +330,12 @@ impl VaultContent {
             } => format!("{ms} ms"),
             _ => String::new(),
         };
-        let name = host.name.clone();
-        let (target, identity) = (host.ssh_target(), host.identity.clone());
+        let card_id = format!("host-{}", host.name);
+        let (pick, edit, connect) = (host.name.clone(), host.name.clone(), host.name.clone());
 
         div()
-            .id(SharedString::from(format!("host-{}", host.name)))
+            .id(SharedString::from(card_id.clone()))
+            .debug_selector(move || card_id)
             .w(px(CARD_WIDTH))
             .pt(px(14.))
             .pb(px(12.))
@@ -273,7 +350,7 @@ impl VaultContent {
             .gap(px(12.))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = name.clone();
+                this.selected = pick.clone();
                 cx.notify();
             }))
             .child(
@@ -281,7 +358,7 @@ impl VaultContent {
                     .flex()
                     .items_center()
                     .gap(px(14.))
-                    .child(art_tile(art, &t))
+                    .child(art_tile(art, 52., 15., &t))
                     .child(
                         div()
                             .flex_1()
@@ -316,17 +393,29 @@ impl VaultContent {
                                     .child(host.tags.join(" / ")),
                             ),
                     )
-                    .child(
-                        connect_button(format!("connect-{}", host.name), selected, &t)
+                    // Settings for the selected host only, so each card
+                    // carries one action.
+                    .when(selected, |d| {
+                        d.child(
+                            round_button("edit-host".into(), IconName::Pencil, false, &t)
+                                .debug_selector(|| "edit-host".into())
+                                .self_start()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_editor(Some(edit.clone()), window, cx);
+                                })),
+                        )
+                    })
+                    .child({
+                        let id = format!("connect-{}", host.name);
+                        round_button(id.clone(), IconName::ArrowRight, selected, &t)
+                            .debug_selector(move || id)
                             .self_start()
-                            .on_click(cx.listener(move |_, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                cx.emit(VaultEvent::Connect {
-                                    target: target.clone(),
-                                    identity: identity.clone(),
-                                });
-                            })),
-                    ),
+                                this.connect_saved(&connect, window, cx);
+                            }))
+                    }),
             )
             .child(
                 div()
@@ -334,7 +423,11 @@ impl VaultContent {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(
+                    .child(if self.editor.is_some() {
+                        // Under the editor the live layer would paint over
+                        // the dialog, so the trace waits.
+                        div().flex_1().into_any_element()
+                    } else {
                         ui.trace(
                             format!("trace-{}", host.name),
                             host.status,
@@ -343,8 +436,9 @@ impl VaultContent {
                             t.text3,
                         )
                         .flex_1()
-                        .h_full(),
-                    )
+                        .h_full()
+                        .into_any_element()
+                    })
                     .child(
                         div()
                             .min_w(px(36.))
@@ -369,6 +463,7 @@ impl Render for VaultContent {
         };
         div()
             .size_full()
+            .relative()
             .flex()
             .gap(px(20.))
             .p(px(20.))
@@ -377,6 +472,23 @@ impl Render for VaultContent {
             .text_size(px(14.))
             .child(sidebar(&theme))
             .child(self.hosts(&ui, cx))
+            .when_some(self.editor.clone(), |d, editor| {
+                d.child(
+                    div()
+                        .id("editor-scrim")
+                        .occlude()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .p(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.scrim())
+                        .child(editor),
+                )
+            })
     }
 }
 
@@ -401,7 +513,11 @@ fn destination_card(
         .gap(px(14.))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.connect(target.clone(), identity.clone(), window, cx);
+            this.connect(
+                Connection::typed(target.clone(), identity.clone()),
+                window,
+                cx,
+            );
         }))
         .child(
             div()
@@ -424,31 +540,16 @@ fn destination_card(
                 .truncate()
                 .child(label),
         )
-        .child(connect_button("destination-connect".into(), true, theme))
+        .child(round_button(
+            "destination-connect".into(),
+            IconName::ArrowRight,
+            true,
+            theme,
+        ))
 }
 
-/// Host-key art in a hairline tile; blank until the host's key is trusted.
-fn art_tile(art: Option<Randomart>, theme: &Theme) -> impl IntoElement {
-    let (ink, faint) = (theme.text, theme.text3);
-    div()
-        .size(px(52.))
-        .flex_none()
-        .rounded(px(15.))
-        .border_1()
-        .border_color(theme.line)
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    marks::paint_art(bounds, art.as_ref(), ink, faint, window)
-                },
-            )
-            .size_full(),
-        )
-}
-
-/// A round arrow button; `filled` makes it solid ink for the primary choice.
-fn connect_button(id: String, filled: bool, theme: &Theme) -> Stateful<Div> {
+/// A round icon button; `filled` makes it solid ink for the primary choice.
+fn round_button(id: String, glyph: IconName, filled: bool, theme: &Theme) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
         .size(px(36.))
@@ -462,7 +563,7 @@ fn connect_button(id: String, filled: bool, theme: &Theme) -> Stateful<Div> {
         .justify_center()
         .cursor_pointer()
         .child(icon(
-            IconName::ArrowRight,
+            glyph,
             16.,
             if filled { theme.card } else { theme.text },
         ))
@@ -473,14 +574,11 @@ fn dev_server_group() -> HostGroup {
     HostGroup {
         name: "Local dev server".into(),
         hosts: vec![Host {
-            name: "tern-devserver".into(),
-            user: "tern".into(),
-            address: "127.0.0.1".into(),
-            port: 2222,
             os: "This computer".into(),
             tags: vec!["dev".into()],
             status: HostStatus::Online { latency_ms: None },
-            identity: Some(PathBuf::from(DEV_KEY)),
+            auth: Auth::Key(PathBuf::from(DEV_KEY)),
+            ..Host::new("tern-devserver", "tern", "127.0.0.1", 2222)
         }],
     }
 }
@@ -528,26 +626,50 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui::TestAppContext;
-    use tern_core::ssh::Target;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::Entity;
+    use tern_core::draft::Field;
+    use tern_core::ssh::Connection;
 
     use super::{VaultContent, VaultEvent};
     use crate::live::LiveSlots;
 
-    #[gpui::test]
-    fn search_filters_hosts_and_connects_to_a_typed_destination(cx: &mut TestAppContext) {
+    fn open_vault(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<VaultContent>,
+        &mut VisualTestContext,
+        Rc<RefCell<Vec<Connection>>>,
+    ) {
         cx.update(gpui_kit::init);
         let (vault, cx) =
             cx.add_window_view(|window, cx| VaultContent::new(LiveSlots::default(), window, cx));
-        let connects: Rc<RefCell<Vec<Target>>> = Rc::default();
-        let _subscription = cx.update(|_, cx| {
-            let connects = connects.clone();
+        let connects: Rc<RefCell<Vec<Connection>>> = Rc::default();
+        let recorded = connects.clone();
+        cx.update(|_, cx| {
             cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
-                let VaultEvent::Connect { target, .. } = event;
-                connects.borrow_mut().push(target.clone());
+                let VaultEvent::Connect(connection) = event;
+                recorded.borrow_mut().push(connection.clone());
             })
+            .detach()
         });
-        let focus_search = |cx: &mut gpui::VisualTestContext| {
+        (vault, cx, connects)
+    }
+
+    /// Clicks the element tagged with `selector`, like a user would.
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("nothing on screen is tagged {selector}"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn search_filters_hosts_and_connects_to_a_typed_destination(cx: &mut TestAppContext) {
+        let (vault, cx, connects) = open_vault(cx);
+        let focus_search = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| {
                 let search = vault.read(cx).search.clone();
                 search.update(cx, |state, cx| state.focus(window, cx));
@@ -570,7 +692,10 @@ mod tests {
         // Enter opens the first match.
         cx.simulate_keystrokes("enter");
         assert_eq!(
-            connects.borrow().last().map(|target| target.host.clone()),
+            connects
+                .borrow()
+                .last()
+                .map(|connection| connection.target.host.clone()),
             Some("10.0.4.21".into())
         );
 
@@ -579,10 +704,90 @@ mod tests {
         cx.simulate_input("deploy@10.0.4.21:2200");
         vault.read_with(cx, |vault, _| assert!(vault.destination.is_some()));
         cx.simulate_keystrokes("enter");
-        let target = connects.borrow().last().cloned().expect("a connect event");
+        let target = connects
+            .borrow()
+            .last()
+            .cloned()
+            .expect("a connect event")
+            .target;
         assert_eq!((target.user.as_str(), target.port), ("deploy", 2200));
         vault.read_with(cx, |vault, cx| {
             assert!(vault.search.read(cx).value().is_empty())
         });
+    }
+
+    #[gpui::test]
+    fn the_host_editor_adds_edits_and_deletes_hosts(cx: &mut TestAppContext) {
+        let (vault, cx, connects) = open_vault(cx);
+        // Replaces a field's text, the way a user selects it all and types.
+        let type_into = |cx: &mut VisualTestContext, field: Field, text: &str| {
+            cx.update(|window, cx| {
+                let editor = vault.read(cx).editor.clone().expect("the editor is open");
+                let input = editor.read(cx).input(field);
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            });
+            cx.simulate_input(text);
+        };
+        let editor_open =
+            |cx: &mut VisualTestContext| vault.read_with(cx, |v, _| v.editor.is_some());
+
+        // A new host: saving it empty points at what's missing.
+        click(cx, "new-host");
+        click(cx, "save-host");
+        assert!(editor_open(cx));
+        let missing = vault.read_with(cx, |vault, cx| {
+            vault.editor.as_ref().unwrap().read(cx).problem_fields()
+        });
+        assert_eq!(missing, [Field::Name, Field::Address, Field::User]);
+
+        type_into(cx, Field::Name, "db-new");
+        type_into(cx, Field::Address, "10.0.0.9");
+        type_into(cx, Field::Port, "2200");
+        type_into(cx, Field::User, "root");
+        click(cx, "save-host");
+        assert!(!editor_open(cx));
+        vault.read_with(cx, |vault, _| {
+            let host = vault.vault.find("db-new").expect("the new host is saved");
+            assert_eq!((host.port, host.user.as_str()), (2200, "root"));
+            assert_eq!(vault.vault.group_of("db-new"), Some("Production"));
+            assert_eq!(vault.selected, "db-new");
+        });
+
+        // Editing: route prod-db-01 through bastion, then connect.
+        click(cx, "host-prod-db-01");
+        click(cx, "edit-host");
+        click(cx, "jump-switch");
+        click(cx, "jump-picker");
+        click(cx, "jump-picker-bastion");
+        click(cx, "save-host");
+        assert!(!editor_open(cx));
+        click(cx, "connect-prod-db-01");
+        let connection = connects.borrow().last().cloned().expect("a connect event");
+        let jump = connection.jump.expect("connects through the jump host");
+        assert_eq!(jump.target.host, "bastion.example.com");
+
+        // Deleting a host others go through is refused; Escape closes.
+        click(cx, "host-bastion");
+        click(cx, "edit-host");
+        click(cx, "delete-host");
+        assert!(editor_open(cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!editor_open(cx));
+        vault.read_with(cx, |vault, _| {
+            assert!(vault.vault.find("bastion").is_some())
+        });
+
+        // Deleting an ordinary host works.
+        click(cx, "host-db-new");
+        click(cx, "edit-host");
+        click(cx, "delete-host");
+        assert!(!editor_open(cx));
+        vault.read_with(cx, |vault, _| assert!(vault.vault.find("db-new").is_none()));
     }
 }

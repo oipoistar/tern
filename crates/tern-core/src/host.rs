@@ -3,6 +3,8 @@ use std::path::PathBuf;
 /// Reachability of a saved host, as last observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostStatus {
+    /// Never checked, like a host that was just added.
+    Unknown,
     /// Answering; with the round trip in milliseconds when it was measured.
     Online {
         latency_ms: Option<u32>,
@@ -19,6 +21,18 @@ impl HostStatus {
     }
 }
 
+/// How Tern signs in to a host.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Auth {
+    /// The SSH agent, then the usual key files in `~/.ssh`.
+    #[default]
+    Agent,
+    /// This key file first, then the agent and the usual keys.
+    Key(PathBuf),
+    /// Ask for a password when connecting.
+    Password,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Host {
     pub name: String,
@@ -28,11 +42,33 @@ pub struct Host {
     pub os: String,
     pub tags: Vec<String>,
     pub status: HostStatus,
-    /// Private key to log in with, before the agent and default keys.
-    pub identity: Option<PathBuf>,
+    pub auth: Auth,
+    /// Another saved host to connect through first, by name.
+    pub jump: Option<String>,
+    /// Ping the server every 30 seconds so idle connections stay up.
+    pub keep_alive: bool,
+    /// Typed into the shell once it starts.
+    pub on_login: Option<String>,
 }
 
 impl Host {
+    /// A host with Tern's defaults for everything but where it is.
+    pub fn new(name: &str, user: &str, address: &str, port: u16) -> Self {
+        Self {
+            name: name.into(),
+            user: user.into(),
+            address: address.into(),
+            port,
+            os: String::new(),
+            tags: Vec::new(),
+            status: HostStatus::Unknown,
+            auth: Auth::Agent,
+            jump: None,
+            keep_alive: true,
+            on_login: None,
+        }
+    }
+
     /// Where to connect for an SSH session.
     pub fn ssh_target(&self) -> crate::ssh::Target {
         crate::ssh::Target {
@@ -77,17 +113,12 @@ pub struct HostGroup {
 
 /// Placeholder vault contents until the encrypted vault exists.
 pub fn sample_groups() -> Vec<HostGroup> {
-    let host =
-        |name: &str, user: &str, address: &str, port, os: &str, tags: &[&str], status| Host {
-            name: name.into(),
-            user: user.into(),
-            address: address.into(),
-            port,
-            os: os.into(),
-            tags: tags.iter().map(|t| t.to_string()).collect(),
-            status,
-            identity: None,
-        };
+    let host = |name: &str, user, address, port, os: &str, tags: &[&str], status| Host {
+        os: os.into(),
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        status,
+        ..Host::new(name, user, address, port)
+    };
     vec![
         HostGroup {
             name: "Production".into(),
@@ -169,28 +200,21 @@ pub fn sample_groups() -> Vec<HostGroup> {
 mod tests {
     use super::*;
 
-    fn host(name: &str, port: u16) -> Host {
-        Host {
-            name: name.into(),
-            user: "deploy".into(),
-            address: "10.0.0.1".into(),
-            port,
-            os: String::new(),
-            tags: vec![],
-            status: HostStatus::Offline,
-            identity: None,
-        }
-    }
-
     #[test]
     fn target_hides_default_port() {
-        assert_eq!(host("a", 22).target(), "deploy@10.0.0.1");
-        assert_eq!(host("a", 2222).target(), "deploy@10.0.0.1:2222");
+        assert_eq!(
+            Host::new("a", "deploy", "10.0.0.1", 22).target(),
+            "deploy@10.0.0.1"
+        );
+        assert_eq!(
+            Host::new("a", "deploy", "10.0.0.1", 2222).target(),
+            "deploy@10.0.0.1:2222"
+        );
     }
 
     #[test]
     fn matches_every_term_anywhere() {
-        let mut db = host("prod-db-01", 22);
+        let mut db = Host::new("prod-db-01", "deploy", "10.0.0.1", 22);
         db.tags = vec!["postgres".into(), "eu-west".into()];
         assert!(db.matches(""));
         assert!(db.matches("DB"));

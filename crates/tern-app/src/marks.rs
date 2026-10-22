@@ -5,11 +5,14 @@ use gpui_kit::*;
 use tern_core::HostStatus;
 use tern_core::randomart::{Randomart, SIZE};
 
-/// Dot radius by how often the bishop landed on a square (0, 1, 2, … 5+).
-/// The largest still leaves a gap at the tile's 3.6 px pitch.
+/// Dot radius by how often the bishop landed on a square (0, 1, 2, … 5+),
+/// for the vault card's 3.6 px pitch; the largest still leaves a gap.
+/// Smaller tiles scale them down.
 const ART_RADIUS: [f32; 6] = [0.55, 0.9, 1.15, 1.35, 1.5, 1.6];
-/// Gap between the art's outer dots and the tile edge.
-const ART_PAD: f32 = 7.;
+const ART_PITCH: f32 = 3.6;
+/// Gap between the art's outer dots and the tile edge, as a share of its
+/// width.
+const ART_PAD: f32 = 0.14;
 
 /// Width of one latency sample on the trace.
 const SAMPLE_PITCH: f32 = 7.;
@@ -28,30 +31,28 @@ pub fn paint_art(
     faint: Hsla,
     window: &mut Window,
 ) {
-    let pitch = (bounds.size.width.as_f32() - 2. * ART_PAD) / (SIZE - 1) as f32;
-    let at = |x: usize, y: usize| {
-        offset(
-            bounds,
-            ART_PAD + x as f32 * pitch,
-            ART_PAD + y as f32 * pitch,
-        )
-    };
+    let width = bounds.size.width.as_f32();
+    let pad = width * ART_PAD;
+    let pitch = (width - 2. * pad) / (SIZE - 1) as f32;
+    let scale = (pitch / ART_PITCH).min(1.);
+    let at = |x: usize, y: usize| offset(bounds, pad + x as f32 * pitch, pad + y as f32 * pitch);
     for y in 0..SIZE {
         for x in 0..SIZE {
             let visits = art.map_or(0, |art| art.visits(x, y)) as usize;
             let color = if visits > 0 { ink } else { faint.opacity(0.35) };
-            dot(at(x, y), ART_RADIUS[visits.min(5)], color, window);
+            dot(at(x, y), ART_RADIUS[visits.min(5)] * scale, color, window);
         }
     }
     if let Some(art) = art {
         let (x, y) = art.end();
-        ring(at(x, y), 3.2, ink, window);
+        ring(at(x, y), 3.2 * scale, ink, window);
     }
 }
 
 /// The latency trace: a live line while the host answers (rougher the slower
-/// it is), a dot sweeping a dashed line while connecting, and a dotted flat
-/// line when it doesn't answer. `seed` keeps neighbouring traces apart.
+/// it is), a dot sweeping a dashed line while connecting, a dotted flat line
+/// when it doesn't answer, and a faint hairline before it's ever been
+/// checked. `seed` keeps neighbouring traces apart.
 pub fn paint_trace(
     bounds: Bounds<Pixels>,
     status: HostStatus,
@@ -64,6 +65,13 @@ pub fn paint_trace(
     let (w, h) = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
     let mid = h / 2.;
     match status {
+        // Never checked: a plain hairline, neither alive nor dead.
+        HostStatus::Unknown => {
+            window.paint_quad(fill(
+                rect(bounds, 2., mid - 0.5, w - 4., 1.),
+                faint.opacity(0.6),
+            ));
+        }
         HostStatus::Offline => {
             let mut x = 2.;
             while x <= w - 2. {

@@ -13,7 +13,7 @@ terminal emulation via [alacritty_terminal](https://crates.io/crates/alacritty_t
 
 | Crate | What it is |
 | --- | --- |
-| `crates/tern-core` | UI-free core: hosts, SSH sessions, host-key checks |
+| `crates/tern-core` | UI-free core: hosts and the vault, SSH sessions (direct or through a jump host), host-key checks |
 | `crates/tern-app` | The desktop app (`tern`) |
 | `crates/tern-devserver` | Local SSH server with a real shell, for development |
 
@@ -22,10 +22,14 @@ terminal emulation via [alacritty_terminal](https://crates.io/crates/alacritty_t
 ```sh
 cargo run -p tern-app                      # the app
 cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at start
+cargo run -p tern-app -- --edit prod-db-01                    # open the host editor (a new host without a name)
 ```
 
 The quick-connect field in the vault accepts the same `ssh …` commands
-(`-p`, `-l` and `-i` are understood).
+(`-p`, `-l` and `-i` are understood). Hosts are added and changed in the host
+editor (New host, or the pencil on the selected host). For now they live in
+memory: the vault starts from sample hosts and forgets edits on quit, until
+the encrypted vault file exists.
 
 Tern checks host keys against `~/.ssh/known_hosts` (read only) and its own
 known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application

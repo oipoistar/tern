@@ -14,11 +14,15 @@ gpui_kit::assets::icon_assets!(
         CodeXml,
         Funnel,
         KeyRound,
+        Laptop,
         LayoutGrid,
         List,
         Lock,
+        Pencil,
         Server,
-        ShieldCheck
+        Shield,
+        ShieldCheck,
+        Zap
     ]
 );
 

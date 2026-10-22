@@ -89,6 +89,8 @@ pub struct Theme {
     pub text2: Hsla,
     pub text3: Hsla,
     pub line: Hsla,
+    /// A switch's track while off.
+    pub track: Hsla,
     pub danger: Hsla,
 }
 
@@ -103,6 +105,7 @@ impl Theme {
             text2: c(rgb(0x5E5E5E)),
             text3: c(rgb(0x737373)),
             line: c(rgba(0x00000017)),
+            track: c(rgb(0xD4D4D9)),
             danger: c(rgb(0xC4321F)),
         }
     }
@@ -117,6 +120,7 @@ impl Theme {
             text2: c(rgb(0xA6A6AE)),
             text3: c(rgb(0x8E8E96)),
             line: c(rgba(0xFFFFFF1A)),
+            track: c(rgb(0x3A3B40)),
             danger: c(rgb(0xFF8A80)),
         }
     }
@@ -167,5 +171,22 @@ impl Theme {
     pub fn shadow_sm(&self) -> Vec<BoxShadow> {
         let alpha = if self.dark { 0.5 } else { 0.06 };
         vec![BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., alpha)).blur_radius(px(2.))]
+    }
+
+    /// For a dialog floating over the screen.
+    pub fn shadow_lg(&self) -> Vec<BoxShadow> {
+        if self.dark {
+            vec![BoxShadow::new(px(0.), px(30.), hsla(0., 0., 0., 0.6)).blur_radius(px(80.))]
+        } else {
+            vec![
+                BoxShadow::new(px(0.), px(2.), hsla(0., 0., 0., 0.04)).blur_radius(px(6.)),
+                BoxShadow::new(px(0.), px(30.), hsla(0., 0., 0., 0.10)).blur_radius(px(80.)),
+            ]
+        }
+    }
+
+    /// Dims the screen behind a dialog.
+    pub fn scrim(&self) -> Hsla {
+        hsla(0., 0., 0., if self.dark { 0.5 } else { 0.18 })
     }
 }

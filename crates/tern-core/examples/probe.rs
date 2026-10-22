@@ -10,10 +10,7 @@
 
 use std::time::Duration;
 
-use tern_core::ssh::{
-    ConnectError, ConnectRequest, Credential, Event, Session, TermSize, default_credentials,
-    parse_command,
-};
+use tern_core::ssh::{ConnectError, Connection, Event, Session, TermSize, parse_command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,25 +26,14 @@ async fn main() -> anyhow::Result<()> {
     let trust_unknown = args.iter().any(|arg| arg == "--trust");
 
     let (target, key) = parse_command(command)?;
-    let credentials = match key {
-        Some(path) => vec![Credential::KeyFile {
-            path,
-            passphrase: None,
-        }],
-        None => default_credentials(),
+    let connection = Connection::typed(target.clone(), key);
+    let size = TermSize {
+        cols: 100,
+        rows: 30,
     };
     let mut trust = None;
     loop {
-        let request = ConnectRequest {
-            target: target.clone(),
-            credentials: credentials.clone(),
-            size: TermSize {
-                cols: 100,
-                rows: 30,
-            },
-            trust: trust.clone(),
-        };
-        let mut session = Session::open(request);
+        let mut session = Session::open(connection.request(size, None, trust.clone()));
         match session.next_event().await {
             Some(Event::Connected) => {
                 eprintln!(
@@ -86,10 +72,13 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("\n(done)");
                 return Ok(());
             }
-            Some(Event::Failed(ConnectError::UnknownHostKey { key, fingerprint }))
-                if trust_unknown && trust.is_none() =>
-            {
-                eprintln!("trusting host key {fingerprint}");
+            Some(Event::Failed(ConnectError::UnknownHostKey {
+                host,
+                key,
+                fingerprint,
+                ..
+            })) if trust_unknown && trust.is_none() => {
+                eprintln!("trusting host key {fingerprint} for {host}");
                 trust = Some(*key);
             }
             Some(Event::Failed(error)) => anyhow::bail!("{error}"),

@@ -6,7 +6,6 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
@@ -16,10 +15,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb};
 use gpui_kit::*;
-use tern_core::ssh::{
-    ConnectError, ConnectRequest, Credential, Event, HostKey, Session, SessionInput, Target,
-    TermSize, default_credentials,
-};
+use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
 
 use crate::theme::{self, MONO, TermPalette, Theme};
 
@@ -31,8 +27,10 @@ const SCROLLBACK: usize = 10_000;
 /// Where the connection stands.
 pub enum Phase {
     Connecting,
-    /// The server's key is unknown; waiting for the user to trust it.
+    /// A server's key is unknown (the target's, or the jump host's);
+    /// waiting for the user to trust it.
     Trust {
+        host: SharedString,
         key: HostKey,
         fingerprint: SharedString,
     },
@@ -46,8 +44,7 @@ pub enum Phase {
 }
 
 pub struct TerminalView {
-    target: Target,
-    identity: Option<PathBuf>,
+    connection: Connection,
     password: Option<String>,
     trust: Option<HostKey>,
     pub phase: Phase,
@@ -86,7 +83,7 @@ impl Dimensions for GridSize {
 }
 
 impl TerminalView {
-    pub fn new(target: Target, identity: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(connection: Connection, cx: &mut Context<Self>) -> Self {
         let size = TermSize {
             cols: 100,
             rows: 30,
@@ -97,8 +94,7 @@ impl TerminalView {
             ..Default::default()
         };
         let mut view = Self {
-            target,
-            identity,
+            connection,
             password: None,
             trust: None,
             phase: Phase::Connecting,
@@ -121,29 +117,16 @@ impl TerminalView {
 
     /// Tab label: the remote title if the shell set one, else `user@host`.
     pub fn title(&self) -> SharedString {
-        self.title
-            .clone()
-            .unwrap_or_else(|| format!("{}@{}", self.target.user, self.target.host).into())
+        self.title.clone().unwrap_or_else(|| {
+            let target = &self.connection.target;
+            format!("{}@{}", target.user, target.host).into()
+        })
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
-        let mut credentials = Vec::new();
-        if let Some(path) = &self.identity {
-            credentials.push(Credential::KeyFile {
-                path: path.clone(),
-                passphrase: None,
-            });
-        }
-        match &self.password {
-            Some(password) => credentials.push(Credential::Password(password.clone())),
-            None => credentials.extend(default_credentials()),
-        }
-        let request = ConnectRequest {
-            target: self.target.clone(),
-            credentials,
-            size: self.size,
-            trust: self.trust.clone(),
-        };
+        let request =
+            self.connection
+                .request(self.size, self.password.as_deref(), self.trust.clone());
         let (input, mut events) = Session::open(request).into_parts();
         self.input = Some(input);
         self.phase = Phase::Connecting;
@@ -172,6 +155,10 @@ impl TerminalView {
                     &GridSize(self.size),
                     Listener(self.term_events.clone()),
                 );
+                // Queued now, it reaches the shell as soon as it starts.
+                if let Some(command) = &self.connection.on_login {
+                    self.send(format!("{command}\r").into_bytes());
+                }
             }
             Event::Output(bytes) => {
                 self.parser.advance(&mut self.term, &bytes);
@@ -187,7 +174,11 @@ impl TerminalView {
             Event::Failed(error) => {
                 self.input = None;
                 self.phase = match error {
-                    ConnectError::UnknownHostKey { key, fingerprint } => Phase::Trust { key: *key, fingerprint: fingerprint.into() },
+                    ConnectError::UnknownHostKey { host, port, key, fingerprint } => Phase::Trust {
+                        host: if port == 22 { host.into() } else { format!("{host}:{port}").into() },
+                        key: *key,
+                        fingerprint: fingerprint.into(),
+                    },
                     ConnectError::AuthFailed { .. } => Phase::Password { typed: String::new(), rejected: self.password.is_some() },
                     ConnectError::HostKeyChanged { fingerprint, file, line } => Phase::Ended(
                         // The one place the extra words earn their keep: this
@@ -498,14 +489,16 @@ impl TerminalView {
         };
         let target = format!(
             "{}@{}:{}",
-            self.target.user, self.target.host, self.target.port
+            self.connection.target.user, self.connection.target.host, self.connection.target.port
         );
 
         Some(match &self.phase {
             Phase::Live => return None,
             Phase::Connecting => card(target.into(), None),
-            Phase::Trust { fingerprint, .. } => card(
-                format!("Trust {target}?").into(),
+            Phase::Trust {
+                host, fingerprint, ..
+            } => card(
+                format!("Trust {host}?").into(),
                 Some(
                     div()
                         .flex()
