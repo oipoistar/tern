@@ -84,6 +84,7 @@ pub fn vault() -> Vault {
             ),
         ],
         snippets: Vec::new(),
+        identities: Vec::new(),
         deleted: Vec::new(),
     }
 }
