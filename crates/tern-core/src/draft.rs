@@ -12,6 +12,8 @@ pub struct HostDraft {
     pub user: String,
     pub group: String,
     pub auth: Auth,
+    /// An identity's id: its user and sign-in replace the host's own.
+    pub identity: Option<String>,
     /// `Some("")` while connecting through a jump host is switched on but
     /// none is chosen yet.
     pub jump: Option<String>,
@@ -55,6 +57,7 @@ impl HostDraft {
             user: String::new(),
             group: group.into(),
             auth: Auth::Agent,
+            identity: None,
             jump: None,
             proxy: None,
             tags: Vec::new(),
@@ -73,6 +76,7 @@ impl HostDraft {
             user: host.user.clone(),
             group: group.into(),
             auth: host.auth.clone(),
+            identity: host.identity.clone(),
             jump: host.jump.clone(),
             proxy: host.proxy.as_ref().map(ToString::to_string),
             tags: host.tags.clone(),
@@ -118,17 +122,27 @@ impl HostDraft {
         if port.is_none() {
             problem(Field::Port, "Port must be a number from 1 to 65535");
         }
-        let user = self.user.trim();
-        if user.is_empty() {
-            problem(Field::User, "Username is required");
-        } else if user.contains(char::is_whitespace) {
-            problem(Field::User, "Username can't contain spaces");
+        // An identity brings its own user and sign-in.
+        let identity = self.identity.as_deref().and_then(|id| vault.identity(id));
+        if self.identity.is_some() && identity.is_none() {
+            problem(Field::User, "That identity no longer exists");
         }
-        if let Auth::Key(path) = &self.auth {
-            if path.as_os_str().is_empty() {
-                problem(Field::Key, "Choose a key file");
-            } else if !path.exists() {
-                problem(Field::Key, "That key file doesn't exist");
+        let user = match identity {
+            Some(identity) => identity.user.as_str(),
+            None => self.user.trim(),
+        };
+        if identity.is_none() {
+            if user.is_empty() {
+                problem(Field::User, "Username is required");
+            } else if user.contains(char::is_whitespace) {
+                problem(Field::User, "Username can't contain spaces");
+            }
+            if let Auth::Key(path) = &self.auth {
+                if path.as_os_str().is_empty() {
+                    problem(Field::Key, "Choose a key file");
+                } else if !path.exists() {
+                    problem(Field::Key, "That key file doesn't exist");
+                }
             }
         }
         if let Some(jump) = self.jump.as_deref().map(str::trim) {
@@ -175,7 +189,9 @@ impl HostDraft {
             port: port.unwrap_or(22),
             os: previous.map(|host| host.os.clone()).unwrap_or_default(),
             tags: normalize_tags(&self.tags),
-            auth: self.auth.clone(),
+            // Kept from the identity too, so the host still works without it.
+            auth: identity.map_or_else(|| self.auth.clone(), |identity| identity.auth.clone()),
+            identity: identity.map(|identity| identity.id.clone()),
             jump: self.jump.as_deref().map(|jump| jump.trim().to_string()),
             proxy,
             keep_alive: self.keep_alive,

@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::forward::{Forward, ForwardId};
-use crate::host::{Host, HostGroup, now_ms};
+use crate::host::{Auth, Host, HostGroup, now_ms};
+use crate::identity::Identity;
 use crate::paths;
 use crate::reach::Place;
 use crate::snippet::{self, Snippet};
@@ -21,6 +22,8 @@ use crate::ssh::{Connection, Jump};
 pub struct Vault {
     pub groups: Vec<HostGroup>,
     pub snippets: Vec<Snippet>,
+    /// Users and sign-ins that hosts share.
+    pub identities: Vec<Identity>,
     /// Hosts and snippets deleted here, so sync deletes them elsewhere too.
     pub deleted: Vec<Tombstone>,
 }
@@ -46,6 +49,7 @@ impl Vault {
                 Snippet::new("Disk space", "df -h"),
                 Snippet::new("Follow syslog", "tail -f /var/log/syslog"),
             ],
+            identities: Vec::new(),
             deleted: Vec::new(),
         }
     }
@@ -60,6 +64,61 @@ impl Vault {
             None => self.snippets.push(snippet),
         }
         Ok(())
+    }
+
+    /// The identity with `id`.
+    pub fn identity(&self, id: &str) -> Option<&Identity> {
+        self.identities.iter().find(|identity| identity.id == id)
+    }
+
+    /// Saves `identity`, replacing the one with its id.
+    pub fn save_identity(&mut self, mut identity: Identity) {
+        identity.updated = now_ms();
+        match self
+            .identities
+            .iter()
+            .position(|have| have.id == identity.id)
+        {
+            Some(index) => self.identities[index] = identity,
+            None => self.identities.push(identity),
+        }
+    }
+
+    /// Hosts that use the identity `id`.
+    pub fn identity_users(&self, id: &str) -> Vec<&str> {
+        self.hosts()
+            .filter(|host| host.identity.as_deref() == Some(id))
+            .map(|host| host.name.as_str())
+            .collect()
+    }
+
+    /// Removes an identity. Refused while hosts use it; the error names
+    /// them.
+    pub fn delete_identity(&mut self, id: &str) -> Result<(), Vec<String>> {
+        let users = self.identity_users(id);
+        if !users.is_empty() {
+            return Err(users.into_iter().map(String::from).collect());
+        }
+        self.identities.retain(|identity| identity.id != id);
+        self.bury(id.to_string());
+        Ok(())
+    }
+
+    /// The user and sign-in `host` connects with, and the name its saved
+    /// password is kept under: its identity's when it has one.
+    pub fn sign_in(&self, host: &Host) -> (String, Auth, String) {
+        match host.identity.as_deref().and_then(|id| self.identity(id)) {
+            Some(identity) => (
+                identity.user.clone(),
+                identity.auth.clone(),
+                crate::identity::identity_password(&identity.id),
+            ),
+            None => (
+                host.user.clone(),
+                host.auth.clone(),
+                crate::secrets::host_password(&host.id),
+            ),
+        }
     }
 
     pub fn delete_snippet(&mut self, name: &str) {
@@ -229,17 +288,29 @@ impl Vault {
         let jumps = self
             .jumps(host)?
             .into_iter()
-            .map(|via| Jump {
-                target: via.ssh_target(),
-                auth: via.auth.clone(),
-                host_id: Some(via.id.clone()),
+            .map(|via| {
+                let (user, auth, secret) = self.sign_in(via);
+                Jump {
+                    target: crate::ssh::Target {
+                        user,
+                        ..via.ssh_target()
+                    },
+                    auth,
+                    host_id: Some(via.id.clone()),
+                    secret: Some(secret),
+                }
             })
             .collect();
+        let (user, auth, secret) = self.sign_in(host);
         Ok(Connection {
             host: Some(host.name.clone()),
             host_id: Some(host.id.clone()),
-            target: host.ssh_target(),
-            auth: host.auth.clone(),
+            secret: Some(secret),
+            target: crate::ssh::Target {
+                user,
+                ..host.ssh_target()
+            },
+            auth,
             jumps,
             proxy: self.first_hop_host(host).proxy.clone(),
             keep_alive: host.keep_alive,
@@ -336,6 +407,7 @@ impl Vault {
             version: FILE_VERSION,
             groups: &self.groups,
             snippets: &self.snippets,
+            identities: &self.identities,
             deleted: &self.deleted,
         })?;
         json.push('\n');
@@ -347,8 +419,8 @@ impl Vault {
 /// misread the file (dropping something it doesn't know when it saves);
 /// older versions then leave it alone instead. 2 added snippets, 3 port
 /// forwarding rules, 4 ids, change times and deletions for sync, 5 agent
-/// forwarding, 6 environment variables, 7 proxies.
-pub const FILE_VERSION: u32 = 7;
+/// forwarding, 6 environment variables, 7 proxies, 8 identities.
+pub const FILE_VERSION: u32 = 8;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -356,6 +428,8 @@ struct FileOut<'a> {
     version: u32,
     groups: &'a [HostGroup],
     snippets: &'a [Snippet],
+    #[serde(skip_serializing_if = "<[Identity]>::is_empty")]
+    identities: &'a [Identity],
     deleted: &'a [Tombstone],
 }
 
@@ -366,6 +440,8 @@ struct FileIn {
     groups: Vec<HostGroup>,
     #[serde(default)]
     snippets: Vec<Snippet>,
+    #[serde(default)]
+    identities: Vec<Identity>,
     #[serde(default)]
     deleted: Vec<Tombstone>,
 }
@@ -447,6 +523,7 @@ fn parse(text: &str) -> Result<Vault, Unusable> {
     Ok(Vault {
         groups: file.groups,
         snippets: file.snippets,
+        identities: file.identities,
         deleted: file.deleted,
     })
 }
@@ -590,6 +667,60 @@ mod tests {
     }
 
     #[test]
+    fn hosts_sign_in_as_their_identity() {
+        use crate::identity::{Identity, identity_password};
+
+        let mut vault = Vault::sample();
+        let ops = Identity::new("ops", "operator", Auth::Password);
+        vault.save_identity(ops.clone());
+        let mut db = vault.find("prod-db-01").unwrap().clone();
+        db.identity = Some(ops.id.clone());
+        vault.save(Some("prod-db-01"), db.clone(), "Production");
+        let mut web = vault.find("prod-web-01").unwrap().clone();
+        web.jump = Some("prod-db-01".into());
+        vault.save(Some("prod-web-01"), web.clone(), "Production");
+
+        // The identity's user, sign-in and password, for the host and as a
+        // jump host.
+        let connection = vault.connection(&db).unwrap();
+        assert_eq!(connection.target.user, "operator");
+        assert_eq!(connection.auth, Auth::Password);
+        assert_eq!(
+            connection.secret.as_deref(),
+            Some(identity_password(&ops.id).as_str())
+        );
+        let through = vault.connection(&web).unwrap();
+        assert_eq!(through.jumps[0].target.user, "operator");
+        assert_eq!(through.target.user, web.user);
+        assert_eq!(
+            through.secret.as_deref(),
+            Some(crate::secrets::host_password(&web.id).as_str())
+        );
+
+        // Changing the identity changes every host that uses it.
+        let mut renamed = vault.identity(&ops.id).unwrap().clone();
+        renamed.user = "root".into();
+        vault.save_identity(renamed);
+        assert_eq!(vault.connection(&db).unwrap().target.user, "root");
+
+        // It can't go while a host uses it, and the file keeps it.
+        assert_eq!(
+            vault.delete_identity(&ops.id),
+            Err(vec!["prod-db-01".to_string()])
+        );
+        let dir = scratch("identities");
+        let path = dir.join("vault.json");
+        vault.save_to(&path).unwrap();
+        assert_eq!(open(&path).vault.identities, vault.identities);
+        std::fs::remove_dir_all(&dir).unwrap();
+        db.identity = None;
+        vault.save(Some("prod-db-01"), db, "Production");
+        assert_eq!(vault.delete_identity(&ops.id), Ok(()));
+        assert!(vault.identities.is_empty());
+        assert!(vault.deleted.iter().any(|tombstone| tombstone.id == ops.id));
+    }
+
+    #[test]
     fn follows_a_chain_of_jump_hosts() {
         let mut vault = Vault::sample();
         let mut bastion = vault.find("bastion").unwrap().clone();
@@ -658,7 +789,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 7"), "{text}");
+        assert!(text.contains("\"version\": 8"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());

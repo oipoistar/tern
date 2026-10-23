@@ -221,9 +221,9 @@ impl TerminalView {
     /// The password saved for this connection's host, if it signs in with
     /// one; it's tried before asking.
     fn saved_password(&self, cx: &App) -> Option<String> {
-        let id = self.connection.host_id.as_deref()?;
+        let secret = self.connection.secret.as_deref()?;
         (self.connection.auth == tern_core::Auth::Password)
-            .then(|| crate::sync::secrets(cx).load(&tern_core::secrets::host_password(id)))
+            .then(|| crate::sync::secrets(cx).load(secret))
             .flatten()
     }
 
@@ -444,11 +444,7 @@ impl TerminalView {
                 self.size,
                 self.password.as_deref(),
                 self.trust.clone(),
-                |jump| {
-                    jump.host_id
-                        .as_deref()
-                        .and_then(|id| store.load(&tern_core::secrets::host_password(id)))
-                },
+                |jump| jump.secret.as_deref().and_then(|secret| store.load(secret)),
             );
             Session::open(request)
         };

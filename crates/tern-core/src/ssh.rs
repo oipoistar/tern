@@ -94,8 +94,11 @@ pub struct ConnectRequest {
 pub struct Jump {
     pub target: Target,
     pub auth: Auth,
-    /// The saved host's id, which its saved password is kept under.
+    /// The saved host's id.
     pub host_id: Option<String>,
+    /// The name its saved password is kept under in the credential store:
+    /// its identity's, or its own.
+    pub secret: Option<String>,
 }
 
 /// Everything needed to open a session: from a saved host
@@ -104,8 +107,11 @@ pub struct Jump {
 pub struct Connection {
     /// The saved host this opens, if it is one.
     pub host: Option<String>,
-    /// That host's id, which its saved password is kept under.
+    /// That host's id.
     pub host_id: Option<String>,
+    /// The name its saved password is kept under in the credential store:
+    /// its identity's, or its own.
+    pub secret: Option<String>,
     pub target: Target,
     pub auth: Auth,
     /// The hosts to go through, first hop first.
@@ -150,6 +156,7 @@ impl Connection {
         Self {
             host: None,
             host_id: None,
+            secret: None,
             target,
             auth: identity.map_or(Auth::Agent, Auth::Key),
             jumps: Vec::new(),
@@ -1418,6 +1425,7 @@ mod tests {
         connection.jumps = ["gateway", "bastion"]
             .map(|host| Jump {
                 host_id: None,
+                secret: None,
                 target: Target {
                     host: host.into(),
                     ..target.clone()
@@ -1442,9 +1450,9 @@ mod tests {
 
         // A jump host that signs in with a password gets its own saved one.
         connection.jumps[1].auth = Auth::Password;
-        connection.jumps[1].host_id = Some("bastion-id".into());
+        connection.jumps[1].secret = Some("password bastion-id".into());
         let saved = |jump: &Jump| {
-            (jump.host_id.as_deref() == Some("bastion-id")).then(|| "jump-pw".to_string())
+            (jump.secret.as_deref() == Some("password bastion-id")).then(|| "jump-pw".to_string())
         };
         let request = connection.request(size, Some("pw"), None, saved);
         assert!(matches!(

@@ -49,6 +49,7 @@ enum SignIn {
 enum Menu {
     Group,
     Jump,
+    Identity,
 }
 
 /// The latest "Test connection" result.
@@ -93,6 +94,8 @@ pub struct HostEditor {
     key: Option<(PathBuf, Option<KeyInfo>)>,
     /// `Some("")` while switched on with no host chosen yet.
     jump: Option<String>,
+    /// An identity's id, whose user and sign-in the host uses.
+    identity: Option<String>,
     tags: Vec<String>,
     keep_alive: bool,
     agent_forwarding: bool,
@@ -199,6 +202,7 @@ impl HostEditor {
             sign_in,
             key,
             jump: draft.jump,
+            identity: draft.identity,
             tags: draft.tags,
             keep_alive: draft.keep_alive,
             agent_forwarding: draft.agent_forwarding,
@@ -232,6 +236,7 @@ impl HostEditor {
                 SignIn::Password => Auth::Password,
                 SignIn::Agent => Auth::Agent,
             },
+            identity: self.identity.clone(),
             jump: self.jump.clone(),
             proxy: self.proxy_on.then(|| text(&self.proxy)),
             tags: self.tags.clone(),
@@ -456,6 +461,15 @@ impl HostEditor {
         match menu {
             Menu::Group => self.group = value,
             Menu::Jump => self.jump = Some(value),
+            // By name; an empty one is the host's own sign-in.
+            Menu::Identity => {
+                self.identity = self
+                    .vault
+                    .identities
+                    .iter()
+                    .find(|identity| identity.name == value)
+                    .map(|identity| identity.id.clone())
+            }
         }
         self.menu = None;
         self.recheck(cx);
@@ -545,13 +559,47 @@ impl HostEditor {
 
     /// Who to sign in as, and how.
     fn sign_in_card(&self, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let identity = self
+            .identity
+            .as_deref()
+            .and_then(|id| self.vault.identity(id));
+        let shown: SharedString = match identity {
+            Some(identity) => format!("{} · {}", identity.name, identity.user).into(),
+            None => "Its own".into(),
+        };
+        let choices = std::iter::once((String::new(), Some("Its own".to_string())))
+            .chain(
+                self.vault
+                    .identities
+                    .iter()
+                    .map(|identity| (identity.name.clone(), Some(identity.user.clone()))),
+            )
+            .collect();
+        card(t)
+            // Offered once there are identities to choose.
+            .when(!self.vault.identities.is_empty(), |d| {
+                d.child(labelled("Identity", t).child(self.picker(
+                    "identity-picker",
+                    Menu::Identity,
+                    shown,
+                    identity.map(|identity| identity.name.clone()),
+                    choices,
+                    false,
+                    t,
+                    cx,
+                )))
+            })
+            .when(identity.is_none(), |d| self.own_sign_in(d, t, cx))
+    }
+
+    /// The username and sign-in method, for a host without an identity.
+    fn own_sign_in(&self, card: Div, t: &Theme, cx: &Context<Self>) -> Div {
         let methods = [
             (SignIn::Key, "SSH key", "sign-in-key"),
             (SignIn::Password, "Password", "sign-in-password"),
             (SignIn::Agent, "SSH agent", "sign-in-agent"),
         ];
-        card(t)
-            .child(self.field("Username", &self.user, Some(Field::User), true, t))
+        card.child(self.field("Username", &self.user, Some(Field::User), true, t))
             .child(
                 div()
                     .flex()

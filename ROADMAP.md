@@ -152,6 +152,13 @@ claude.ai account). Each item below names the artboard it comes from.
       can't ask for anything, so an untrusted key, a refused sign-in or
       a server's question shows as the rule's one-line reason.
       Connection errors now read as a few words everywhere
+- [x] Identities (item 5b): a Keys / Identities switch on the Keychain
+      screen; an identity is a name, a username and a sign-in (agent,
+      key file or password, the password in the system keychain), and a
+      host using one (an Identity picker in the editor) signs in as it,
+      jump hosts too; editing an identity changes every host that uses
+      it, it can't be deleted while one does, and identities sync with
+      hosts. Vault file version 8
 
 ## Known gaps in what's built
 
@@ -159,12 +166,6 @@ claude.ai account). Each item below names the artboard it comes from.
   Linux too, but the app itself hasn't been run there.
 
 ## Next, in order
-
-### 5b. Keychain, later
-- Identities (a user plus a key, reused by hosts), with a Keys / Identities
-  switch in the Keychain toolbar.
-- The "Include in encrypted sync" switch in a key's details comes with sync
-  (item 14).
 
 ### 14b. More sync providers
 - WebDAV / Nextcloud directly, without a desktop client: the same

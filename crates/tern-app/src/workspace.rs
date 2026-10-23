@@ -140,7 +140,7 @@ impl Workspace {
             };
             workspace.open_settings(page, window, cx);
         }
-        // `tern --show [keychain|snippets|forwarding|known-hosts|history]`
+        // `tern --show [keychain|identities|snippets|forwarding|known-hosts|history]`
         // opens the vault at that screen.
         let mut args = std::env::args().skip_while(|arg| arg != "--show");
         if args.next().is_some()

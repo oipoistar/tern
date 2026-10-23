@@ -33,6 +33,7 @@ use crate::bench;
 use crate::forwarding::{Alone, ForwardEvent, ForwardsView, States};
 use crate::history::{HistoryEvent, HistoryView};
 use crate::host_editor::{EditorEvent, HostEditor};
+use crate::identities::{IdentitiesView, IdentityEvent};
 use crate::keychain::{KeychainEvent, KeychainView};
 use crate::known_hosts::KnownHostsView;
 use crate::live::LiveSlots;
@@ -136,6 +137,9 @@ pub struct VaultContent {
     focus: FocusHandle,
     /// Screens, made when first shown.
     keychain: Option<Entity<KeychainView>>,
+    /// The Keychain screen shows identities instead of keys.
+    show_identities: bool,
+    identities: Option<Entity<IdentitiesView>>,
     snippets: Option<Entity<SnippetsView>>,
     forwards: Option<Entity<ForwardsView>>,
     known_hosts: Option<Entity<KnownHostsView>>,
@@ -236,11 +240,13 @@ impl VaultContent {
 
     /// Switches the screen beside the sidebar. Screens that show files
     /// read them again, for changes made meanwhile.
-    /// Shows the screen called `name` (`keychain`, `snippets`,
-    /// `forwarding`, `known-hosts`, `history`; anything else is Hosts).
+    /// Shows the screen called `name` (`keychain`, `identities`,
+    /// `snippets`, `forwarding`, `known-hosts`, `history`; anything else is
+    /// Hosts).
     pub fn show_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_identities = name == "identities";
         let section = match name {
-            "keychain" => Section::Keychain,
+            "keychain" | "identities" => Section::Keychain,
             "snippets" => Section::Snippets,
             "forwarding" => Section::Forwarding,
             "known-hosts" => Section::KnownHosts,
@@ -254,6 +260,22 @@ impl VaultContent {
         self.section = section;
         match section {
             Section::Hosts => self.refresh_keys(),
+            Section::Keychain if self.show_identities => match &self.identities {
+                Some(view) => {
+                    let identities = self.vault.identities.clone();
+                    view.update(cx, |view, cx| view.refresh(identities, cx));
+                }
+                None => {
+                    let identities = self.vault.identities.clone();
+                    let view = cx.new(|_| IdentitiesView::new(identities));
+                    self._screen_events.push(cx.subscribe_in(
+                        &view,
+                        window,
+                        Self::on_identity_event,
+                    ));
+                    self.identities = Some(view);
+                }
+            },
             Section::Keychain => match &self.keychain {
                 Some(view) => {
                     let vault = self.vault.clone();
@@ -507,6 +529,8 @@ impl VaultContent {
             filter_open: false,
             focus: cx.focus_handle(),
             keychain: None,
+            show_identities: false,
+            identities: None,
             snippets: None,
             forwards: None,
             known_hosts: None,
@@ -828,16 +852,15 @@ impl VaultContent {
         };
         // Saved passwords only: nothing here can ask for one.
         let store = sync::secrets(cx);
-        let saved =
-            |id: Option<&str>| id.and_then(|id| store.load(&tern_core::secrets::host_password(id)));
+        let saved = |secret: Option<&str>| secret.and_then(|secret| store.load(secret));
         let password = (connection.auth == Auth::Password)
-            .then(|| saved(connection.host_id.as_deref()))
+            .then(|| saved(connection.secret.as_deref()))
             .flatten();
         let mut request = connection.request(
             TermSize { cols: 80, rows: 24 },
             password.as_deref(),
             None,
-            |jump| saved(jump.host_id.as_deref()),
+            |jump| saved(jump.secret.as_deref()),
         );
         request.forwards = vec![forward.clone()];
         request.shell = false;
@@ -1198,6 +1221,109 @@ impl VaultContent {
         if let Some(view) = &self.snippets {
             view.update(cx, |view, cx| view.open_form(None, window, cx));
         }
+    }
+
+    /// The Keychain screen: a Keys / Identities switch over the one shown.
+    fn keychain_screen(&self, t: &Theme, cx: &Context<Self>) -> AnyElement {
+        let parts = [
+            (false, "Keys", "keychain-keys"),
+            (true, "Identities", "keychain-identities"),
+        ];
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div().flex().child(
+                    div()
+                        .flex()
+                        .gap(px(4.))
+                        .p(px(4.))
+                        .rounded(px(14.))
+                        .bg(t.card2)
+                        .children(parts.into_iter().map(|(identities, label, id)| {
+                            let on = self.show_identities == identities;
+                            div()
+                                .id(id)
+                                .debug_selector(move || id.into())
+                                .h(px(34.))
+                                .px(px(16.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(11.))
+                                .text_size(px(13.))
+                                .font_weight(if on {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(if on { t.text } else { t.text2 })
+                                .when(on, |d| d.bg(t.card).shadow(t.shadow_sm()))
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.show_identities = identities;
+                                    this.show(Section::Keychain, window, cx);
+                                    cx.notify();
+                                }))
+                        })),
+                ),
+            )
+            .child(div().flex_1().min_h_0().flex().map(|d| {
+                match (self.show_identities, &self.identities, &self.keychain) {
+                    (true, Some(view), _) => d.child(view.clone()),
+                    (false, _, Some(view)) => d.child(view.clone()),
+                    _ => d,
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Saves or deletes an identity from the Keychain screen; a password
+    /// goes to the system's credential store, never the vault file.
+    fn on_identity_event(
+        &mut self,
+        view: &Entity<IdentitiesView>,
+        event: &IdentityEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = sync::secrets(cx);
+        match event {
+            IdentityEvent::Save {
+                identity,
+                password,
+                save_password,
+            } => {
+                let name = tern_core::identity::identity_password(&identity.id);
+                if identity.auth == Auth::Password && *save_password {
+                    if let Some(password) = password {
+                        let _ = store.store(&name, password);
+                    }
+                } else {
+                    let _ = store.forget(&name);
+                }
+                self.vault.save_identity(identity.clone());
+            }
+            IdentityEvent::Delete(id) => match self.vault.delete_identity(id) {
+                Ok(()) => {
+                    let _ = store.forget(&tern_core::identity::identity_password(id));
+                }
+                Err(users) => {
+                    let verb = if users.len() == 1 { "uses" } else { "use" };
+                    let problem = format!("{} {verb} this identity", users.join(", "));
+                    view.update(cx, |view, cx| view.refuse(problem, cx));
+                    return;
+                }
+            },
+        }
+        self.persist(cx);
+        let identities = self.vault.identities.clone();
+        view.update(cx, |view, cx| view.refresh(identities, cx));
+        cx.notify();
     }
 
     fn on_snippet_event(
@@ -1919,13 +2045,16 @@ impl Render for VaultContent {
             theme: &theme,
             live: &self.live,
         };
-        let screen: Option<AnyView> = match self.section {
+        let screen: Option<AnyElement> = match self.section {
             Section::Hosts => None,
-            Section::Keychain => self.keychain.clone().map(Into::into),
-            Section::Snippets => self.snippets.clone().map(Into::into),
-            Section::Forwarding => self.forwards.clone().map(Into::into),
-            Section::KnownHosts => self.known_hosts.clone().map(Into::into),
-            Section::History => self.history_view.clone().map(Into::into),
+            Section::Keychain => Some(self.keychain_screen(&theme, cx)),
+            Section::Snippets => self.snippets.clone().map(|view| view.into_any_element()),
+            Section::Forwarding => self.forwards.clone().map(|view| view.into_any_element()),
+            Section::KnownHosts => self.known_hosts.clone().map(|view| view.into_any_element()),
+            Section::History => self
+                .history_view
+                .clone()
+                .map(|view| view.into_any_element()),
         };
         div()
             .id("vault")
@@ -2266,6 +2395,71 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn hosts_share_identities(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        use tern_core::identity::identity_password;
+        use tern_core::secrets::{MemorySecrets, Secrets as _};
+
+        use crate::sync::SecretsStore;
+
+        let (vault, cx, _) = open_vault(cx);
+        let secrets = Arc::new(MemorySecrets::default());
+        let kept = secrets.clone();
+        cx.update(|_, cx| cx.set_global(SecretsStore(secrets)));
+        // Types into the identity form's field: name, user, key, password.
+        let type_into = |cx: &mut VisualTestContext, field: usize, text: &str| {
+            cx.update(|window, cx| {
+                let view = vault
+                    .read(cx)
+                    .identities
+                    .clone()
+                    .expect("the screen is open");
+                let input = view.read(cx).inputs().expect("the form is open")[field].clone();
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_input(text);
+        };
+
+        click(cx, "nav-keychain");
+        click(cx, "keychain-identities");
+        click(cx, "new-identity");
+        type_into(cx, 0, "ops");
+        type_into(cx, 1, "operator");
+        click(cx, "identity-password");
+        type_into(cx, 3, "s3cret");
+        click(cx, "save-identity");
+        let ops = vault.read_with(cx, |vault, _| vault.vault.identities[0].clone());
+        assert_eq!((ops.name.as_str(), ops.user.as_str()), ("ops", "operator"));
+        assert_eq!(
+            kept.load(&identity_password(&ops.id)).as_deref(),
+            Some("s3cret")
+        );
+
+        // A host takes the identity's user and sign-in.
+        click(cx, "nav-hosts");
+        click(cx, "host-prod-db-01");
+        click(cx, "edit-host");
+        click(cx, "identity-picker");
+        click(cx, "identity-picker-ops");
+        click(cx, "save-host");
+        vault.read_with(cx, |vault, _| {
+            let host = vault.vault.find("prod-db-01").unwrap();
+            assert_eq!(host.identity.as_deref(), Some(ops.id.as_str()));
+            let connection = vault.vault.connection(host).unwrap();
+            assert_eq!(connection.target.user, "operator");
+            assert_eq!(connection.secret, Some(identity_password(&ops.id)));
+        });
+
+        // Deleting it is refused while a host uses it.
+        click(cx, "nav-keychain");
+        click(cx, "identity-0");
+        click(cx, "delete-identity");
+        vault.read_with(cx, |vault, _| assert_eq!(vault.vault.identities.len(), 1));
     }
 
     #[gpui::test]

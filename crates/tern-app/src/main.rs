@@ -4,6 +4,7 @@ mod files;
 mod forwarding;
 mod history;
 mod host_editor;
+mod identities;
 mod keychain;
 mod known_hosts;
 mod live;

@@ -57,6 +57,10 @@ pub struct Host {
     pub tags: Vec<String>,
     #[serde(default)]
     pub auth: Auth,
+    /// An identity (by id) whose user and sign-in this host uses instead
+    /// of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     /// Another saved host to connect through first, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
@@ -118,6 +122,7 @@ impl Host {
             os: String::new(),
             tags: Vec::new(),
             auth: Auth::Agent,
+            identity: None,
             jump: None,
             proxy: None,
             keep_alive: true,

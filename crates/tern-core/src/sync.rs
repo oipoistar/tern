@@ -22,6 +22,7 @@ use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, HostGroup, new_id, now_ms};
+use crate::identity::Identity;
 use crate::keys::{self, KeyPair};
 use crate::paths;
 use crate::settings::{Appearance, Settings, TerminalSettings};
@@ -109,6 +110,9 @@ pub struct Snapshot {
     pub hosts: Vec<SyncedHost>,
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+    /// Identities travel with hosts.
+    #[serde(default)]
+    pub identities: Vec<Identity>,
     #[serde(default)]
     pub deleted: Vec<Tombstone>,
     #[serde(default)]
@@ -195,6 +199,11 @@ pub fn snapshot(vault: &Vault, settings: &Settings, keys: Vec<SyncedKey>) -> Sna
         hosts,
         snippets: if sync.snippets {
             vault.snippets.clone()
+        } else {
+            Vec::new()
+        },
+        identities: if sync.hosts {
+            vault.identities.clone()
         } else {
             Vec::new()
         },
@@ -316,6 +325,25 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
     }
     snippets.retain(|snippet| !gone(&snippet.id, snippet.updated));
 
+    let mut identities = local.identities.clone();
+    if sync.hosts {
+        for snapshot in others.iter().filter(|snapshot| snapshot.has_hosts) {
+            for incoming in &snapshot.identities {
+                match identities
+                    .iter()
+                    .position(|identity| identity.id == incoming.id)
+                {
+                    Some(index) if incoming.updated > identities[index].updated => {
+                        identities[index] = incoming.clone()
+                    }
+                    Some(_) => {}
+                    None => identities.push(incoming.clone()),
+                }
+            }
+        }
+    }
+    identities.retain(|identity| !gone(&identity.id, identity.updated));
+
     let mut tombstones: Vec<Tombstone> = deleted
         .into_iter()
         .map(|(id, at)| Tombstone { id, at })
@@ -346,6 +374,7 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
         vault: Vault {
             groups,
             snippets,
+            identities,
             deleted: tombstones,
         },
         settings: newer,
@@ -545,6 +574,26 @@ mod tests {
         );
         assert!(Syncer::new("wrong").unseal(&sealed).is_err());
         assert!(Syncer::new("x").unseal(b"TERNSYN1short").is_err());
+    }
+
+    #[test]
+    fn identities_travel_with_hosts() {
+        use crate::host::Auth;
+        use crate::identity::Identity;
+
+        let (here, mut there) = pair();
+        let ops = Identity::new("ops", "operator", Auth::Agent);
+        there.save_identity(ops.clone());
+        let from_there = snapshot(&there, &settings("There"), Vec::new());
+        let merged = merge(&here, &settings("Here"), &[from_there]).vault;
+        assert_eq!(merged.identities.len(), 1);
+        assert_eq!(merged.identities[0].id, ops.id);
+
+        // A deletion there removes it here too.
+        there.delete_identity(&ops.id).unwrap();
+        let from_there = snapshot(&there, &settings("There"), Vec::new());
+        let merged = merge(&merged, &settings("Here"), &[from_there]).vault;
+        assert!(merged.identities.is_empty());
     }
 
     #[test]

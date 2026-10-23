@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 auth: key.map_or(Auth::Agent, Auth::Key),
                 host_id: None,
+                secret: None,
             });
         }
     }
