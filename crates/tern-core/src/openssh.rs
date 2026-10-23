@@ -286,15 +286,24 @@ type Settings<'a> = HashMap<&'a str, Vec<&'a [String]>>;
 
 /// What OpenSSH uses for `name` (an alias, or an address as given): the
 /// first value of each setting (all of them for additive ones) from the
-/// blocks that match, in file order. `ProxyJump` and `ProxyCommand` count
-/// as one setting, as the first of them wins.
+/// blocks that match, in file order. As in OpenSSH, a `ProxyCommand` also
+/// keeps any later `ProxyJump` out, and a `ProxyJump` other than `none` a
+/// later `ProxyCommand`.
 fn resolve<'a>(blocks: &'a [Block], name: &str) -> Settings<'a> {
-    const PROXIES: [&str; 2] = ["proxyjump", "proxycommand"];
     let mut found: Settings = HashMap::new();
     for block in blocks.iter().filter(|block| block.matches(name)) {
         for (keyword, arguments) in &block.settings {
             let keyword = keyword.as_str();
-            if PROXIES.contains(&keyword) && PROXIES.iter().any(|set| found.contains_key(set)) {
+            let kept_out = match keyword {
+                "proxyjump" => found.contains_key("proxycommand"),
+                "proxycommand" => found
+                    .get("proxyjump")
+                    .and_then(|values| values.first())
+                    .and_then(|arguments| arguments.first())
+                    .is_some_and(|jumps| !jumps.eq_ignore_ascii_case("none")),
+                _ => false,
+            };
+            if kept_out {
                 continue;
             }
             let values = found.entry(keyword).or_default();
@@ -549,12 +558,12 @@ fn to_hosts(blocks: &[Block], dir: &Path, user: &str) -> Vec<Host> {
 /// `ProxyCommand` when that's `nc` or `ssh -W`; otherwise directly.
 fn config_route(settings: &Settings) -> Route {
     let first = |keyword: &str| settings.get(keyword).and_then(|values| values.first());
-    if let Some(list) = first("proxyjump").and_then(|arguments| arguments.first()) {
-        return proxy_jump(list).unwrap_or_default();
+    match first("proxyjump").and_then(|arguments| arguments.first()) {
+        Some(list) if !list.eq_ignore_ascii_case("none") => proxy_jump(list).unwrap_or_default(),
+        _ => first("proxycommand")
+            .and_then(|words| command_route(words))
+            .unwrap_or_default(),
     }
-    first("proxycommand")
-        .and_then(|words| command_route(words))
-        .unwrap_or_default()
 }
 
 /// The jump hosts of a `ProxyJump` value or `-J`: hops separated by
@@ -1154,9 +1163,11 @@ Host proxied
     ProxyCommand nc -x socks.lan:1080 %h %p
 Host jumped
     ProxyJump gw.lan
-Host direct
+Host no-jump
     ProxyJump none
-Host * !gw.lan
+Host no-command
+    ProxyCommand none
+Host * !gw.lan !other.lan
     ProxyJump gw.lan
     ProxyCommand ssh -W %h:%p other.lan
 "#;
@@ -1164,8 +1175,9 @@ Host * !gw.lan
         let proxied = find(&hosts, "proxied");
         assert!(proxied.proxy.is_some() && proxied.jump.is_none());
         assert_eq!(find(&hosts, "jumped").jump.as_deref(), Some("gw.lan"));
-        assert_eq!(find(&hosts, "direct").jump, None);
-        assert!(hosts.iter().all(|host| host.name != "other.lan"));
+        // `ProxyJump none` keeps out a later ProxyJump, not a ProxyCommand.
+        assert_eq!(find(&hosts, "no-jump").jump.as_deref(), Some("other.lan"));
+        assert_eq!(find(&hosts, "no-command").jump, None);
     }
 
     #[test]
