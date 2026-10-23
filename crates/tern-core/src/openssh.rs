@@ -149,6 +149,14 @@ fn read_lines(text: &str, dir: &Path, blocks: &mut Vec<Block>, depth: usize) {
         let Some((keyword, arguments)) = split_line(line) else {
             continue;
         };
+        let Some(arguments) = arguments else {
+            // OpenSSH refuses a line whose quotes don't close; it sets
+            // nothing here, and a `Host` line's block applies to no host.
+            if keyword == "host" {
+                blocks.push(Block::default());
+            }
+            continue;
+        };
         match keyword.as_str() {
             "host" => blocks.push(Block {
                 patterns: arguments,
@@ -174,9 +182,10 @@ fn read_lines(text: &str, dir: &Path, blocks: &mut Vec<Block>, depth: usize) {
     }
 }
 
-/// A line's keyword (lowercased) and arguments; `None` for blank lines and
-/// comments. Keywords end at a space or `=`; arguments may be quoted.
-fn split_line(line: &str) -> Option<(String, Vec<String>)> {
+/// A line's keyword (lowercased) and its arguments as [`words`] splits
+/// them; `None` for blank lines and comments. The keyword ends at a space
+/// or `=`.
+fn split_line(line: &str) -> Option<(String, Option<Vec<String>>)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -187,31 +196,43 @@ fn split_line(line: &str) -> Option<(String, Vec<String>)> {
     let keyword = line[..end].to_lowercase();
     let rest = line[end..].trim_start();
     let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
-    let mut arguments = Vec::new();
-    let mut word = String::new();
-    let (mut quoted, mut started) = (false, false);
-    for c in rest.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                started = true;
-            }
-            c if c.is_whitespace() && !quoted => {
-                if started {
-                    arguments.push(std::mem::take(&mut word));
-                    started = false;
-                }
-            }
-            c => {
-                word.push(c);
-                started = true;
+    Some((keyword, words(rest)))
+}
+
+/// Arguments as OpenSSH splits them: at spaces outside quotes ('…' or
+/// "…"), with `\` before a quote, a backslash or (outside quotes) a space
+/// taking that character as it is, any other `\` kept (`C:\tools`), and a
+/// `#` that starts a word beginning a comment that ends the line. `None`
+/// when a quote isn't closed.
+fn words(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|&c| c == ' ' || c == '\t').is_some() {}
+        if chars.peek().is_none_or(|&c| c == '#') {
+            return Some(words);
+        }
+        let mut word = String::new();
+        let mut quote = None;
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next_if(|&next| {
+                    matches!(next, '\'' | '"' | '\\') || (next == ' ' && quote.is_none())
+                }) {
+                    Some(next) => word.push(next),
+                    None => word.push(c),
+                },
+                ' ' | '\t' if quote.is_none() => break,
+                '\'' | '"' if quote.is_none() => quote = Some(c),
+                c if Some(c) == quote => quote = None,
+                c => word.push(c),
             }
         }
+        if quote.is_some() {
+            return None;
+        }
+        words.push(word);
     }
-    if started {
-        arguments.push(word);
-    }
-    Some((keyword, arguments))
 }
 
 /// The files an `Include` names: `~` is the home folder, relative names are
@@ -704,6 +725,47 @@ Host *
         // Wildcards and Match blocks aren't hosts.
         assert!(hosts.iter().all(|host| !host.name.contains('*')));
         assert!(hosts.iter().all(|host| host.name != "other"));
+    }
+
+    #[test]
+    fn leaves_out_comments_after_arguments() {
+        let config = r#"
+Host build01.lan  # CI runner
+    User ci # the robot
+    ProxyCommand ssh -W %h:%p bastion # old
+Host bastion
+    HostName 10.0.0.1 #office
+    SetEnv "NOTE=#1 # not a comment" TAG=a#b # a comment
+Host "unclosed
+    User nobody
+"#;
+        let hosts = importable(&Vault::default(), config, Path::new("."), "me");
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, ["build01.lan", "bastion"]);
+        let build = find(&hosts, "build01.lan");
+        assert_eq!(build.target(), "ci@build01.lan");
+        assert_eq!(build.jump.as_deref(), Some("bastion"));
+        let bastion = find(&hosts, "bastion");
+        assert_eq!(bastion.target(), "me@10.0.0.1");
+        assert_eq!(bastion.env["NOTE"], "#1 # not a comment");
+        assert_eq!(bastion.env["TAG"], "a#b");
+        assert_eq!(bastion.env.len(), 2);
+    }
+
+    #[test]
+    fn splits_arguments_as_openssh_does() {
+        let split = |text: &str| words(text).map(|words| words.join("|"));
+        assert_eq!(
+            split(r#"a "b c" 'd "e"' f\ g"#).as_deref(),
+            Some(r#"a|b c|d "e"|f g"#)
+        );
+        assert_eq!(
+            split(r#"x=\"q\" C:\tools 'it\'s' "a\\b""#).as_deref(),
+            Some(r#"x="q"|C:\tools|it's|a\b"#)
+        );
+        assert_eq!(split("one #two three").as_deref(), Some("one"));
+        assert_eq!(split(r##"a#b "#c""##).as_deref(), Some("a#b|#c"));
+        assert_eq!(split("'open"), None);
     }
 
     #[test]
