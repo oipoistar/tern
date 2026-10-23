@@ -621,7 +621,9 @@ fn port_number(text: &str) -> Option<u16> {
 
 /// `host` as one `ssh` command line, for a terminal without Tern: its
 /// port, key, jump hosts (`-J`), agent forwarding, proxy and the rules
-/// switched on. A key path with spaces is quoted.
+/// switched on. A key path with spaces is quoted. OpenSSH ignores a
+/// `ProxyCommand` beside `-J`, so when the first jump host is behind a
+/// proxy, the jump hosts are a `ProxyCommand` too (see [`through`]).
 pub fn ssh_command(vault: &Vault, host: &Host) -> String {
     let (user, auth, _) = vault.sign_in(host);
     let mut words = vec!["ssh".to_string()];
@@ -631,17 +633,18 @@ pub fn ssh_command(vault: &Vault, host: &Host) -> String {
     if let Auth::Key(path) = &auth {
         words.push(format!("-i {}", quote(&path.display().to_string())));
     }
-    let jumps = jump_list(vault, host);
-    if !jumps.is_empty() {
-        words.push(format!("-J {jumps}"));
+    let jumps = vault.jumps(host).unwrap_or_default();
+    let proxy = jumps.first().copied().unwrap_or(host).proxy.as_ref();
+    if proxy.is_none() && !jumps.is_empty() {
+        words.push(format!("-J {}", jump_list(vault, &jumps)));
     }
     if host.agent_forwarding {
         words.push("-A".into());
     }
-    if let Some(proxy) = &vault.first_hop_host(host).proxy {
+    if let Some(proxy) = proxy {
         words.push(format!(
             "-o {}",
-            quote(&format!("ProxyCommand={}", proxy_command(proxy)))
+            quote(&format!("ProxyCommand={}", through(vault, &jumps, proxy)))
         ));
     }
     for forward in host.forwards.iter().filter(|forward| forward.on) {
@@ -651,15 +654,87 @@ pub fn ssh_command(vault: &Vault, host: &Host) -> String {
     words.join(" ")
 }
 
-/// `host` as a `Host` block for `~/.ssh/config`, which the importer reads
-/// back as the same host.
+/// A `ProxyCommand` that reaches a host behind `hops` (first hop first),
+/// the first of them through `proxy`: `ssh -W` to the last hop, with a
+/// `ProxyCommand` of its own that reaches it the same way, its `%` doubled
+/// as it's expanded once more. Without hops, `nc` through the proxy.
+fn through(vault: &Vault, hops: &[&Host], proxy: &Proxy) -> String {
+    let Some((last, before)) = hops.split_last() else {
+        return proxy_command(proxy);
+    };
+    let inner = through(vault, before, proxy).replace('%', "%%");
+    let (user, auth, _) = vault.sign_in(last);
+    let mut words = vec![
+        "ssh -o".to_string(),
+        sh_quote(&format!("ProxyCommand={inner}")),
+    ];
+    if last.port != 22 {
+        words.push(format!("-p {}", last.port));
+    }
+    if let Auth::Key(path) = &auth {
+        words.push(format!("-i {}", sh_quote(&path.display().to_string())));
+    }
+    words.push(format!("-W {}", sh_quote("[%h]:%p")));
+    words.push(sh_quote(&format!("{user}@{}", last.address)));
+    words.join(" ")
+}
+
+/// `host` as a `Host` block for `~/.ssh/config`, then one for each host it
+/// goes through, nearest first, each naming the next in its `ProxyJump`:
+/// the importer reads them back as the same hosts. The first jump host's
+/// proxy is its own block's `ProxyCommand`, as OpenSSH ignores one beside
+/// a `ProxyJump`.
 pub fn config_block(vault: &Vault, host: &Host) -> String {
+    let mut chain = vec![host];
+    chain.extend(vault.jumps(host).unwrap_or_default().into_iter().rev());
+    let mut aliases: Vec<String> = Vec::new();
+    for via in &chain {
+        let alias = alias_of(&via.name);
+        // `ProxyJump none` would mean no jump host at all.
+        let taken = |name: &str| {
+            name.eq_ignore_ascii_case("none")
+                || aliases.iter().any(|have| have.eq_ignore_ascii_case(name))
+        };
+        let alias = (1..)
+            .map(|n| match n {
+                1 => alias.clone(),
+                n => format!("{alias}-{n}"),
+            })
+            .find(|name| !taken(name))
+            .expect("an unused alias");
+        aliases.push(alias);
+    }
+    chain
+        .iter()
+        .zip(&aliases)
+        .enumerate()
+        .map(|(at, (via, alias))| host_block(vault, via, alias, aliases.get(at + 1)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A `Host` alias for a host called `name`, which `ProxyJump` can name
+/// too: its letters, digits, `.` and `_`, with a `-` for any run of other
+/// characters between them.
+fn alias_of(name: &str) -> String {
+    let mut alias = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() || matches!(c, '.' | '_') {
+            alias.push(c);
+        } else if !alias.is_empty() && !alias.ends_with('-') {
+            alias.push('-');
+        }
+    }
+    match alias.trim_end_matches('-') {
+        "" => "host".to_string(),
+        alias => alias.to_string(),
+    }
+}
+
+/// `host`'s `Host` block under `alias`: through the host whose alias is
+/// `jump`, if any, otherwise through its proxy.
+fn host_block(vault: &Vault, host: &Host, alias: &str, jump: Option<&String>) -> String {
     let (user, auth, _) = vault.sign_in(host);
-    let alias: String = host
-        .name
-        .chars()
-        .map(|c| if c.is_whitespace() { '-' } else { c })
-        .collect();
     let mut lines = vec![
         format!("Host {alias}"),
         format!("    HostName {}", host.address),
@@ -674,9 +749,8 @@ pub fn config_block(vault: &Vault, host: &Host) -> String {
             config_quote(&path.display().to_string())
         ));
     }
-    let jumps = jump_list(vault, host);
-    if !jumps.is_empty() {
-        lines.push(format!("    ProxyJump {jumps}"));
+    if let Some(jump) = jump {
+        lines.push(format!("    ProxyJump {jump}"));
     } else if let Some(proxy) = &host.proxy {
         lines.push(format!("    ProxyCommand {}", proxy_command(proxy)));
     }
@@ -710,13 +784,11 @@ pub fn config_block(vault: &Vault, host: &Host) -> String {
     lines.join("\n") + "\n"
 }
 
-/// `host`'s jump hosts as `-J` and `ProxyJump` take them: `user@host:port`,
-/// first hop first, comma-separated.
-fn jump_list(vault: &Vault, host: &Host) -> String {
-    vault
-        .jumps(host)
-        .unwrap_or_default()
-        .into_iter()
+/// Jump hosts (first hop first) as `-J` takes them: `user@host:port`,
+/// comma-separated.
+fn jump_list(vault: &Vault, jumps: &[&Host]) -> String {
+    jumps
+        .iter()
         .map(|via| {
             let (user, _, _) = vault.sign_in(via);
             if via.port == 22 {
@@ -749,12 +821,31 @@ fn proxy_command(proxy: &Proxy) -> String {
     format!("nc -X {kind} -x {}:{} %h %p", proxy.host, proxy.port)
 }
 
-/// `text` in double quotes when it has spaces.
+/// `text` as one word for the shell a command is pasted into: in double
+/// quotes when it has spaces, or as [`sh_quote`] has it when it holds a
+/// double quote itself.
 fn quote(text: &str) -> String {
-    if text.contains(char::is_whitespace) {
+    if text.contains('"') {
+        sh_quote(text)
+    } else if text.contains(char::is_whitespace) {
         format!("\"{text}\"")
     } else {
         text.to_string()
+    }
+}
+
+/// `text` as one word for `sh`, which runs a `ProxyCommand`, read the same
+/// way by OpenSSH's own check of the line: as it is when plain, otherwise
+/// in single quotes, with a quote inside as `'"'"'` (never a backslash).
+fn sh_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r#"'"'"'"#))
     }
 }
 
@@ -1365,23 +1456,139 @@ Host *
             block.starts_with("Host prod-db\n    HostName 10.0.4.21\n"),
             "{block}"
         );
-        assert!(
-            block.contains("    ProxyJump admin@bastion.example.com:2222\n"),
-            "{block}"
-        );
+        assert!(block.contains("    ProxyJump bastion\n"), "{block}");
         assert!(
             block.contains("    LocalForward 5433 localhost:5432\n"),
             "{block}"
         );
+        // The jump host follows, in a block of its own.
+        assert!(
+            block.contains(
+                "\n\nHost bastion\n    HostName bastion.example.com\n    User admin\n    Port 2222\n"
+            ),
+            "{block}"
+        );
 
-        // Read back, it's the same host.
+        // Read back, they're the same hosts.
         let read = importable(&Vault::default(), &block, Path::new("."), "someone");
-        let again = read.iter().find(|host| host.name == "prod-db").unwrap();
+        let again = find(&read, "prod-db");
         assert_eq!(again.target(), "deploy@10.0.4.21");
         assert!(again.agent_forwarding && !again.keep_alive);
         assert_eq!(again.env, db.env);
         assert_eq!(again.forwards.len(), 1);
-        assert_eq!(again.jump.as_deref(), Some("bastion.example.com"));
+        assert_eq!(again.jump.as_deref(), Some("bastion"));
+        let bastion = find(&read, "bastion");
+        assert_eq!(bastion.target(), "admin@bastion.example.com:2222");
+        assert_eq!(read.len(), 2);
+    }
+
+    /// prod db through bastion, which goes through gw, which is behind a
+    /// SOCKS proxy.
+    fn chain_behind_a_proxy() -> (Vault, Host) {
+        let mut vault = Vault::default();
+        let mut gw = Host::new("gw", "ops", "gw.example.com", 22);
+        gw.proxy = Some(Proxy::parse("socks5://socks.lan:1080").unwrap());
+        vault.save(None, gw, "Prod");
+        let mut bastion = Host::new("bastion", "admin", "bastion.example.com", 2222);
+        bastion.jump = Some("gw".into());
+        bastion.auth = Auth::Key(PathBuf::from("/keys/id bastion"));
+        vault.save(None, bastion, "Prod");
+        let mut db = Host::new("prod db", "deploy", "10.0.4.21", 22);
+        db.jump = Some("bastion".into());
+        vault.save(None, db.clone(), "Prod");
+        (vault, db)
+    }
+
+    /// What the importer makes of a command's `-o ProxyCommand=…`, as a
+    /// host "back" at `user@address`.
+    fn read_command(command: &str, user: &str, address: &str) -> Vec<Host> {
+        let words = words(command).unwrap();
+        let at = words.iter().position(|word| word == "-o").unwrap();
+        let config = format!(
+            "Host back\n    HostName {address}\n    User {user}\n    {}\n",
+            words[at + 1]
+        );
+        importable(&Vault::default(), &config, Path::new("."), "someone")
+    }
+
+    #[test]
+    fn keeps_the_first_jump_hosts_proxy_in_the_command() {
+        let mut vault = Vault::default();
+        let mut bastion = Host::new("bastion", "admin", "bastion.example.com", 2222);
+        bastion.proxy = Some(Proxy::parse("socks5://socks.lan:1080").unwrap());
+        vault.save(None, bastion, "Prod");
+        let mut db = Host::new("prod db", "deploy", "10.0.4.21", 22);
+        db.jump = Some("bastion".into());
+        vault.save(None, db.clone(), "Prod");
+        // OpenSSH ignores a ProxyCommand beside -J, so the jump host is
+        // one, with the proxy in its own.
+        let command = ssh_command(&vault, &db);
+        assert_eq!(
+            command,
+            "ssh -o \"ProxyCommand=ssh -o 'ProxyCommand=nc -X 5 -x socks.lan:1080 %%h %%p' \
+             -p 2222 -W '[%h]:%p' admin@bastion.example.com\" deploy@10.0.4.21"
+        );
+        let read = read_command(&command, "deploy", "10.0.4.21");
+        let bastion = jump_of(&read, "back");
+        assert_eq!(bastion.target(), "admin@bastion.example.com:2222");
+        assert_eq!(bastion.proxy, vault.find("bastion").unwrap().proxy);
+
+        // Through two, the first behind the proxy.
+        let (vault, db) = chain_behind_a_proxy();
+        let command = ssh_command(&vault, &db);
+        let read = read_command(&command, "deploy", "10.0.4.21");
+        let bastion = jump_of(&read, "back");
+        assert_eq!(bastion.target(), "admin@bastion.example.com:2222");
+        assert!(
+            matches!(&bastion.auth, Auth::Key(path) if path.ends_with("id bastion")),
+            "{command}"
+        );
+        let gw = jump_of(&read, &bastion.name);
+        assert_eq!(gw.target(), "ops@gw.example.com");
+        assert_eq!(gw.proxy, vault.find("gw").unwrap().proxy);
+        assert_eq!(gw.jump, None);
+    }
+
+    #[test]
+    fn keeps_the_first_jump_hosts_proxy_in_the_config() {
+        let (vault, db) = chain_behind_a_proxy();
+        let block = config_block(&vault, &db);
+        assert_eq!(
+            block,
+            "Host prod-db\n    HostName 10.0.4.21\n    User deploy\n    ProxyJump bastion\n    \
+             ServerAliveInterval 30\n\n\
+             Host bastion\n    HostName bastion.example.com\n    User admin\n    Port 2222\n    \
+             IdentityFile \"/keys/id bastion\"\n    ProxyJump gw\n    ServerAliveInterval 30\n\n\
+             Host gw\n    HostName gw.example.com\n    User ops\n    \
+             ProxyCommand nc -X 5 -x socks.lan:1080 %h %p\n    ServerAliveInterval 30\n"
+        );
+
+        let read = importable(&Vault::default(), &block, Path::new("."), "someone");
+        assert_eq!(read.len(), 3);
+        assert_eq!(find(&read, "prod-db").jump.as_deref(), Some("bastion"));
+        let bastion = find(&read, "bastion");
+        assert_eq!(bastion.jump.as_deref(), Some("gw"));
+        assert!(matches!(&bastion.auth, Auth::Key(path) if path.ends_with("id bastion")));
+        let gw = find(&read, "gw");
+        assert_eq!(gw.proxy, vault.find("gw").unwrap().proxy);
+        assert_eq!(gw.jump, None);
+    }
+
+    #[test]
+    fn gives_each_block_an_alias_of_its_own() {
+        let mut vault = Vault::default();
+        vault.save(None, Host::new("none", "a", "first.lan", 22), "Mine");
+        let mut middle = Host::new("prod-db", "b", "second.lan", 22);
+        middle.jump = Some("none".into());
+        vault.save(None, middle, "Mine");
+        let mut host = Host::new("prod db", "c", "third.lan", 22);
+        host.jump = Some("prod-db".into());
+        vault.save(None, host.clone(), "Mine");
+        let block = config_block(&vault, &host);
+        let read = importable(&Vault::default(), &block, Path::new("."), "someone");
+        assert_eq!(find(&read, "prod-db").jump.as_deref(), Some("prod-db-2"));
+        assert_eq!(find(&read, "prod-db-2").jump.as_deref(), Some("none-2"));
+        assert_eq!(find(&read, "none-2").target(), "a@first.lan");
     }
 
     #[test]
