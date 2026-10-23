@@ -233,7 +233,7 @@ fn rect(bounds: Bounds<Pixels>, x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels
 
 /// Dots are rounded quads, which GPUI instances on the GPU; paths would need
 /// tessellating on the CPU.
-fn dot(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) {
+pub fn dot(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) {
     window.paint_quad(quad(
         Bounds::new(
             point(center.x - px(radius), center.y - px(radius)),
@@ -247,7 +247,7 @@ fn dot(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) {
     ));
 }
 
-fn ring(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) {
+pub fn ring(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) {
     window.paint_quad(quad(
         Bounds::new(
             point(center.x - px(radius), center.y - px(radius)),

@@ -2274,21 +2274,32 @@ impl Workspace {
                 .pr(px(4.))
                 .child(phase_glyph(&terminal.phase, theme))
                 .child(div().max_w(px(180.)).truncate().child(terminal.title()))
-                // A tab not on screen shows a bell if one rang there, or a dot
-                // for output it hasn't shown.
+                // A tab not on screen shows a bell if one rang there, a check
+                // if a long command finished, or a dot for output it hasn't
+                // shown.
                 .when(self.active != Some(index), |d| {
                     let panes = session.panes.iter().map(|pane| pane.read(cx));
-                    let (rang, unseen) = panes.fold((false, false), |(rang, unseen), pane| {
-                        (rang || pane.rang, unseen || pane.unseen)
-                    });
+                    let (rang, finished, unseen) =
+                        panes.fold((false, false, false), |(rang, finished, unseen), pane| {
+                            (
+                                rang || pane.rang,
+                                finished || pane.finished.is_some(),
+                                unseen || pane.unseen,
+                            )
+                        });
                     let id = format!("activity-{index}");
-                    match (rang, unseen) {
-                        (true, _) => d.child(div().debug_selector(move || id).child(icon(
+                    match (rang, finished, unseen) {
+                        (true, _, _) => d.child(div().debug_selector(move || id).child(icon(
                             IconName::Bell,
                             12.,
                             theme.text,
                         ))),
-                        (false, true) => d.child(
+                        (false, true, _) => d.child(div().debug_selector(move || id).child(icon(
+                            IconName::Check,
+                            12.,
+                            theme.text,
+                        ))),
+                        (false, false, true) => d.child(
                             div()
                                 .debug_selector(move || id)
                                 .size(px(5.))

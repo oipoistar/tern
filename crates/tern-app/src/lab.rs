@@ -19,7 +19,7 @@ use tern_core::ssh::{Connection, Target};
 use tern_core::{Auth, Host, Vault};
 
 use crate::files::FilesPanel;
-use crate::terminal::{Phase, TerminalView};
+use crate::terminal::{Marked, Phase, TerminalView};
 
 fn keys() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/lab/keys")
@@ -292,6 +292,31 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
                 .is_some_and(|listed| listed.iter().any(|c| c.name == "lab-app"))
         });
         println!("ok    the host's containers are listed");
+
+        // Command marks, from bash told to report them as shell
+        // integration does.
+        shell(
+            &view,
+            cx,
+            "PS0='\\e]133;C\\a'; PS1='\\[\\e]133;D;$?\\a\\e]133;A\\a\\]\\$ \\[\\e]133;B\\a\\]'; echo marked-$((7+7))",
+            "marked-14",
+        );
+        shell(
+            &view,
+            cx,
+            "ls / | head -3; echo listed-$((8+8))",
+            "listed-16",
+        );
+        shell(&view, cx, "ls /nonexistent-$((9+9))", "nonexistent-18");
+        wait(&view, cx, "the commands marked", |view| {
+            let marks: Vec<Marked> = view
+                .command_marks()
+                .into_iter()
+                .map(|(_, mark)| mark)
+                .collect();
+            marks.ends_with(&[Marked::Done, Marked::Failed])
+        });
+        println!("ok    commands are marked, done or failed, as bash reports them");
     }
 
     // A shell inside a container on the host: the stand-in runs it on the

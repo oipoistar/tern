@@ -29,6 +29,7 @@ pub mod reconnect;
 pub mod restore;
 pub mod schemes;
 pub mod secrets;
+pub mod sequences;
 pub mod settings;
 pub mod sftp;
 pub mod shells;

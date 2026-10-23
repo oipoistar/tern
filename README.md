@@ -55,6 +55,16 @@ known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application
 Support/Tern` or `~/.local/share/tern`; `TERN_DATA_DIR` overrides it, which
 also keeps a test run away from your real vault).
 
+Tern marks each command in the terminal's margin (a ring when it succeeded,
+a dot when it failed), jumps between them with Ctrl+Shift+Up and Down, and
+copies one's output, when the shell reports them as iTerm2, WezTerm and
+Windows Terminal read it (OSC 133). For bash, in `~/.bashrc`:
+
+```sh
+PS0='\e]133;C\a'
+PS1='\[\e]133;D;$?\a\e]133;A\a\]'"$PS1"'\[\e]133;B\a\]'
+```
+
 ## Develop
 
 ```sh

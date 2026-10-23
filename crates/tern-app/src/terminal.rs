@@ -23,7 +23,7 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
@@ -40,6 +40,7 @@ use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
 use tern_core::probe::{self, Listening, Vitals};
 use tern_core::reconnect;
+use tern_core::sequences::{Mark, Piece, Scanner};
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
 use tern_core::shells;
@@ -69,6 +70,47 @@ const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1
 const PROBE_EVERY: Duration = Duration::from_secs(5);
 /// How often a recording being played moves on.
 const REPLAY_TICK: Duration = Duration::from_millis(33);
+/// A command running this long gets its tab a check when it finishes off
+/// screen.
+const LONG_COMMAND: Duration = Duration::from_secs(10);
+
+/// Shell integration's marks, kept in the underline colour of a command
+/// line's first cell so they move with the text (Tern draws underlines in
+/// the text's own colour, so it never shows): a command running, done, or
+/// failed.
+const MARK_RUNNING: Rgb = Rgb {
+    r: 0x13,
+    g: 0x3c,
+    b: 0,
+};
+const MARK_DONE: Rgb = Rgb {
+    r: 0x13,
+    g: 0x3c,
+    b: 1,
+};
+const MARK_FAILED: Rgb = Rgb {
+    r: 0x13,
+    g: 0x3c,
+    b: 2,
+};
+
+/// Where a command marked by shell integration is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marked {
+    Running,
+    Done,
+    Failed,
+}
+
+/// The mark in a command line's first cell, if it has one.
+fn marked(cell: &GridCell) -> Option<Marked> {
+    match cell.underline_color()? {
+        AnsiColor::Spec(rgb) if rgb == MARK_RUNNING => Some(Marked::Running),
+        AnsiColor::Spec(rgb) if rgb == MARK_DONE => Some(Marked::Done),
+        AnsiColor::Spec(rgb) if rgb == MARK_FAILED => Some(Marked::Failed),
+        _ => None,
+    }
+}
 
 /// A recording played back in a pane.
 struct Replay {
@@ -184,6 +226,13 @@ pub struct TerminalView {
     containers: Option<Vec<Container>>,
     /// The recording being written of what this pane shows.
     recording: Option<Recorder>,
+    /// Picks shell integration's marks out of the output, and when the
+    /// command running started.
+    scanner: Scanner,
+    command_since: Option<Instant>,
+    /// A long command finished while the pane wasn't looked at: whether
+    /// it succeeded.
+    pub finished: Option<bool>,
     /// This pane plays back a recording instead of a session: the
     /// recording, unless it couldn't be read.
     played: bool,
@@ -489,6 +538,7 @@ impl TerminalView {
             Listener(self.term_events.clone()),
         );
         self.parser = Processor::new();
+        self.scanner = Scanner::default();
         replay.at = 0.;
         replay.next = 0;
     }
@@ -505,21 +555,20 @@ impl TerminalView {
         };
         let at = at.clamp(0., replay.cast.duration());
         replay.at = at;
-        while let Some((when, shown)) = replay.cast.events.get(replay.next) {
-            if *when > at {
-                break;
-            }
+        let due: Vec<Shown> = replay.cast.events[replay.next..]
+            .iter()
+            .take_while(|(when, _)| *when <= at)
+            .map(|(_, shown)| shown.clone())
+            .collect();
+        replay.next += due.len();
+        for shown in due {
             match shown {
-                Shown::Output(text) => self.parser.advance(&mut self.term, text.as_bytes()),
+                Shown::Output(text) => self.feed(text.as_bytes()),
                 Shown::Resize(cols, rows) => {
-                    self.size = TermSize {
-                        cols: *cols,
-                        rows: *rows,
-                    };
+                    self.size = TermSize { cols, rows };
                     self.term.resize(GridSize(self.size));
                 }
             }
-            replay.next += 1;
         }
         // Nothing answers a recording's questions, and its title stays.
         self.term_events.borrow_mut().clear();
@@ -985,6 +1034,9 @@ impl TerminalView {
             vitals: Vitals::default(),
             containers: None,
             recording: None,
+            scanner: Scanner::default(),
+            command_since: None,
+            finished: None,
             played: false,
             replay: None,
             _probing: None,
@@ -1027,6 +1079,116 @@ impl TerminalView {
     pub fn seen(&mut self) {
         self.unseen = false;
         self.rang = false;
+        self.finished = None;
+    }
+
+    /// Gives the terminal output, picking out the sequences Tern acts on
+    /// itself.
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.scanner.quiet(bytes) {
+            self.parser.advance(&mut self.term, bytes);
+            return;
+        }
+        for piece in self.scanner.scan(bytes) {
+            match piece {
+                Piece::Text(text) => self.parser.advance(&mut self.term, &text),
+                Piece::Mark(mark) => self.on_mark(mark),
+                Piece::Image(_) => {}
+            }
+        }
+    }
+
+    /// Acts on a shell integration mark, where the output has got to.
+    fn on_mark(&mut self, mark: Mark) {
+        match mark {
+            // Enter moved the cursor on: the command line is above it.
+            Mark::Output => {
+                let line = Line(self.term.grid().cursor.point.line.0 - 1);
+                if line >= self.term.topmost_line() {
+                    self.term.grid_mut()[line][Column(0)]
+                        .set_underline_color(Some(AnsiColor::Spec(MARK_RUNNING)));
+                }
+                self.command_since = Some(Instant::now());
+            }
+            Mark::Finished(status) => {
+                let failed = status.is_some_and(|status| status != 0);
+                let top = self.term.topmost_line();
+                let mut line = self.term.grid().cursor.point.line;
+                // The running command is the nearest mark above.
+                while line >= top {
+                    let cell = &mut self.term.grid_mut()[line][Column(0)];
+                    if marked(cell) == Some(Marked::Running) {
+                        let mark = if failed { MARK_FAILED } else { MARK_DONE };
+                        cell.set_underline_color(Some(AnsiColor::Spec(mark)));
+                        break;
+                    }
+                    line = Line(line.0 - 1);
+                }
+                if let Some(since) = self.command_since.take()
+                    && since.elapsed() >= LONG_COMMAND
+                {
+                    self.finished = Some(!failed);
+                }
+            }
+            Mark::Prompt | Mark::Command => {}
+        }
+    }
+
+    /// The lines holding marked commands, top first, with their marks.
+    pub fn command_marks(&self) -> Vec<(i32, Marked)> {
+        let grid = self.term.grid();
+        (self.term.topmost_line().0..=self.term.bottommost_line().0)
+            .filter_map(|line| marked(&grid[Line(line)][Column(0)]).map(|mark| (line, mark)))
+            .collect()
+    }
+
+    /// Scrolls to the marked command above the top of the view, or below.
+    fn jump_to_command(&mut self, up: bool, cx: &mut Context<Self>) {
+        let offset = self.term.grid().display_offset() as i32;
+        let top = -offset;
+        let lines: Vec<i32> = self
+            .command_marks()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        let target = if up {
+            lines.iter().rev().find(|&&line| line < top)
+        } else {
+            lines.iter().find(|&&line| line > top)
+        };
+        let Some(&target) = target else {
+            return;
+        };
+        // That line at the top, or the screen as it is for a line on it.
+        let wanted = (-target).max(0);
+        self.term.scroll_display(Scroll::Delta(wanted - offset));
+        cx.notify();
+    }
+
+    /// The output of the marked command at or above `line`: from below its
+    /// command line to above the next one.
+    fn command_output(&self, line: i32) -> Option<String> {
+        let marks = self.command_marks();
+        let (start, mark) = *marks.iter().rev().find(|(at, _)| *at <= line)?;
+        let cursor = self.term.grid().cursor.point.line.0;
+        let end = marks
+            .iter()
+            .find(|(at, _)| *at > start)
+            .map(|(at, _)| at - 1)
+            .unwrap_or(if mark == Marked::Running {
+                cursor
+            } else {
+                cursor - 1
+            });
+        if end <= start {
+            return Some(String::new());
+        }
+        let text = self.term.bounds_to_string(
+            GridPoint::new(Line(start + 1), Column(0)),
+            GridPoint::new(Line(end), self.term.last_column()),
+        );
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        Some(lines.join("\n").trim_end_matches('\n').to_string())
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -1208,7 +1370,7 @@ impl TerminalView {
                 {
                     self.recording = None;
                 }
-                self.parser.advance(&mut self.term, &bytes);
+                self.feed(&bytes);
                 self.answer_terminal_events(cx);
                 self.update_preview();
             }
@@ -1465,6 +1627,19 @@ impl TerminalView {
             self.select_all();
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        // Ctrl+Shift+Up and Down (Cmd+Shift on macOS): the marked command
+        // above or below, when the shell marks them.
+        let modifiers = &keystroke.modifiers;
+        if modifiers.shift
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.alt
+            && matches!(keystroke.key.as_str(), "up" | "down")
+            && !self.command_marks().is_empty()
+        {
+            self.jump_to_command(keystroke.key == "up", cx);
+            cx.stop_propagation();
             return;
         }
         // Input waiting for a yes: Enter gives it, Escape doesn't.
@@ -1859,6 +2034,10 @@ impl TerminalView {
             this.menu = None;
             cx.notify();
         };
+        // The output of the marked command where the menu was asked for.
+        let (row, _, _) = self.screen_cell(at);
+        let line = row as i32 - self.term.grid().display_offset() as i32;
+        let output = self.command_output(line);
         deferred(
             anchored()
                 .position(at)
@@ -1886,6 +2065,16 @@ impl TerminalView {
                                 }))
                             }),
                         )
+                        .when_some(output, |d, output| {
+                            d.child(item("menu-copy-output", "Copy output", true).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        output.clone(),
+                                    ));
+                                    close(this, cx);
+                                }),
+                            ))
+                        })
                         .child(
                             item("menu-paste", "Paste", self.is_live()).on_click(cx.listener(
                                 move |this, _, _, cx| {
@@ -2255,6 +2444,7 @@ impl TerminalView {
         let mut frame = Frame {
             rows: (0..rows).map(|_| RowFrame::default()).collect(),
             cursor: None,
+            ink: palette.foreground,
         };
 
         let cursor = content.cursor;
@@ -2274,6 +2464,9 @@ impl TerminalView {
             }
             let (row, col) = (row as usize, indexed.point.column.0);
             let cell = indexed.cell;
+            if col == 0 {
+                frame.rows[row].mark = marked(cell);
+            }
             let mut fg = resolve(cell.fg, content.colors, palette);
             let mut bg = resolve(cell.bg, content.colors, palette);
             if cell.flags.contains(Flags::INVERSE) {
@@ -2802,10 +2995,14 @@ impl Metrics {
 struct Frame {
     rows: Vec<RowFrame>,
     cursor: Option<CursorFrame>,
+    /// The ink of the gutter's marks.
+    ink: Hsla,
 }
 
 #[derive(Default)]
 struct RowFrame {
+    /// Shell integration's mark for a command line.
+    mark: Option<Marked>,
     backgrounds: Vec<BgSpan>,
     segments: Vec<Segment>,
 }
@@ -2861,6 +3058,19 @@ fn paint_frame(
         )
     };
 
+    // Shell integration's marks, in the padding left of the grid: a ring
+    // for a command that succeeded, a dot for one that failed.
+    for (row, line) in frame.rows.iter().enumerate() {
+        let center = point(
+            origin.x - px(8.),
+            origin.y + *line_height * (row as f32 + 0.5),
+        );
+        match line.mark {
+            Some(Marked::Done) => crate::marks::ring(center, 3., frame.ink, window),
+            Some(Marked::Failed) => crate::marks::dot(center, 3., frame.ink, window),
+            _ => {}
+        }
+    }
     for (row, line) in frame.rows.iter().enumerate() {
         for span in &line.backgrounds {
             let size = size(*cell_width * (span.end - span.start) as f32, *line_height);
@@ -3149,6 +3359,56 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn marks_the_commands_a_shell_reports(cx: &mut TestAppContext) {
+        use std::time::{Duration, Instant};
+
+        use super::Marked;
+
+        // Two commands, as a shell with integration prints them: the first
+        // lists a lot, the second fails.
+        let mut output = String::from("\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
+        for i in 0..200 {
+            output += &format!("file{i}\r\n");
+        }
+        output += "\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07false\r\n\x1b]133;C\x07";
+        output += "\x1b]133;D;1\x07\x1b]133;A\x07$ ";
+        let (view, cx) = pane_with(cx, &output);
+        let marks = view.read_with(cx, |view, _| view.command_marks());
+        let states: Vec<Marked> = marks.iter().map(|(_, mark)| *mark).collect();
+        assert_eq!(states, [Marked::Done, Marked::Failed]);
+        // The first command's output, as Copy output gives it.
+        let copied = view.read_with(cx, |view, _| view.command_output(marks[0].0).unwrap());
+        assert_eq!(copied.lines().count(), 200);
+        assert!(copied.starts_with("file0\nfile1\n") && copied.ends_with("file199"));
+
+        // Up goes to the first command, at the top; down comes back.
+        focus(&view, cx);
+        let offset = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.term.grid().display_offset() as i32)
+        };
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{modifier}-shift-up"));
+        assert_eq!(offset(cx), -marks[0].0);
+        cx.simulate_keystrokes(&format!("{modifier}-shift-down"));
+        assert_eq!(offset(cx), 0);
+
+        // A long command finishing marks the pane until it's seen.
+        view.update(cx, |view, cx| {
+            view.command_since = Some(Instant::now() - Duration::from_secs(11));
+            view.on_session_event(Event::Output(b"\x1b]133;D;0\x07".to_vec()), cx);
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(view.finished, Some(true));
+            view.seen();
+            assert_eq!(view.finished, None);
+        });
     }
 
     #[gpui::test]

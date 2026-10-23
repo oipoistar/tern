@@ -264,6 +264,15 @@ claude.ai account). Each item below names the artboard it comes from.
       of its own, at its recorded size, under a bar with play or pause,
       an ink track to click and the time (Space plays or pauses, the
       arrows move five seconds). A file that can't be read says why there
+- [x] Command marks: when the shell reports its commands (OSC 133; the
+      README has bash's two lines), each command line is marked in the
+      terminal's margin, a ring once it succeeded and a dot once it
+      failed, the marks moving with the text (kept in the line's first
+      cell); Ctrl+Shift+Up and Down (Cmd on macOS) jump between them,
+      Copy output in the terminal's menu copies the output of the
+      command under the pointer, and a command that ran ten seconds or
+      more finishing in a tab not on screen gives the tab a check.
+      Recordings keep the marks, and replays show them
 
 ## Known gaps in what's built
 
