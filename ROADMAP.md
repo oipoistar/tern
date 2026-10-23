@@ -127,7 +127,8 @@ claude.ai account). Each item below names the artboard it comes from.
 
 ## Known gaps in what's built
 
-- Only tested on Windows so far (item 23).
+- Only tested on Windows so far (item 19); CI builds and tests on macOS and
+  Linux too, but the app itself hasn't been run there.
 
 ## Next, in order
 

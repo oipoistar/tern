@@ -10,9 +10,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A run in progress finishes; of the pushes made meanwhile, only the newest
+# waits to run next.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
