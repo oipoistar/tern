@@ -53,6 +53,43 @@ impl Snippet {
         }
     }
 
+    /// The `{{name}}` placeholders in the command, each once, in order:
+    /// values to ask for before typing it.
+    pub fn variables(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut rest = self.command.as_str();
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else {
+                break;
+            };
+            let name = after[..end].trim();
+            if !name.is_empty()
+                && !name.contains(['{', '}'])
+                && !names.iter().any(|have| have == name)
+            {
+                names.push(name.to_string());
+            }
+            rest = &after[end + 2..];
+        }
+        names
+    }
+
+    /// A copy with each `{{name}}` replaced by its value; placeholders
+    /// without one stay as they are.
+    pub fn filled(&self, values: &[(String, String)]) -> Snippet {
+        let mut command = self.command.clone();
+        for (name, value) in values {
+            for spelling in [format!("{{{{{name}}}}}"), format!("{{{{ {name} }}}}")] {
+                command = command.replace(&spelling, value);
+            }
+        }
+        Snippet {
+            command,
+            ..self.clone()
+        }
+    }
+
     /// Whether every whitespace-separated term of `query` appears
     /// (case-insensitively) in the name or command.
     pub fn matches(&self, query: &str) -> bool {
@@ -102,6 +139,29 @@ mod tests {
 
     fn snippet(name: &str, command: &str) -> Snippet {
         Snippet::new(name, command)
+    }
+
+    #[test]
+    fn asks_for_its_variables() {
+        let deploy = snippet(
+            "deploy",
+            "cd {{app}} && git checkout {{ branch }} && make {{app}}",
+        );
+        assert_eq!(deploy.variables(), ["app", "branch"]);
+        let values = [
+            ("app".to_string(), "/srv/web".to_string()),
+            ("branch".to_string(), "main".to_string()),
+        ];
+        assert_eq!(
+            deploy.filled(&values).command,
+            "cd /srv/web && git checkout main && make /srv/web"
+        );
+        assert!(snippet("plain", "df -h").variables().is_empty());
+        assert!(
+            snippet("braces", "echo {{}} {{ }} {{open")
+                .variables()
+                .is_empty()
+        );
     }
 
     #[test]

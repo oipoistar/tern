@@ -40,6 +40,8 @@ struct Form {
 struct Run {
     snippet: Snippet,
     chosen: Vec<String>,
+    /// A field for each of the snippet's `{{name}}` variables.
+    values: Vec<(String, Entity<InputState>)>,
 }
 
 pub struct SnippetsView {
@@ -162,6 +164,27 @@ impl SnippetsView {
                             }))
                     })),
             )
+            .when(!run.values.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(8.))
+                        .children(run.values.iter().map(|(_, field)| {
+                            div()
+                                .w(px(200.))
+                                .h(px(38.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(11.))
+                                .bg(t.card2)
+                                .font_family(MONO)
+                                .text_size(px(13.))
+                                .child(Input::new(field).appearance(false))
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -188,8 +211,15 @@ impl SnippetsView {
                                     this.run = Some(run);
                                     return;
                                 }
+                                let values: Vec<(String, String)> = run
+                                    .values
+                                    .iter()
+                                    .map(|(name, field)| {
+                                        (name.clone(), field.read(cx).value().to_string())
+                                    })
+                                    .collect();
                                 cx.emit(SnippetEvent::Run {
-                                    snippet: run.snippet,
+                                    snippet: run.snippet.filled(&values),
                                     hosts: run.chosen,
                                 });
                                 cx.notify();
@@ -435,12 +465,23 @@ impl SnippetsView {
                     .border_color(t.line)
                     .hover(|d| d.bg(t.card2))
                     .child(icon(IconName::Play, 14., t.text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.form = None;
+                        let values = to_run
+                            .variables()
+                            .into_iter()
+                            .map(|name| {
+                                let placeholder = name.clone();
+                                let field = cx
+                                    .new(|cx| InputState::new(window, cx).placeholder(placeholder));
+                                (name, field)
+                            })
+                            .collect();
                         this.run = Some(Run {
                             snippet: to_run.clone(),
                             chosen: Vec::new(),
+                            values,
                         });
                         cx.notify();
                     })),

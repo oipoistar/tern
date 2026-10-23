@@ -9,9 +9,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
+use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, parse_command};
 
 use crate::bench;
@@ -22,7 +24,7 @@ use crate::settings::{self, Page, SettingsEvent, SettingsView};
 use crate::sync::{self, Status};
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
 use crate::theme::{self, MONO, Theme};
-use crate::ui::{button, icon, status_dot, tern_mark};
+use crate::ui::{button, icon, ink_button, status_dot, tern_mark};
 use crate::vault::{VaultContent, VaultEvent};
 
 /// Latency traces scroll slowly, so 20 fps is plenty; nothing else animates.
@@ -82,8 +84,17 @@ impl Tab {
     }
 }
 
+/// A snippet waiting for its `{{name}}` values before it's typed.
+struct Filling {
+    snippet: Snippet,
+    /// Each variable's name and field.
+    fields: Vec<(String, Entity<InputState>)>,
+    _subscriptions: Vec<Subscription>,
+}
+
 pub struct Workspace {
     vault: Entity<VaultContent>,
+    filling: Option<Filling>,
     tabs: Vec<Tab>,
     /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
@@ -209,6 +220,7 @@ impl Workspace {
         });
         Self {
             vault,
+            filling: None,
             tabs: Vec::new(),
             active: None,
             live,
@@ -543,12 +555,73 @@ impl Workspace {
     }
 
     /// Types a saved snippet into the focused pane, or every pane while
-    /// broadcasting.
+    /// broadcasting; one with `{{name}}` variables asks for them first.
     fn run_snippet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(active), Some(snippet)) = (
-            self.active,
-            self.vault.read(cx).snippets().get(index).cloned(),
-        ) else {
+        let Some(snippet) = self.vault.read(cx).snippets().get(index).cloned() else {
+            return;
+        };
+        let names = snippet.variables();
+        if names.is_empty() {
+            return self.type_snippet(&snippet, window, cx);
+        }
+        let fields: Vec<(String, Entity<InputState>)> = names
+            .into_iter()
+            .map(|name| {
+                let placeholder = name.clone();
+                let field = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+                (name, field)
+            })
+            .collect();
+        // Enter moves to the next value, and types the snippet after the
+        // last.
+        let subscriptions = fields
+            .iter()
+            .enumerate()
+            .map(|(at, (_, field))| {
+                cx.subscribe_in(
+                    field,
+                    window,
+                    move |this, _, event: &InputEvent, window, cx| {
+                        if let InputEvent::PressEnter { .. } = event {
+                            this.next_value(at, window, cx);
+                        }
+                    },
+                )
+            })
+            .collect();
+        if let Some((_, first)) = fields.first() {
+            first.update(cx, |field, cx| field.focus(window, cx));
+        }
+        self.filling = Some(Filling {
+            snippet,
+            fields,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    /// After the value at `at`: the next field, or the snippet typed.
+    fn next_value(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(filling) = &self.filling else {
+            return;
+        };
+        if let Some((_, next)) = filling.fields.get(at + 1) {
+            next.update(cx, |field, cx| field.focus(window, cx));
+            return;
+        }
+        let values: Vec<(String, String)> = filling
+            .fields
+            .iter()
+            .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
+            .collect();
+        let snippet = filling.snippet.filled(&values);
+        self.filling = None;
+        self.type_snippet(&snippet, window, cx);
+        cx.notify();
+    }
+
+    fn type_snippet(&mut self, snippet: &Snippet, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
             return;
         };
         let tab = &self.tabs[active];
@@ -872,6 +945,61 @@ impl Workspace {
 
     /// Under the panes: a chip per snippet, then a dashed one to add
     /// another.
+    /// The values a snippet asks for, in a row above the snippet bar.
+    fn filling_row(
+        &self,
+        filling: &Filling,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let last = filling.fields.len().saturating_sub(1);
+        div()
+            .id("snippet-values")
+            .debug_selector(|| "snippet-values".into())
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            // Escape leaves the snippet untyped.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.filling = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(filling.snippet.name.clone()),
+            )
+            .children(filling.fields.iter().map(|(_, field)| {
+                div()
+                    .w(px(180.))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(10.))
+                    .bg(theme.card2)
+                    .font_family(MONO)
+                    .text_size(px(12.5))
+                    .child(Input::new(field).appearance(false))
+            }))
+            .child(
+                ink_button("snippet-run", theme)
+                    .debug_selector(|| "snippet-run".into())
+                    .h(px(32.))
+                    .rounded(px(10.))
+                    .child(icon(IconName::Play, 13., theme.card))
+                    .child("Run")
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.next_value(last, window, cx)),
+                    ),
+            )
+    }
+
     fn snippet_bar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let names: Vec<String> = self
             .vault
@@ -1207,6 +1335,9 @@ impl Render for Workspace {
                                 d.child(files)
                             }),
                     )
+                    .when_some(self.filling.as_ref(), |d, filling| {
+                        d.child(self.filling_row(filling, &theme, cx))
+                    })
                     .child(self.snippet_bar(&theme, cx))
                     .into_any_element()
             }
@@ -1400,6 +1531,44 @@ mod tests {
         cx.simulate_keystrokes("ctrl-tab");
         assert!(cx.debug_bounds("activity-0").is_none());
         first.read_with(cx, |pane, _| assert!(!pane.rang && !pane.unseen));
+    }
+
+    #[gpui::test]
+    fn asks_for_a_snippets_values_before_typing_it(cx: &mut TestAppContext) {
+        use tern_core::snippet::Snippet;
+
+        cx.update(gpui_kit::init);
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let live = LiveSlots::default();
+            let mut vault = Vault::default();
+            vault
+                .snippets
+                .push(Snippet::new("Tail", "tail -n {{lines}} {{file}}"));
+            let vault = cx.new(|cx| VaultContent::new(vault, None, live.clone(), window, cx));
+            let mut workspace = Workspace::with(vault, live, offline, window, cx);
+            let terminal = cx.new(TerminalView::offline);
+            workspace.add_session(terminal, window, cx);
+            workspace
+        });
+        cx.run_until_parked();
+
+        click(cx, "snippet-0");
+        assert_eq!(sent(&workspace, cx), [Vec::<u8>::new()]);
+        cx.simulate_input("50");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("/var/log/syslog");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            sent(&workspace, cx),
+            [b"tail -n 50 /var/log/syslog\r".to_vec()]
+        );
+        assert!(cx.debug_bounds("snippet-values").is_none());
+
+        // Escape leaves it untyped.
+        click(cx, "snippet-0");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("snippet-values").is_none());
+        assert_eq!(sent(&workspace, cx), [Vec::<u8>::new()]);
     }
 
     #[gpui::test]

@@ -179,6 +179,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Tab markers: a tab not on screen shows a dot once its sessions
       print something new, and a bell if one rang; looking at the tab
       clears them
+- [x] Snippet variables: {{name}} in a snippet's command asks for a
+      value before it's typed, in a row above the snippet bar (Enter
+      moves on, the last Enter types it, Escape doesn't) and in the Run
+      on hosts chooser
 
 ## Known gaps in what's built
 
