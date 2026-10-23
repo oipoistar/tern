@@ -49,6 +49,27 @@ pub struct TermPalette {
 }
 
 impl TermPalette {
+    /// The palette terminals draw with now: the chosen scheme, or Tern's
+    /// own for the app's look.
+    pub fn current(cx: &App) -> Self {
+        let theme = current(cx);
+        match crate::settings::current(cx).terminal.colors.as_deref() {
+            Some(name) => tern_core::schemes::find(name)
+                .map(Self::for_scheme)
+                .unwrap_or_else(|| Self::for_theme(&theme)),
+            None => Self::for_theme(&theme),
+        }
+    }
+
+    pub fn for_scheme(scheme: &tern_core::schemes::Scheme) -> Self {
+        Self {
+            background: c(rgb(scheme.background)),
+            foreground: c(rgb(scheme.foreground)),
+            cursor: c(rgb(scheme.cursor)),
+            ansi: scheme.ansi.map(|hex| c(rgb(hex))),
+        }
+    }
+
     pub fn for_theme(theme: &Theme) -> Self {
         let ansi = [
             0x2A2A2D, 0xF07178, 0x8CD3A5, 0xFFCB6B, 0x82AAFF, 0xC792EA, 0x89DDFF,

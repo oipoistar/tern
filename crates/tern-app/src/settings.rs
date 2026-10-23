@@ -14,7 +14,7 @@ use tern_core::settings::{Appearance, Bell, CursorStyle, Settings, TerminalSetti
 use tern_core::sync::SyncedSettings;
 
 use crate::sync::{self, Status, SyncState};
-use crate::theme::{self, MONO, Theme};
+use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{button, icon, ink_button, switch};
 
 /// The settings in effect, and where they're saved (`None` in tests).
@@ -484,6 +484,62 @@ impl SettingsView {
             }))
     }
 
+    /// Each terminal colour scheme as a swatch of itself: its background,
+    /// its name in its own text colour, a row of its colours. Tern's own,
+    /// which follows the app's look, comes first.
+    fn schemes(chosen: Option<&str>, t: &Theme) -> Div {
+        let swatches = std::iter::once(("Tern", None, TermPalette::for_theme(t))).chain(
+            tern_core::schemes::SCHEMES.iter().map(|scheme| {
+                (
+                    scheme.name,
+                    Some(scheme.name),
+                    TermPalette::for_scheme(scheme),
+                )
+            }),
+        );
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .py(px(6.))
+            .children(swatches.map(|(name, value, palette)| {
+                let on = chosen == value;
+                let id = format!("colors-{}", name.to_lowercase().replace(' ', "-"));
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id)
+                    .w(px(122.))
+                    .h(px(56.))
+                    .p(px(9.))
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .rounded(px(12.))
+                    .bg(palette.background)
+                    .border_2()
+                    .border_color(if on { t.text } else { t.line })
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.foreground)
+                            .truncate()
+                            .child(name),
+                    )
+                    .child(
+                        div().flex().gap(px(4.)).children((1..7).map(|index| {
+                            div().size(px(8.)).rounded_full().bg(palette.ansi[index])
+                        })),
+                    )
+                    .on_click(move |_, _, cx| {
+                        update(cx, |settings| {
+                            settings.terminal.colors = value.map(String::from)
+                        })
+                    })
+            }))
+    }
+
     fn page(&self, settings: &Settings, t: &Theme, cx: &Context<Self>) -> Div {
         let terminal = &settings.terminal;
         match self.page {
@@ -526,6 +582,11 @@ impl SettingsView {
                     t,
                 ))
                 .child(Self::row("Size", Self::field(&self.font_size, 90., t), t))
+                .child(Self::row(
+                    "Colours",
+                    Self::schemes(terminal.colors.as_deref(), t),
+                    t,
+                ))
                 .child(Self::row(
                     "Cursor",
                     Self::choice(

@@ -1296,6 +1296,20 @@ mod tests {
             (CursorStyle::Beam, true)
         );
 
+        // A colour scheme repaints terminals; Tern's own follows the look.
+        click(cx, "colors-dracula");
+        assert_eq!(current(cx).terminal.colors.as_deref(), Some("Dracula"));
+        let background = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| crate::theme::TermPalette::current(cx).background)
+        };
+        let dracula = tern_core::schemes::find("Dracula").unwrap();
+        assert_eq!(
+            background(cx),
+            crate::theme::TermPalette::for_scheme(dracula).background
+        );
+        click(cx, "colors-tern");
+        assert_eq!(current(cx).terminal.colors, None);
+
         // A typed size applies once it makes sense.
         cx.update(|window, cx| {
             let view = workspace

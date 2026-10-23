@@ -807,7 +807,7 @@ impl VaultContent {
     /// lines, Open terminal and SFTP, and its port forwarding switches.
     fn side_panel(&self, host: &Host, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
         let t = ui.theme;
-        let palette = TermPalette::for_theme(t);
+        let palette = TermPalette::current(cx);
         let art = self.keys.get(&(host.address.clone(), host.port)).cloned();
         let preview = self.open_sessions.get(&host.name).cloned();
         div()

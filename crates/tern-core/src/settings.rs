@@ -62,6 +62,10 @@ pub struct TerminalSettings {
     pub bell: Bell,
     /// Selecting text copies it.
     pub copy_on_select: bool,
+    /// A colour scheme by name ([`crate::schemes`]); none follows the
+    /// app's look.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colors: Option<String>,
 }
 
 impl TerminalSettings {
@@ -79,6 +83,12 @@ impl TerminalSettings {
             Self::default().font_size
         };
         self.scrollback = self.scrollback.min(Self::MAX_SCROLLBACK);
+        // A scheme this version doesn't have falls back to Tern's own.
+        self.colors = self
+            .colors
+            .as_deref()
+            .and_then(crate::schemes::find)
+            .map(|scheme| scheme.name.to_string());
         self
     }
 
@@ -103,6 +113,7 @@ impl Default for TerminalSettings {
             scrollback: 10_000,
             bell: Bell::Visual,
             copy_on_select: false,
+            colors: None,
         }
     }
 }
@@ -178,6 +189,16 @@ mod tests {
             ..TerminalSettings::default()
         };
         assert_eq!(tiny.clamped().font_size, TerminalSettings::MIN_FONT_SIZE);
+        let schemed = |name: &str| {
+            TerminalSettings {
+                colors: Some(name.into()),
+                ..TerminalSettings::default()
+            }
+            .clamped()
+            .colors
+        };
+        assert_eq!(schemed("dracula").as_deref(), Some("Dracula"));
+        assert_eq!(schemed("Something else"), None);
     }
 
     #[test]

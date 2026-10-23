@@ -419,7 +419,7 @@ impl KeychainView {
     }
 
     fn details(&self, pair: &KeyPair, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
-        let palette = TermPalette::for_theme(t);
+        let palette = TermPalette::current(cx);
         let users: Vec<String> = pair
             .users(&self.vault)
             .iter()

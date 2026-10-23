@@ -135,6 +135,12 @@ claude.ai account). Each item below names the artboard it comes from.
       rwx) and delete (folders with what they hold), each taken or
       confirmed in one line under the path bar, on the host and on this
       computer; nothing is ever replaced
+- [x] Terminal colour schemes: Settings, Terminal, Colours shows each
+      scheme as a swatch of itself (Tern's own, which follows the app's
+      look, then Solarized Dark and Light, Dracula, Nord, Gruvbox Dark,
+      One Dark, Tokyo Night, Monokai and GitHub Light); terminals, the
+      vault's previews and key art repaint at once, and the choice syncs
+      with the other settings
 
 ## Known gaps in what's built
 

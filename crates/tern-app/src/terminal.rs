@@ -611,7 +611,7 @@ impl TerminalView {
                 TermEvent::Title(title) => self.title = Some(title.into()),
                 TermEvent::ResetTitle => self.title = None,
                 TermEvent::ColorRequest(index, reply) => {
-                    let palette = TermPalette::for_theme(&theme::current(cx));
+                    let palette = TermPalette::current(cx);
                     let color = resolve(
                         AnsiColor::Indexed(index.min(255) as u8),
                         self.term.colors(),
@@ -1602,7 +1602,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::current(cx);
-        let palette = TermPalette::for_theme(&theme);
+        let palette = TermPalette::current(cx);
         let focused = self.focus.is_focused(window);
         let terminal = settings::current(cx).terminal;
         // Settings changed since: scrollback and the default cursor apply
