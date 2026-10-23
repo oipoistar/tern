@@ -15,6 +15,8 @@ pub struct HostDraft {
     /// `Some("")` while connecting through a jump host is switched on but
     /// none is chosen yet.
     pub jump: Option<String>,
+    /// `Some` while a proxy is switched on: its URL as typed.
+    pub proxy: Option<String>,
     pub tags: Vec<String>,
     pub keep_alive: bool,
     pub agent_forwarding: bool,
@@ -32,6 +34,7 @@ pub enum Field {
     User,
     Key,
     Jump,
+    Proxy,
     Env,
 }
 
@@ -53,6 +56,7 @@ impl HostDraft {
             group: group.into(),
             auth: Auth::Agent,
             jump: None,
+            proxy: None,
             tags: Vec::new(),
             keep_alive: true,
             agent_forwarding: false,
@@ -70,6 +74,7 @@ impl HostDraft {
             group: group.into(),
             auth: host.auth.clone(),
             jump: host.jump.clone(),
+            proxy: host.proxy.as_ref().map(ToString::to_string),
             tags: host.tags.clone(),
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
@@ -150,6 +155,12 @@ impl HostDraft {
                 }
             }
         }
+        let proxy = match self.proxy.as_deref() {
+            None => None,
+            Some(text) => crate::proxy::Proxy::parse(text)
+                .map_err(|error| problem(Field::Proxy, &error))
+                .ok(),
+        };
         let env = crate::env::parse(&self.env).unwrap_or_else(|error| {
             problem(Field::Env, &error);
             Default::default()
@@ -170,6 +181,7 @@ impl HostDraft {
             tags: normalize_tags(&self.tags),
             auth: self.auth.clone(),
             jump: self.jump.as_deref().map(|jump| jump.trim().to_string()),
+            proxy,
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),

@@ -107,6 +107,11 @@ claude.ai account). Each item below names the artboard it comes from.
       editor takes OpenSSH's SetEnv form (NAME=value, quotes around
       spaces); the shell is asked to start with them, and the server's
       AcceptEnv decides
+- [x] Proxies per host: a Proxy switch and URL (socks5://host:port or
+      http://host:port) in the host editor, drawn as a stop on the
+      route; the first hop is dialled through it, reachability checks
+      too, and the proxy's refusal is the error shown. Proxies that need
+      a password aren't supported, since the vault file keeps no secrets
 
 ## Known gaps in what's built
 

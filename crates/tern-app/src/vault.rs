@@ -316,9 +316,11 @@ impl VaultContent {
 
     fn run_due_checks(&mut self, cx: &mut Context<Self>) {
         let mut places: Vec<Place> = Vec::new();
+        let mut proxies = Vec::new();
         for host in self.vault.hosts() {
             let place = self.vault.first_hop(host);
             if !places.contains(&place) {
+                proxies.push(self.vault.first_hop_host(host).proxy.clone());
                 places.push(place);
             }
         }
@@ -327,7 +329,11 @@ impl VaultContent {
             return;
         }
         for place in due {
-            let check = probe(&place.0, place.1);
+            let proxy = places
+                .iter()
+                .position(|each| *each == place)
+                .and_then(|at| proxies[at].clone());
+            let check = probe(&place.0, place.1, proxy);
             cx.spawn(async move |this, cx| {
                 let latency_ms = check.await.ok().map(|reached| reached.latency_ms);
                 let _ = this.update(cx, |this, cx| {
@@ -2441,6 +2447,15 @@ mod tests {
         });
         assert_eq!(problems, [Field::Env]);
         type_into(cx, Field::Env, "LANG=C.UTF-8 TZ=UTC");
+        // A proxy is written as a URL.
+        click(cx, "proxy-switch");
+        type_into(cx, Field::Proxy, "proxy.lan:1080");
+        click(cx, "save-host");
+        let problems = vault.read_with(cx, |vault, cx| {
+            vault.editor.as_ref().unwrap().read(cx).problem_fields()
+        });
+        assert_eq!(problems, [Field::Proxy]);
+        type_into(cx, Field::Proxy, "socks5://proxy.lan:1080");
         click(cx, "save-host");
         assert!(!editor_open(cx));
         vault.read_with(cx, |vault, _| {
@@ -2448,6 +2463,8 @@ mod tests {
             assert_eq!((host.port, host.user.as_str()), (2200, "root"));
             assert_eq!(host.env.get("TZ").map(String::as_str), Some("UTC"));
             assert_eq!(host.env.len(), 2);
+            let proxy = host.proxy.as_ref().expect("the proxy is saved");
+            assert_eq!(proxy.to_string(), "socks5://proxy.lan:1080");
             assert_eq!(vault.vault.group_of("db-new"), Some("Production"));
             assert_eq!(vault.selected, "db-new");
         });

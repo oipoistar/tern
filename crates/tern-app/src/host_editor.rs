@@ -10,6 +10,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::draft::{Field, HostDraft, Problem};
+use tern_core::proxy::Proxy;
 use tern_core::randomart::Randomart;
 use tern_core::reach::Place;
 use tern_core::secrets::host_password;
@@ -77,6 +78,9 @@ pub struct HostEditor {
     tag: Entity<InputState>,
     on_login: Entity<InputState>,
     env: Entity<InputState>,
+    /// The proxy's URL, used while `proxy_on`.
+    proxy: Entity<InputState>,
+    proxy_on: bool,
     /// For password sign-in: typed to save it, empty to keep the one saved.
     password: Entity<InputState>,
     /// Keep the password in the system's credential store.
@@ -128,6 +132,12 @@ impl HostEditor {
         let tag = text_input("", "Add tag", window, cx);
         let on_login = text_input(&draft.on_login, "", window, cx);
         let env = text_input(&draft.env, "NAME=value", window, cx);
+        let proxy = text_input(
+            draft.proxy.as_deref().unwrap_or_default(),
+            "socks5://host:1080",
+            window,
+            cx,
+        );
         let password_saved =
             host.is_some_and(|host| secrets(cx).load(&host_password(&host.id)).is_some());
         let password = cx.new(|cx| {
@@ -180,6 +190,8 @@ impl HostEditor {
             tag,
             on_login,
             env,
+            proxy_on: draft.proxy.is_some(),
+            proxy,
             password,
             save_password: password_saved,
             password_saved,
@@ -221,6 +233,7 @@ impl HostEditor {
                 SignIn::Agent => Auth::Agent,
             },
             jump: self.jump.clone(),
+            proxy: self.proxy_on.then(|| text(&self.proxy)),
             tags: self.tags.clone(),
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
@@ -248,6 +261,7 @@ impl HostEditor {
             Field::Port => self.port.clone(),
             Field::User => self.user.clone(),
             Field::Env => self.env.clone(),
+            Field::Proxy => self.proxy.clone(),
             Field::Key | Field::Jump => unreachable!("{field:?} isn't typed"),
         }
     }
@@ -349,9 +363,22 @@ impl HostEditor {
                 .and_then(|chain| chain.first().copied())
                 .unwrap_or(via)
         });
-        let (hop, address, port) = match via {
-            Some(via) => (Some(via.name.clone()), via.address.clone(), via.port),
+        let (hop, address, port, proxy) = match via {
+            Some(via) => (
+                Some(via.name.clone()),
+                via.address.clone(),
+                via.port,
+                via.proxy.clone(),
+            ),
             None => {
+                let proxy = match draft.proxy.as_deref().map(Proxy::parse) {
+                    Some(Err(problem)) => {
+                        self.test = Test::Failed(problem.into());
+                        cx.notify();
+                        return;
+                    }
+                    parsed => parsed.and_then(Result::ok),
+                };
                 let port = draft
                     .port
                     .trim()
@@ -360,7 +387,7 @@ impl HostEditor {
                     .filter(|&port| port > 0);
                 let address = draft.address.trim();
                 match port {
-                    Some(port) if !address.is_empty() => (None, address.to_string(), port),
+                    Some(port) if !address.is_empty() => (None, address.to_string(), port, proxy),
                     _ => {
                         self.test = Test::Failed("enter a host and port first".into());
                         cx.notify();
@@ -370,7 +397,7 @@ impl HostEditor {
             }
         };
         self.test = Test::Running;
-        let check = probe(&address, port);
+        let check = probe(&address, port, proxy);
         self._test = Some(cx.spawn(async move |this, cx| {
             let result = check.await;
             let _ = this.update(cx, |editor, cx| {
@@ -662,19 +689,36 @@ impl HostEditor {
             .map(|host| (host.name.clone(), Some(host.target())))
             .collect();
         // The whole route: the chosen host's own jump hosts come first.
-        let hops = chosen
-            .map(|via| {
-                let mut hops: Vec<String> = self
-                    .vault
-                    .jumps(via)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|hop| hop.name.clone())
-                    .collect();
-                hops.push(via.name.clone());
-                hops
-            })
-            .unwrap_or_default();
+        let hops = on.then(|| {
+            chosen
+                .map(|via| {
+                    let mut hops: Vec<String> = self
+                        .vault
+                        .jumps(via)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|hop| hop.name.clone())
+                        .collect();
+                    hops.push(via.name.clone());
+                    hops
+                })
+                .unwrap_or_default()
+        });
+        // The proxy dials the first hop: this host's own, or the first jump
+        // host's.
+        let proxy: Option<Option<String>> = match chosen {
+            Some(via) => self
+                .vault
+                .first_hop_host(via)
+                .proxy
+                .as_ref()
+                .map(|proxy| Some(proxy.host.clone())),
+            None => self.proxy_on.then(|| {
+                Proxy::parse(&self.proxy.read(cx).value())
+                    .ok()
+                    .map(|proxy| proxy.host)
+            }),
+        };
         card(t)
             .child(
                 div()
@@ -711,13 +755,49 @@ impl HostEditor {
                     t,
                     cx,
                 ))
-                .child(self.route(hops, t, cx))
+            })
+            // A host reached through a jump host doesn't dial out itself, so
+            // its own proxy only matters without one.
+            .when(!on, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Proxy"),
+                        )
+                        .child(
+                            switch("proxy-switch", self.proxy_on, t)
+                                .debug_selector(|| "proxy-switch".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.proxy_on = !this.proxy_on;
+                                    this.recheck(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(self.proxy_on, |d| {
+                    d.child(div().child(self.field_body(&self.proxy, Some(Field::Proxy), true, t)))
+                })
+            })
+            .when(on || proxy.is_some(), |d| {
+                d.child(self.route(proxy, hops, t, cx))
             })
     }
 
-    /// This computer → each jump host → this host. Before a jump host is
-    /// chosen, one blank stop stands for it.
-    fn route(&self, hops: Vec<String>, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    /// This computer → the proxy → each jump host → this host. A blank
+    /// stop stands for a jump host or proxy not given yet.
+    fn route(
+        &self,
+        proxy: Option<Option<String>>,
+        hops: Option<Vec<String>>,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let node = |glyph: IconName, label: Option<SharedString>, target: bool| {
             div()
                 .w(px(86.))
@@ -758,11 +838,15 @@ impl HostEditor {
                 .mt(px(20.))
                 .bg(t.track)
         };
-        let stops: Vec<Option<String>> = if hops.is_empty() {
-            vec![None]
-        } else {
-            hops.into_iter().map(Some).collect()
-        };
+        let mut stops: Vec<(IconName, Option<String>)> = Vec::new();
+        if let Some(proxy) = proxy {
+            stops.push((IconName::Globe, proxy));
+        }
+        match hops {
+            Some(hops) if hops.is_empty() => stops.push((IconName::Shield, None)),
+            Some(hops) => stops.extend(hops.into_iter().map(|hop| (IconName::Shield, Some(hop)))),
+            None => {}
+        }
         let typed = self.name.read(cx).value();
         let this_host: SharedString = if typed.trim().is_empty() {
             "New host".into()
@@ -778,10 +862,10 @@ impl HostEditor {
             .rounded(px(16.))
             .bg(t.card2)
             .child(node(IconName::Laptop, None, false))
-            .children(stops.into_iter().flat_map(|hop| {
+            .children(stops.into_iter().flat_map(|(glyph, label)| {
                 [
                     link().into_any_element(),
-                    node(IconName::Shield, hop.map(Into::into), false).into_any_element(),
+                    node(glyph, label.map(Into::into), false).into_any_element(),
                 ]
             }))
             .child(link())
@@ -1032,20 +1116,29 @@ impl HostEditor {
         mono: bool,
         t: &Theme,
     ) -> Div {
+        labelled(label, t).child(self.field_body(input, field, mono, t))
+    }
+
+    /// A text field's box, outlined in red while it has a problem.
+    fn field_body(
+        &self,
+        input: &Entity<InputState>,
+        field: Option<Field>,
+        mono: bool,
+        t: &Theme,
+    ) -> Div {
         let bad = field.is_some_and(|field| self.has_problem(field));
-        labelled(label, t).child(
-            div()
-                .h(px(44.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .rounded(px(12.))
-                .bg(t.card2)
-                .border_1()
-                .border_color(if bad { t.danger } else { t.card2 })
-                .when(mono, |d| d.font_family(MONO))
-                .child(Input::new(input).appearance(false)),
-        )
+        div()
+            .h(px(44.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .rounded(px(12.))
+            .bg(t.card2)
+            .border_1()
+            .border_color(if bad { t.danger } else { t.card2 })
+            .when(mono, |d| d.font_family(MONO))
+            .child(Input::new(input).appearance(false))
     }
 
     /// A field that opens a list to choose from. `shown` is the field's text;

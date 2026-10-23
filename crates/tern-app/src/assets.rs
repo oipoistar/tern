@@ -15,6 +15,7 @@ gpui_kit::assets::icon_assets!(
         Columns2,
         Download,
         Funnel,
+        Globe,
         Import,
         KeyRound,
         Laptop,

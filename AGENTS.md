@@ -50,7 +50,7 @@ host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
 OpenSSH certificates (`certs.rs`),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
 (`history.rs`), the vault's filter (`filter.rs`), links in terminal
-text (`links.rs`), port forwarding
+text (`links.rs`), proxies (`proxy.rs`), port forwarding
 (`forward.rs`), agent forwarding (`agent.rs`), SFTP (`sftp.rs`), settings
 (`settings.rs`), sync (`sync.rs`), the system's credential store
 (`secrets.rs`), reading

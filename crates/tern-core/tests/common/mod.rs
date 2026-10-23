@@ -391,6 +391,7 @@ pub fn request(
         },
         credentials,
         jumps: Vec::new(),
+        proxy: None,
         size: TermSize { cols: 80, rows: 24 },
         trust,
         keep_alive: true,

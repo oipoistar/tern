@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
 use crate::forward::Forward;
+use crate::proxy::Proxy;
 
 /// Reachability of a saved host, as last observed (see [`crate::reach`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +60,10 @@ pub struct Host {
     /// Another saved host to connect through first, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
+    /// A proxy to reach this host through, when Tern connects to it itself
+    /// (not through a jump host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<Proxy>,
     /// Ping the server every 30 seconds so idle connections stay up.
     #[serde(default = "on")]
     pub keep_alive: bool,
@@ -114,6 +119,7 @@ impl Host {
             tags: Vec::new(),
             auth: Auth::Agent,
             jump: None,
+            proxy: None,
             keep_alive: true,
             agent_forwarding: false,
             on_login: None,

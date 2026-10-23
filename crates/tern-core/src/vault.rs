@@ -209,14 +209,18 @@ impl Vault {
         false
     }
 
-    /// Where to check that `host` answers: the first hop when it goes
-    /// through jump hosts, otherwise the host itself.
-    pub fn first_hop(&self, host: &Host) -> Place {
-        let hop = self
-            .jumps(host)
+    /// The host Tern dials itself to reach `host`: the first jump host
+    /// when it goes through any, otherwise the host.
+    pub fn first_hop_host<'a>(&'a self, host: &'a Host) -> &'a Host {
+        self.jumps(host)
             .ok()
             .and_then(|chain| chain.first().copied())
-            .unwrap_or(host);
+            .unwrap_or(host)
+    }
+
+    /// Where to check that `host` answers: its first hop.
+    pub fn first_hop(&self, host: &Host) -> Place {
+        let hop = self.first_hop_host(host);
         (hop.address.clone(), hop.port)
     }
 
@@ -236,6 +240,7 @@ impl Vault {
             target: host.ssh_target(),
             auth: host.auth.clone(),
             jumps,
+            proxy: self.first_hop_host(host).proxy.clone(),
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
             env: host
@@ -340,8 +345,8 @@ impl Vault {
 /// misread the file (dropping something it doesn't know when it saves);
 /// older versions then leave it alone instead. 2 added snippets, 3 port
 /// forwarding rules, 4 ids, change times and deletions for sync, 5 agent
-/// forwarding, 6 environment variables.
-pub const FILE_VERSION: u32 = 6;
+/// forwarding, 6 environment variables, 7 proxies.
+pub const FILE_VERSION: u32 = 7;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -651,7 +656,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 6"), "{text}");
+        assert!(text.contains("\"version\": 7"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());

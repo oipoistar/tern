@@ -22,6 +22,7 @@ use crate::certs;
 use crate::forward::{Forward, ForwardState, Forwarder, RemoteTargets, serve_remote};
 use crate::host::Auth;
 use crate::paths;
+use crate::proxy::{self, Proxy};
 use crate::randomart::Randomart;
 use crate::sftp::{self, Sftp};
 
@@ -68,6 +69,8 @@ pub struct ConnectRequest {
     /// Sign in to each of these in turn, first hop first, and reach the
     /// target through them (`ssh -J a,b`).
     pub jumps: Vec<(Target, Vec<Credential>)>,
+    /// Reach the first hop through this proxy.
+    pub proxy: Option<Proxy>,
     pub size: TermSize,
     /// A host key the user has just accepted, for the target or the jump
     /// host. It's saved to Tern's known hosts once that host is verified.
@@ -101,6 +104,8 @@ pub struct Connection {
     pub auth: Auth,
     /// The hosts to go through, first hop first.
     pub jumps: Vec<Jump>,
+    /// The proxy the first hop is reached through.
+    pub proxy: Option<Proxy>,
     pub keep_alive: bool,
     /// Let the server use this computer's SSH agent.
     pub agent_forwarding: bool,
@@ -121,6 +126,7 @@ impl Connection {
             target,
             auth: identity.map_or(Auth::Agent, Auth::Key),
             jumps: Vec::new(),
+            proxy: None,
             keep_alive: true,
             agent_forwarding: false,
             env: Vec::new(),
@@ -145,6 +151,7 @@ impl Connection {
                 .iter()
                 .map(|jump| (jump.target.clone(), credentials_for(&jump.auth, None)))
                 .collect(),
+            proxy: self.proxy.clone(),
             size,
             trust,
             keep_alive: self.keep_alive,
@@ -383,6 +390,7 @@ async fn run(
         target,
         credentials,
         jumps,
+        proxy,
         size,
         trust,
         keep_alive,
@@ -396,12 +404,15 @@ async fn run(
     // connection must outlive the session.
     let mut via = Vec::new();
     let mut tunnel = None;
+    // Only the first hop is dialled from here, so only it uses the proxy.
+    let mut proxy = proxy;
     for (at, (jump, jump_credentials)) in jumps.iter().enumerate() {
         let mut jump_handle = open(
             keep_alive,
             jump,
             trust.clone(),
             tunnel.take(),
+            proxy.take(),
             RemoteTargets::default(),
             false,
         )
@@ -429,6 +440,7 @@ async fn run(
         &target,
         trust,
         tunnel,
+        proxy,
         remote.clone(),
         agent_forwarding,
     )
@@ -518,14 +530,16 @@ async fn run(
     Ok(())
 }
 
-/// Connects to `target` and verifies its host key, over TCP or, through
-/// jump hosts, over `tunnel`. Host certificates are asked for only when a
-/// known_hosts file names an authority for the host, as OpenSSH does.
+/// Connects to `target` and verifies its host key: over TCP, through
+/// `proxy`, or, through jump hosts, over `tunnel`. Host certificates are
+/// asked for only when a known_hosts file names an authority for the host,
+/// as OpenSSH does.
 async fn open(
     keep_alive: bool,
     target: &Target,
     trust: Option<PublicKey>,
     tunnel: Option<ChannelStream<client::Msg>>,
+    proxy: Option<Proxy>,
     remote: RemoteTargets,
     agent_forwarding: bool,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
@@ -548,9 +562,15 @@ async fn open(
         remote,
         agent_forwarding,
     };
-    let connected = match tunnel {
-        Some(stream) => client::connect_stream(config, stream, handler).await,
-        None => client::connect(config, (target.host.as_str(), target.port), handler).await,
+    let connected = match (tunnel, proxy) {
+        (Some(stream), _) => client::connect_stream(config, stream, handler).await,
+        (None, Some(proxy)) => {
+            let stream = proxy::connect(&proxy, &target.host, target.port)
+                .await
+                .map_err(other)?;
+            client::connect_stream(config, stream, handler).await
+        }
+        (None, None) => client::connect(config, (target.host.as_str(), target.port), handler).await,
     };
     // A rejected host key surfaces as a generic russh error; report ours.
     connected.map_err(|error| {
@@ -783,18 +803,27 @@ pub struct Reached {
 /// Checks that an SSH server answers at `host:port` without signing in: a
 /// TCP connection, timed, then the server's greeting. Runs on Tern's
 /// runtime; await it from any executor. Errors are a few lowercase words.
-pub fn probe(host: &str, port: u16) -> impl Future<Output = Result<Reached, String>> + 'static {
+pub fn probe(
+    host: &str,
+    port: u16,
+    proxy: Option<Proxy>,
+) -> impl Future<Output = Result<Reached, String>> + 'static {
     let host = host.to_string();
-    spawn(async move { probe_now(&host, port).await })
+    spawn(async move { probe_now(&host, port, proxy).await })
 }
 
-async fn probe_now(host: &str, port: u16) -> Result<Reached, String> {
+async fn probe_now(host: &str, port: u16, proxy: Option<Proxy>) -> Result<Reached, String> {
     let started = Instant::now();
-    let connect = tokio::net::TcpStream::connect((host, port));
-    let stream = tokio::time::timeout(PROBE_TIMEOUT, connect)
-        .await
-        .map_err(|_| "no answer".to_string())?
-        .map_err(|error| describe(&error))?;
+    let stream = match &proxy {
+        // Through a proxy, the time it takes to open the tunnel.
+        Some(proxy) => tokio::time::timeout(PROBE_TIMEOUT, proxy::connect(proxy, host, port))
+            .await
+            .map_err(|_| "no answer".to_string())??,
+        None => tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect((host, port)))
+            .await
+            .map_err(|_| "no answer".to_string())?
+            .map_err(|error| describe(&error))?,
+    };
     let latency_ms = started.elapsed().as_micros().div_ceil(1000).max(1) as u32;
     // Servers may send other lines before the version line (RFC 4253 4.2).
     let mut lines = BufReader::new(stream).lines();
@@ -1191,7 +1220,7 @@ mod tests {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(probe("127.0.0.1", port))
+                .block_on(probe("127.0.0.1", port, None))
         };
 
         let reached = check(serve(b"hello\r\nSSH-2.0-Test_1.0\r\n")).unwrap();

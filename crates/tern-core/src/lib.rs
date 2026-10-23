@@ -13,6 +13,7 @@ pub mod keys;
 pub mod known_hosts;
 pub mod links;
 pub mod paths;
+pub mod proxy;
 pub mod putty;
 pub mod randomart;
 pub mod reach;
