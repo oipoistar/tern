@@ -236,6 +236,20 @@ impl VaultContent {
         self.showing = showing;
     }
 
+    /// Every saved host's name and `user@address`, in vault order.
+    pub fn host_entries(&self) -> Vec<(String, String)> {
+        self.vault
+            .hosts()
+            .map(|host| (host.name.clone(), host.target()))
+            .collect()
+    }
+
+    /// Connects to the saved host `name`, as its card's arrow does.
+    pub fn open_host(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = name.to_string();
+        self.connect_saved(name, window, cx);
+    }
+
     /// Gives the vault the keyboard, for moving through hosts.
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.focus.focus(window, cx);

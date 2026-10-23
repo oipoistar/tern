@@ -187,6 +187,11 @@ claude.ai account). Each item below names the artboard it comes from.
       take the mouse) offers Copy, Paste, Select all, Find, Clear
       scrollback and Save output, which writes the scrollback and screen
       to a text file
+- [x] Command palette: Ctrl+Shift+P (Cmd+Shift+P on macOS), or the
+      search button in the header, finds saved hosts, open tabs,
+      snippets and Tern's own screens and actions by a few of their
+      letters; Up and Down pick, Enter runs, Escape gives the keyboard
+      back
 
 ## Known gaps in what's built
 

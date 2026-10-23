@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
@@ -45,6 +45,8 @@ pub enum Shortcut {
     /// included.
     NextTab,
     PreviousTab,
+    /// Ctrl+Shift+P (Cmd+Shift+P on macOS): the command palette.
+    Palette,
 }
 
 /// The window shortcut `keystroke` is, if any. Panes leave these alone.
@@ -54,6 +56,7 @@ pub fn shortcut(keystroke: &Keystroke) -> Option<Shortcut> {
         "t" if (m.control && m.shift && !m.alt) || (m.platform && !m.shift) => {
             Some(Shortcut::NewLocal)
         }
+        "p" if m.shift && !m.alt && (m.control || m.platform) => Some(Shortcut::Palette),
         "tab" if m.control && !m.alt => Some(if m.shift {
             Shortcut::PreviousTab
         } else {
@@ -84,6 +87,61 @@ impl Tab {
     }
 }
 
+/// A square outlined button in the header, holding an icon.
+fn header_button(id: &'static str, glyph: IconName, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .size(px(38.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(theme.line)
+        .bg(theme.card)
+        .shadow(theme.shadow_sm())
+        .cursor_pointer()
+        .child(icon(glyph, 18., theme.text2))
+}
+
+/// What a command palette entry does.
+#[derive(Clone)]
+enum Command {
+    /// Connect to the saved host.
+    Connect(String),
+    /// Show the tab (`None` is the vault).
+    Tab(Option<usize>),
+    /// Type the snippet into the focused pane.
+    Snippet(usize),
+    NewLocal,
+    Settings,
+    /// Show a vault screen, by `--show` name.
+    Screen(&'static str),
+    Theme,
+}
+
+/// A command palette entry.
+#[derive(Clone)]
+struct Entry {
+    glyph: IconName,
+    label: SharedString,
+    detail: Option<SharedString>,
+    command: Command,
+}
+
+/// The command palette: a field and the entries that match it.
+struct Palette {
+    input: Entity<InputState>,
+    selected: usize,
+    /// What had the keyboard before, given it back on closing.
+    restore: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
+/// Entries the palette shows at most.
+const PALETTE_ROWS: usize = 8;
+
 /// A snippet waiting for its `{{name}}` values before it's typed.
 struct Filling {
     snippet: Snippet,
@@ -95,6 +153,7 @@ struct Filling {
 pub struct Workspace {
     vault: Entity<VaultContent>,
     filling: Option<Filling>,
+    palette: Option<Palette>,
     tabs: Vec<Tab>,
     /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
@@ -161,6 +220,19 @@ impl Workspace {
                 .vault
                 .update(cx, |vault, cx| vault.show_named(&screen, window, cx));
         }
+        // `tern --palette [query]` opens the command palette, likewise.
+        let mut args = std::env::args().skip_while(|arg| arg != "--palette");
+        if args.next().is_some() {
+            workspace.open_palette(window, cx);
+            if let (Some(query), Some(palette)) = (
+                args.next().filter(|arg| !arg.starts_with("--")),
+                &workspace.palette,
+            ) {
+                palette
+                    .input
+                    .update(cx, |input, cx| input.set_value(query, window, cx));
+            }
+        }
         workspace
     }
 
@@ -221,6 +293,7 @@ impl Workspace {
         Self {
             vault,
             filling: None,
+            palette: None,
             tabs: Vec::new(),
             active: None,
             live,
@@ -265,6 +338,326 @@ impl Workspace {
         }
     }
 
+    /// Opens the command palette, its field focused.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        let restore = window.focused(cx);
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    if let Some(palette) = &mut this.palette {
+                        palette.selected = 0;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.run_selected(window, cx),
+                _ => {}
+            },
+        );
+        self.palette = Some(Palette {
+            input,
+            selected: 0,
+            restore,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Closes the palette, the keyboard back where it was.
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(restore) = self.palette.take().and_then(|palette| palette.restore) {
+            window.focus(&restore, cx);
+        }
+        cx.notify();
+    }
+
+    /// Everything the palette offers: hosts, open tabs, snippets, then
+    /// the window's own actions.
+    fn entries(&self, cx: &App) -> Vec<Entry> {
+        let vault = self.vault.read(cx);
+        let mut entries: Vec<Entry> = vault
+            .host_entries()
+            .into_iter()
+            .map(|(name, target)| Entry {
+                glyph: IconName::Server,
+                label: name.clone().into(),
+                detail: Some(target.into()),
+                command: Command::Connect(name),
+            })
+            .collect();
+        entries.push(Entry {
+            glyph: IconName::LayoutGrid,
+            label: "Vault".into(),
+            detail: None,
+            command: Command::Tab(None),
+        });
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let pane = tab.focused().read(cx);
+            entries.push(Entry {
+                glyph: IconName::SquareTerminal,
+                label: pane.title(),
+                detail: Some(pane.label()),
+                command: Command::Tab(Some(index)),
+            });
+        }
+        if self.active.is_some() {
+            for (index, snippet) in vault.snippets().iter().enumerate() {
+                entries.push(Entry {
+                    glyph: IconName::CodeXml,
+                    label: snippet.name.clone().into(),
+                    detail: Some(snippet.command.clone().into()),
+                    command: Command::Snippet(index),
+                });
+            }
+        }
+        let action = |glyph, label: &'static str, command| Entry {
+            glyph,
+            label: label.into(),
+            detail: None,
+            command,
+        };
+        entries.extend([
+            action(
+                IconName::SquareTerminal,
+                "New local terminal",
+                Command::NewLocal,
+            ),
+            action(IconName::SlidersHorizontal, "Settings", Command::Settings),
+            if theme::current(cx).dark {
+                action(IconName::Sun, "Light appearance", Command::Theme)
+            } else {
+                action(IconName::Moon, "Dark appearance", Command::Theme)
+            },
+            action(IconName::KeyRound, "Keychain", Command::Screen("keychain")),
+            action(
+                IconName::KeyRound,
+                "Identities",
+                Command::Screen("identities"),
+            ),
+            action(IconName::CodeXml, "Snippets", Command::Screen("snippets")),
+            action(
+                IconName::ArrowLeftRight,
+                "Port forwarding",
+                Command::Screen("forwarding"),
+            ),
+            action(
+                IconName::ShieldCheck,
+                "Known hosts",
+                Command::Screen("known-hosts"),
+            ),
+            action(IconName::Clock, "History", Command::Screen("history")),
+        ]);
+        entries
+    }
+
+    /// The entries matching what's typed, best first.
+    fn matching(&self, query: &str, cx: &App) -> Vec<Entry> {
+        let mut scored: Vec<(u32, Entry)> = self
+            .entries(cx)
+            .into_iter()
+            .filter_map(|entry| {
+                let label = tern_core::fuzzy::score(query, &entry.label);
+                let detail = entry
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| tern_core::fuzzy::score(query, detail))
+                    .map(|score| score / 2);
+                label.max(detail).map(|score| (score, entry))
+            })
+            .collect();
+        // Stable, so equal scores keep their place: hosts, tabs, snippets.
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored
+            .into_iter()
+            .take(PALETTE_ROWS)
+            .map(|(_, entry)| entry)
+            .collect()
+    }
+
+    fn move_selection(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let count = self.matching(&palette.input.read(cx).value(), cx).len();
+        if let Some(palette) = &mut self.palette
+            && count > 0
+        {
+            palette.selected = (palette.selected as isize + by).rem_euclid(count as isize) as usize;
+        }
+        cx.notify();
+    }
+
+    /// Runs the selected entry and closes the palette.
+    fn run_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let entries = self.matching(&palette.input.read(cx).value(), cx);
+        let Some(entry) = entries.get(palette.selected).cloned() else {
+            return;
+        };
+        self.close_palette(window, cx);
+        self.run_command(entry.command, window, cx);
+    }
+
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::Connect(name) => self
+                .vault
+                .update(cx, |vault, cx| vault.open_host(&name, window, cx)),
+            Command::Tab(index) => self.activate(index, window, cx),
+            Command::Snippet(index) => self.run_snippet(index, window, cx),
+            Command::NewLocal => self.open_local(window, cx),
+            Command::Settings => self.open_settings(Page::Terminal, window, cx),
+            Command::Screen(name) => {
+                self.activate(None, window, cx);
+                self.vault
+                    .update(cx, |vault, cx| vault.show_named(name, window, cx));
+            }
+            Command::Theme => {
+                let dark = theme::current(cx).dark;
+                settings::update(cx, |settings| {
+                    settings.appearance = if dark {
+                        tern_core::settings::Appearance::Light
+                    } else {
+                        tern_core::settings::Appearance::Dark
+                    }
+                });
+                settings::apply_appearance(window, cx);
+            }
+        }
+    }
+
+    /// The palette over the window: a field, then the entries that match,
+    /// the selected one in ink.
+    fn palette_view(
+        &self,
+        palette: &Palette,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let entries = self.matching(&palette.input.read(cx).value(), cx);
+        div()
+            .id("palette-scrim")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .pt(px(90.))
+            .flex()
+            .justify_center()
+            .items_start()
+            .bg(theme.scrim())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
+            )
+            .child(
+                div()
+                    .id("palette")
+                    .debug_selector(|| "palette".into())
+                    .w(px(560.))
+                    .max_w_full()
+                    .p(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .rounded(px(20.))
+                    .bg(theme.card)
+                    .border_1()
+                    .border_color(theme.line)
+                    .shadow(theme.shadow_lg())
+                    .text_color(theme.text)
+                    // Clicks inside stay inside.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                        this.move_selection(-1, cx);
+                        cx.stop_propagation();
+                    }))
+                    .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                        this.move_selection(1, cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            this.close_palette(window, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .h(px(44.))
+                            .px(px(12.))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .rounded(px(13.))
+                            .bg(theme.card2)
+                            .child(icon(IconName::Search, 16., theme.text2))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(14.))
+                                    .child(Input::new(&palette.input).appearance(false)),
+                            ),
+                    )
+                    .children(entries.into_iter().enumerate().map(|(index, entry)| {
+                        let on = index == palette.selected;
+                        let id = format!("palette-{index}");
+                        let (ink, faint) = if on {
+                            (theme.card, theme.card.opacity(0.7))
+                        } else {
+                            (theme.text, theme.text2)
+                        };
+                        let command = entry.command.clone();
+                        div()
+                            .id(SharedString::from(id.clone()))
+                            .debug_selector(move || id)
+                            .h(px(40.))
+                            .px(px(12.))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .rounded(px(11.))
+                            .when(on, |d| d.bg(theme.text))
+                            .text_color(ink)
+                            .cursor_pointer()
+                            .child(icon(entry.glyph, 15., ink))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(240.))
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(entry.label),
+                            )
+                            .children(entry.detail.map(|detail| {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(MONO)
+                                    .text_size(px(12.))
+                                    .text_color(faint)
+                                    .child(detail)
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_palette(window, cx);
+                                this.run_command(command.clone(), window, cx);
+                            }))
+                    })),
+            )
+    }
+
     /// A tab with a shell on this computer.
     fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_session(Connection::local(), window, cx);
@@ -283,6 +676,7 @@ impl Workspace {
             next => Some(next - 1),
         };
         match shortcut {
+            Shortcut::Palette => self.open_palette(window, cx),
             Shortcut::NewLocal => self.open_local(window, cx),
             Shortcut::NextTab => self.activate(step(1), window, cx),
             Shortcut::PreviousTab => self.activate(step(count - 1), window, cx),
@@ -1097,54 +1491,33 @@ impl Workspace {
                 )
             })
             .child(
-                div()
-                    .id("open-settings")
-                    .debug_selector(|| "open-settings".into())
-                    .size(px(38.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(theme.line)
-                    .bg(theme.card)
-                    .shadow(theme.shadow_sm())
-                    .cursor_pointer()
-                    .child(icon(IconName::SlidersHorizontal, 18., theme.text2))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(Page::Terminal, window, cx)
-                    })),
+                header_button("open-palette", IconName::Search, theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(
-                div()
-                    .id("theme-toggle")
-                    .debug_selector(|| "theme-toggle".into())
-                    .size(px(38.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(theme.line)
-                    .bg(theme.card)
-                    .shadow(theme.shadow_sm())
-                    .cursor_pointer()
-                    .child(icon(
-                        if dark { IconName::Sun } else { IconName::Moon },
-                        18.,
-                        theme.text2,
-                    ))
-                    // A choice made here sticks, as if made in Settings.
-                    .on_click(move |_, window, cx| {
-                        settings::update(cx, |settings| {
-                            settings.appearance = if dark {
-                                tern_core::settings::Appearance::Light
-                            } else {
-                                tern_core::settings::Appearance::Dark
-                            }
-                        });
-                        settings::apply_appearance(window, cx);
+                header_button("open-settings", IconName::SlidersHorizontal, theme).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_settings(Page::Terminal, window, cx)
                     }),
+                ),
+            )
+            .child(
+                header_button(
+                    "theme-toggle",
+                    if dark { IconName::Sun } else { IconName::Moon },
+                    theme,
+                )
+                // A choice made here sticks, as if made in Settings.
+                .on_click(move |_, window, cx| {
+                    settings::update(cx, |settings| {
+                        settings.appearance = if dark {
+                            tern_core::settings::Appearance::Light
+                        } else {
+                            tern_core::settings::Appearance::Dark
+                        }
+                    });
+                    settings::apply_appearance(window, cx);
+                }),
             )
     }
 
@@ -1354,6 +1727,9 @@ impl Render for Workspace {
             .child(self.header(&theme, cx))
             .child(div().flex_1().min_h_0().child(body))
             .child(live_layer(&self.live, time))
+            .when_some(self.palette.as_ref(), |d, palette| {
+                d.child(self.palette_view(palette, &theme, cx))
+            })
             .when_some(self.settings.clone(), |d, view| {
                 d.child(
                     div()
@@ -1581,6 +1957,56 @@ mod tests {
         click(cx, "new-snippet");
         workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
         assert!(cx.debug_bounds("save-snippet").is_some());
+    }
+
+    #[gpui::test]
+    fn the_palette_runs_what_it_finds(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let palette = if cfg!(target_os = "macos") {
+            "cmd-shift-p"
+        } else {
+            "ctrl-shift-p"
+        };
+        let first = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        cx.update(|window, cx| first.update(cx, |pane, cx| pane.focus(window, cx)));
+
+        // Down passes over the first match; Enter connects to the second.
+        cx.simulate_keystrokes(palette);
+        assert!(cx.debug_bounds("palette").is_some());
+        cx.simulate_input("prod");
+        cx.simulate_keystrokes("down enter");
+        assert!(cx.debug_bounds("palette").is_none());
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active, Some(1));
+            let pane = workspace.tabs[1].focused().read(cx);
+            assert_eq!(pane.connection().target.host, "web-01.internal");
+        });
+
+        // Escape runs nothing and gives the keyboard back.
+        cx.simulate_keystrokes(palette);
+        cx.simulate_input("local");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("palette").is_none());
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.tabs.len(), 2));
+        let second = workspace.read_with(cx, |workspace, _| workspace.tabs[1].focused().clone());
+        cx.update(|window, cx| {
+            assert!(second.read(cx).is_focused(window));
+        });
+
+        // A click runs a row; the search button opens it too.
+        click(cx, "open-palette");
+        cx.simulate_input("known");
+        click(cx, "palette-0");
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, None));
+        assert!(cx.debug_bounds("known-hosts").is_some());
+
+        // The window's own actions.
+        let dark = |cx: &mut VisualTestContext| cx.update(|_, cx| crate::theme::current(cx).dark);
+        let before = dark(cx);
+        click(cx, "open-palette");
+        cx.simulate_input("appearance");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(dark(cx), !before);
     }
 
     #[gpui::test]

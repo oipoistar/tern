@@ -7,6 +7,7 @@ pub mod draft;
 pub mod env;
 pub mod filter;
 pub mod forward;
+pub mod fuzzy;
 pub mod history;
 pub mod host;
 pub mod identity;
