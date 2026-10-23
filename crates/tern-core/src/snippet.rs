@@ -1,6 +1,8 @@
 //! Snippets: saved commands, typed into a session from its snippet bar.
 //! They live in the vault file beside the hosts.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 use crate::host::new_id;
@@ -39,38 +41,22 @@ impl Snippet {
         text.into_bytes()
     }
 
-    /// The command as one line for a shell to run after login, lines
-    /// joined by returns; `after` (a host's own command) goes first.
-    pub fn after_login(&self, after: Option<&str>) -> String {
-        let typed = self
-            .command
+    /// The command as one line for a shell, its lines joined by returns.
+    pub fn line(&self) -> String {
+        self.command
             .trim_end_matches(['\r', '\n'])
             .replace("\r\n", "\n")
-            .replace('\n', "\r");
-        match after {
-            Some(first) if !first.trim().is_empty() => format!("{first}\r{typed}"),
-            _ => typed,
-        }
+            .replace('\n', "\r")
     }
 
     /// The `{{name}}` placeholders in the command, each once, in order:
     /// values to ask for before typing it.
     pub fn variables(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        let mut rest = self.command.as_str();
-        while let Some(start) = rest.find("{{") {
-            let after = &rest[start + 2..];
-            let Some(end) = after.find("}}") else {
-                break;
-            };
-            let name = after[..end].trim();
-            if !name.is_empty()
-                && !name.contains(['{', '}'])
-                && !names.iter().any(|have| have == name)
-            {
+        for (_, name) in placeholders(&self.command) {
+            if !names.iter().any(|have| have == name) {
                 names.push(name.to_string());
             }
-            rest = &after[end + 2..];
         }
         names
     }
@@ -78,12 +64,16 @@ impl Snippet {
     /// A copy with each `{{name}}` replaced by its value; placeholders
     /// without one stay as they are.
     pub fn filled(&self, values: &[(String, String)]) -> Snippet {
-        let mut command = self.command.clone();
-        for (name, value) in values {
-            for spelling in [format!("{{{{{name}}}}}"), format!("{{{{ {name} }}}}")] {
-                command = command.replace(&spelling, value);
+        let mut command = String::new();
+        let mut copied = 0;
+        for (range, name) in placeholders(&self.command) {
+            if let Some((_, value)) = values.iter().find(|(have, _)| have == name) {
+                command.push_str(&self.command[copied..range.start]);
+                command.push_str(value);
+                copied = range.end;
             }
         }
+        command.push_str(&self.command[copied..]);
         Snippet {
             command,
             ..self.clone()
@@ -98,6 +88,37 @@ impl Snippet {
             .split_whitespace()
             .all(|term| haystack.contains(&term.to_lowercase()))
     }
+}
+
+/// Each `{{name}}` placeholder in `command`, with where it is: a name is a
+/// letter or `_`, then letters, digits, `_` or `-`, spaced inside the
+/// braces as it likes. Other braces, like a Go template's `{{.Names}}`,
+/// are only text.
+fn placeholders(command: &str) -> Vec<(Range<usize>, &str)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(start) = command[from..].find("{{").map(|at| from + at) {
+        let inside = start + 2;
+        let Some(length) = command[inside..].find("}}") else {
+            break;
+        };
+        let name = command[inside..inside + length].trim_matches(' ');
+        let is_name = name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if is_name {
+            let end = inside + length + 2;
+            found.push((start..end, name));
+            from = end;
+        } else {
+            from = inside;
+        }
+    }
+    found
 }
 
 /// Checks a snippet as typed against the saved ones: a name no other
@@ -165,11 +186,32 @@ mod tests {
     }
 
     #[test]
-    fn runs_after_a_hosts_own_command() {
+    fn leaves_other_braces_alone() {
+        // Any spacing inside the braces, filled the same.
+        let forget = snippet("forget", "ssh-keygen -R {{ host}} && ssh {{host  }}");
+        assert_eq!(forget.variables(), ["host"]);
+        let values = [("host".to_string(), "web-01".to_string())];
+        assert_eq!(
+            forget.filled(&values).command,
+            "ssh-keygen -R web-01 && ssh web-01"
+        );
+        // Go templates aren't names, so they're typed as written.
+        let docker = snippet(
+            "names",
+            "docker ps --format '{{.Names}} {{json .}}' {{ {{tag}} }}",
+        );
+        assert_eq!(docker.variables(), ["tag"]);
+        let values = [("tag".to_string(), "v2".to_string())];
+        assert_eq!(
+            docker.filled(&values).command,
+            "docker ps --format '{{.Names}} {{json .}}' {{ v2 }}"
+        );
+    }
+
+    #[test]
+    fn joins_its_lines_with_returns() {
         let disk = snippet("disk", "df -h\nuptime\n");
-        assert_eq!(disk.after_login(None), "df -h\ruptime");
-        assert_eq!(disk.after_login(Some("cd /srv")), "cd /srv\rdf -h\ruptime");
-        assert_eq!(disk.after_login(Some("  ")), "df -h\ruptime");
+        assert_eq!(disk.line(), "df -h\ruptime");
     }
 
     fn named(result: Result<Snippet, String>) -> Result<(String, String), String> {

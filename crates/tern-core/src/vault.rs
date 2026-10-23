@@ -206,6 +206,36 @@ impl Vault {
         self.groups.retain(|group| !group.hosts.is_empty());
     }
 
+    /// Adds imported `hosts` to `group`, each under a name no other host has
+    /// (ignoring case): a taken one gets " (group)", then a number too. Jump
+    /// hosts among them follow their renames.
+    pub fn import(&mut self, mut hosts: Vec<Host>, group: &str) {
+        let mut taken: Vec<String> = self.hosts().map(|host| host.name.to_lowercase()).collect();
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for host in &mut hosts {
+            let free = (1..)
+                .map(|n| match n {
+                    1 => host.name.clone(),
+                    2 => format!("{} ({group})", host.name),
+                    n => format!("{} ({group}) {}", host.name, n - 1),
+                })
+                .find(|name| !taken.contains(&name.to_lowercase()))
+                .expect("some number is free");
+            taken.push(free.to_lowercase());
+            // A jump among them means the first host of that name.
+            renamed
+                .entry(host.name.clone())
+                .or_insert_with(|| free.clone());
+            host.name = free;
+        }
+        for mut host in hosts {
+            if let Some(name) = host.jump.as_ref().and_then(|jump| renamed.get(jump)) {
+                host.jump = Some(name.clone());
+            }
+            self.save(None, host, group);
+        }
+    }
+
     /// Removes a host. Refused while other hosts go through it; the error
     /// names them. A group left empty goes away.
     pub fn delete(&mut self, name: &str) -> Result<(), Vec<String>> {
@@ -321,6 +351,7 @@ impl Vault {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             on_login: host.on_login.clone(),
+            once: None,
             forwards: host
                 .forwards
                 .iter()
@@ -570,6 +601,39 @@ fn set_aside(path: &Path, reason: &str) -> Opened {
 mod tests {
     use super::*;
     use crate::host::Auth;
+
+    #[test]
+    fn imports_under_names_no_host_has() {
+        let mut vault = Vault::default();
+        vault.save(None, Host::new("web", "me", "10.0.0.1", 22), "Hosts");
+        vault.save(
+            None,
+            Host::new("web (OpenSSH)", "me", "10.0.0.2", 22),
+            "Hosts",
+        );
+        let bastion = Host::new("WEB", "admin", "10.0.0.3", 22);
+        let behind = Host {
+            jump: Some("WEB".into()),
+            ..Host::new("db", "deploy", "10.0.0.4", 22)
+        };
+        let again = Host::new("db", "deploy", "10.0.0.5", 22);
+        vault.import(vec![bastion, behind, again], "OpenSSH");
+
+        let hosts: Vec<(&str, Option<&str>)> = vault
+            .hosts()
+            .map(|host| (host.name.as_str(), host.jump.as_deref()))
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                ("web", None),
+                ("web (OpenSSH)", None),
+                ("WEB (OpenSSH) 2", None),
+                ("db", Some("WEB (OpenSSH) 2")),
+                ("db (OpenSSH)", None),
+            ]
+        );
+    }
 
     fn names(vault: &Vault, group: usize) -> Vec<&str> {
         vault.groups[group]

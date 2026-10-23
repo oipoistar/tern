@@ -80,6 +80,8 @@ struct Tab {
     broadcast: bool,
     /// The Files panel, made when first opened, on the pane focused then.
     files: Option<Entity<FilesPanel>>,
+    /// The pane whose host the Files panel shows.
+    files_for: Option<Entity<TerminalView>>,
     files_open: bool,
 }
 
@@ -147,6 +149,8 @@ const PALETTE_ROWS: usize = 8;
 /// A snippet waiting for its `{{name}}` values before it's typed.
 struct Filling {
     snippet: Snippet,
+    /// The pane it was asked for in; it's typed into that pane's tab.
+    pane: Entity<TerminalView>,
     /// Each variable's name and field.
     fields: Vec<(String, Entity<InputState>)>,
     _subscriptions: Vec<Subscription>,
@@ -307,6 +311,8 @@ impl Workspace {
         let appearance = cx.observe_window_appearance(window, |_, window, cx| {
             settings::apply_appearance(window, cx)
         });
+        let focus_lost =
+            cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx));
         Self {
             vault,
             filling: None,
@@ -321,7 +327,7 @@ impl Workspace {
             tabs_file: None,
             remembered: (None, Vec::new()),
             _ticker: ticker,
-            _subscriptions: vec![connect, appearance],
+            _subscriptions: vec![connect, appearance, focus_lost],
         }
     }
 
@@ -358,6 +364,7 @@ impl Workspace {
             maximized: None,
             broadcast: false,
             files: None,
+            files_for: None,
             files_open: false,
         });
     }
@@ -422,6 +429,25 @@ impl Workspace {
                 .map(|tab| tab.panes.iter().map(|pane| pane.entity_id()).collect())
                 .collect(),
         );
+    }
+
+    /// Gives the keyboard somewhere to go when what had it is gone (a closed
+    /// form or row): the palette's field, Settings, the tab's pane, or the
+    /// vault. Keys reaching no view would also miss the window's shortcuts.
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(palette) = &self.palette {
+            palette
+                .input
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else if let Some(settings) = &self.settings {
+            settings.update(cx, |settings, cx| settings.focus(window, cx));
+        } else if let Some(index) = self.active {
+            self.tabs[index]
+                .focused()
+                .update(cx, |pane, cx| pane.focus(window, cx));
+        } else {
+            self.vault.update(cx, |vault, cx| vault.focus(window, cx));
+        }
     }
 
     /// Opens the command palette, its field focused.
@@ -751,6 +777,10 @@ impl Workspace {
 
     /// The window's shortcuts, which panes pass up.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Over the palette or Settings they would act behind it.
+        if self.palette.is_some() || self.settings.is_some() {
+            return;
+        }
         let Some(shortcut) = shortcut(&event.keystroke) else {
             return;
         };
@@ -791,21 +821,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let open = connection.host.as_deref().and_then(|host| {
-            self.tabs.iter().position(|tab| {
+            self.tabs.iter().enumerate().find_map(|(index, tab)| {
                 tab.panes
                     .iter()
-                    .any(|pane| pane.read(cx).is_live() && pane.read(cx).host() == Some(host))
+                    .position(|pane| pane.read(cx).is_live() && pane.read(cx).host() == Some(host))
+                    .map(|pane| (index, pane))
             })
         });
         match open {
-            Some(index) => self.activate(Some(index), window, cx),
+            // That host's pane takes the keyboard, so Files opens on it.
+            Some((index, pane)) => {
+                self.tabs[index].focused = pane;
+                self.activate(Some(index), window, cx);
+            }
             None => self.open_session(connection, window, cx),
         }
         if let Some(index) = self.active
             && files
-            && !self.tabs[index].files_open
         {
-            self.toggle_files(cx);
+            self.show_files(index, cx);
         }
     }
 
@@ -840,6 +874,7 @@ impl Workspace {
             maximized: None,
             broadcast: false,
             files: None,
+            files_for: None,
             files_open: false,
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
@@ -874,14 +909,24 @@ impl Workspace {
                         vault.set_forward_state(host, &forward, state, cx)
                     });
                 }
-                TerminalEvent::Typed(bytes) => this.broadcast(&terminal, bytes, cx),
+                TerminalEvent::Typed(bytes) => {
+                    this.broadcast(&terminal, |pane, cx| pane.type_text(bytes.clone(), cx), cx)
+                }
+                TerminalEvent::Pasted(text) => {
+                    this.broadcast(&terminal, |pane, cx| pane.type_paste(text, cx), cx)
+                }
             },
         ));
     }
 
-    /// Sends what was typed in `from` to the other panes of its tab, while
-    /// that tab broadcasts.
-    fn broadcast(&mut self, from: &Entity<TerminalView>, bytes: &[u8], cx: &mut Context<Self>) {
+    /// Gives the other panes of `from`'s tab what it was given, while that
+    /// tab broadcasts.
+    fn broadcast(
+        &mut self,
+        from: &Entity<TerminalView>,
+        give: impl Fn(&mut TerminalView, &mut Context<TerminalView>),
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.panes.contains(from)) else {
             return;
         };
@@ -889,7 +934,7 @@ impl Workspace {
             return;
         }
         for pane in tab.panes.iter().filter(|pane| *pane != from) {
-            pane.update(cx, |terminal, cx| terminal.type_text(bytes.to_vec(), cx));
+            pane.update(cx, |terminal, cx| give(terminal, cx));
         }
     }
 
@@ -937,8 +982,13 @@ impl Workspace {
         // The first pane already runs the host's rules.
         connection.forwards.clear();
         let new_terminal = self.new_terminal;
+        let broadcasting = self.tabs[index].broadcast;
         while self.tabs[index].panes.len() < count.min(MAX_PANES) {
-            let terminal = cx.new(|cx| new_terminal(connection.clone(), cx));
+            let terminal = cx.new(|cx| {
+                let mut terminal = new_terminal(connection.clone(), cx);
+                terminal.broadcasting = broadcasting;
+                terminal
+            });
             self.watch(&terminal, cx);
             let tab = &mut self.tabs[index];
             tab.panes.push(terminal);
@@ -952,22 +1002,44 @@ impl Workspace {
         if let Some(index) = self.active {
             let tab = &mut self.tabs[index];
             tab.broadcast = !tab.broadcast;
+            let on = tab.broadcast;
+            for pane in &tab.panes {
+                pane.update(cx, |pane, _| pane.broadcasting = on);
+            }
             cx.notify();
         }
     }
 
-    /// Shows or hides the Files panel, opening SFTP the first time.
+    /// Shows or hides the Files panel; shown, it's on the focused pane's
+    /// host.
     fn toggle_files(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
         };
-        let tab = &mut self.tabs[index];
-        if tab.files.is_none() {
-            let opening = tab.focused().read(cx).open_sftp();
-            tab.files =
-                Some(cx.new(|cx| FilesPanel::new(opening, FilesPanel::default_local_dir(), cx)));
+        if self.tabs[index].files_open {
+            self.tabs[index].files_open = false;
+            cx.notify();
+        } else {
+            self.show_files(index, cx);
         }
-        tab.files_open = !tab.files_open;
+    }
+
+    /// Opens the Files panel of tab `index` on its focused pane's host,
+    /// starting SFTP there unless the panel already shows that pane.
+    fn show_files(&mut self, index: usize, cx: &mut Context<Self>) {
+        let tab = &mut self.tabs[index];
+        let focused = tab.focused().clone();
+        if tab.files_for.as_ref() != Some(&focused) {
+            let (opening, host) = {
+                let pane = focused.read(cx);
+                (pane.open_sftp(), pane.label())
+            };
+            tab.files = Some(
+                cx.new(|cx| FilesPanel::new(opening, FilesPanel::default_local_dir(), host, cx)),
+            );
+            tab.files_for = Some(focused);
+        }
+        tab.files_open = true;
         cx.notify();
     }
 
@@ -987,7 +1059,7 @@ impl Workspace {
     /// Records a live pane in History as closed by hand.
     fn record_closed(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
         let terminal = terminal.read(cx);
-        if terminal.is_live() {
+        if terminal.is_live() && !terminal.connection().local {
             let visit = terminal.visit("Closed");
             self.vault.update(cx, |vault, cx| {
                 if let Some(host) = &visit.host {
@@ -1023,6 +1095,13 @@ impl Workspace {
         for pane in self.tabs[index].panes.clone() {
             self.record_closed(&pane, cx);
         }
+        if self
+            .filling
+            .as_ref()
+            .is_some_and(|filling| self.tabs[index].panes.contains(&filling.pane))
+        {
+            self.filling = None;
+        }
         self.tabs.remove(index);
         let next = match self.active {
             Some(active) if active == index => {
@@ -1031,18 +1110,24 @@ impl Workspace {
             Some(active) if active > index => Some(active - 1),
             other => other,
         };
+        // The tabs after it moved down, so the old index would mark another
+        // tab as seen.
+        self.active = next;
         self.activate(next, window, cx);
     }
 
     /// Types a saved snippet into the focused pane, or every pane while
     /// broadcasting; one with `{{name}}` variables asks for them first.
     fn run_snippet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(snippet) = self.vault.read(cx).snippets().get(index).cloned() else {
+        let (Some(active), Some(snippet)) = (
+            self.active,
+            self.vault.read(cx).snippets().get(index).cloned(),
+        ) else {
             return;
         };
         let names = snippet.variables();
         if names.is_empty() {
-            return self.type_snippet(&snippet, window, cx);
+            return self.type_snippet(active, &snippet, window, cx);
         }
         let fields: Vec<(String, Entity<InputState>)> = names
             .into_iter()
@@ -1074,6 +1159,7 @@ impl Workspace {
         }
         self.filling = Some(Filling {
             snippet,
+            pane: self.tabs[active].focused().clone(),
             fields,
             _subscriptions: subscriptions,
         });
@@ -1095,16 +1181,27 @@ impl Workspace {
             .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
             .collect();
         let snippet = filling.snippet.filled(&values);
+        let tab = self
+            .tabs
+            .iter()
+            .position(|tab| tab.panes.contains(&filling.pane));
         self.filling = None;
-        self.type_snippet(&snippet, window, cx);
+        if let Some(tab) = tab {
+            self.type_snippet(tab, &snippet, window, cx);
+        }
         cx.notify();
     }
 
-    fn type_snippet(&mut self, snippet: &Snippet, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.active else {
-            return;
-        };
-        let tab = &self.tabs[active];
+    /// Types `snippet` into tab `index`'s focused pane, or into all its
+    /// panes while it broadcasts.
+    fn type_snippet(
+        &mut self,
+        index: usize,
+        snippet: &Snippet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = &self.tabs[index];
         let panes = if tab.broadcast {
             tab.panes.clone()
         } else {
@@ -1115,9 +1212,11 @@ impl Workspace {
                 terminal.type_text(snippet.keystrokes(), cx)
             });
         }
-        self.tabs[active]
-            .focused()
-            .update(cx, |terminal, cx| terminal.focus(window, cx));
+        if self.active == Some(index) {
+            self.tabs[index]
+                .focused()
+                .update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
     }
 
     fn open_settings(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
@@ -1423,8 +1522,6 @@ impl Workspace {
             )
     }
 
-    /// Under the panes: a chip per snippet, then a dashed one to add
-    /// another.
     /// The values a snippet asks for, in a row above the snippet bar.
     fn filling_row(
         &self,
@@ -1440,10 +1537,13 @@ impl Workspace {
             .flex_wrap()
             .items_center()
             .gap(px(8.))
-            // Escape leaves the snippet untyped.
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            // Escape leaves the snippet untyped, and the keyboard with the
+            // pane.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    this.filling = None;
+                    if let Some(filling) = this.filling.take() {
+                        filling.pane.update(cx, |pane, cx| pane.focus(window, cx));
+                    }
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1480,6 +1580,8 @@ impl Workspace {
             )
     }
 
+    /// Under the panes: a chip per snippet, then a dashed one to add
+    /// another.
     fn snippet_bar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let names: Vec<String> = self
             .vault
@@ -1794,9 +1896,12 @@ impl Render for Workspace {
                                 d.child(files)
                             }),
                     )
-                    .when_some(self.filling.as_ref(), |d, filling| {
-                        d.child(self.filling_row(filling, &theme, cx))
-                    })
+                    .when_some(
+                        self.filling
+                            .as_ref()
+                            .filter(|filling| tab.panes.contains(&filling.pane)),
+                        |d, filling| d.child(self.filling_row(filling, &theme, cx)),
+                    )
                     .child(self.snippet_bar(&theme, cx))
                     .into_any_element()
             }
@@ -1966,6 +2071,144 @@ mod tests {
     }
 
     #[gpui::test]
+    fn types_a_one_off_command_at_the_first_login_only(cx: &mut TestAppContext) {
+        use tern_core::ssh::{Event, Target};
+
+        let (workspace, cx) = open_workspace(cx);
+        let target = Target {
+            host: "web-01".into(),
+            port: 22,
+            user: "deploy".into(),
+        };
+        let connection = Connection {
+            on_login: Some("cd /srv".into()),
+            once: Some("make deploy".into()),
+            ..Connection::typed(target, None)
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.vault.update(cx, |_, cx| {
+                cx.emit(VaultEvent::OpenTogether(vec![connection]))
+            })
+        });
+        cx.run_until_parked();
+        // Offline panes are signed in as they open.
+        let sent = |cx: &mut VisualTestContext, pane: usize| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.tabs[1].panes[pane].read(cx).sent.take()
+            })
+        };
+        assert_eq!(sent(cx, 0), b"cd /srv\rmake deploy\r");
+        // A reconnect types only the host's own command again.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[1].panes[0].clone());
+        pane.update(cx, |pane, cx| pane.on_session_event(Event::Connected, cx));
+        assert_eq!(sent(cx, 0), b"cd /srv\r");
+        // So does a pane split from it.
+        click(cx, "layout-2");
+        assert_eq!(sent(cx, 1), b"cd /srv\r");
+    }
+
+    #[gpui::test]
+    fn broadcast_pastes_ask_first_and_suit_each_shell(cx: &mut TestAppContext) {
+        use gpui_kit::ClipboardItem;
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        click(cx, "layout-2");
+        click(cx, "broadcast");
+        let panes = workspace.read_with(cx, |workspace, _| workspace.tabs[0].panes.clone());
+        // The first pane's shell takes pastes bracketed, the second's not.
+        panes[0].update(cx, |pane, cx| {
+            pane.on_session_event(Event::Output(b"\x1b[?2004h".to_vec()), cx)
+        });
+        cx.update(|window, cx| panes[0].update(cx, |pane, cx| pane.focus(window, cx)));
+        cx.write_to_clipboard(ClipboardItem::new_string("make\nmake install".into()));
+
+        // It asks first, though this pane's shell would take it bracketed.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-shift-v"
+        });
+        assert_eq!(sent(&workspace, cx), [Vec::<u8>::new(), Vec::new()]);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            sent(&workspace, cx),
+            [
+                b"\x1b[200~make\rmake install\x1b[201~".to_vec(),
+                b"make\rmake install".to_vec()
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn closing_a_tab_keeps_the_other_tabs_marks(cx: &mut TestAppContext) {
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        click(cx, "new-local");
+        click(cx, "new-local");
+        // On the middle tab, the last one rings.
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        let last = workspace.read_with(cx, |workspace, _| workspace.tabs[2].focused().clone());
+        last.update(cx, |pane, cx| {
+            pane.on_session_event(Event::Output(b"\x07".to_vec()), cx)
+        });
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.close_tab(0, window, cx))
+        });
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active, Some(0)));
+        last.read_with(cx, |pane, _| assert!(pane.rang));
+    }
+
+    #[gpui::test]
+    fn window_shortcuts_wait_while_the_palette_is_open(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        cx.update(|window, cx| first.update(cx, |pane, cx| pane.focus(window, cx)));
+        let active = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.active);
+
+        click(cx, "open-palette");
+        cx.simulate_keystrokes("ctrl-tab");
+        assert!(cx.debug_bounds("palette").is_some());
+        assert_eq!(active(cx), Some(0));
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(active(cx), None);
+    }
+
+    #[gpui::test]
+    fn files_opens_on_the_host_asked_for(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let sample = Vault::sample();
+        let connection = |name: &str| sample.connection(sample.find(name).unwrap()).unwrap();
+        let (web, db) = (connection("prod-web-01"), connection("prod-db-01"));
+        let emit = |cx: &mut VisualTestContext, event: VaultEvent| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.vault.update(cx, |_, cx| cx.emit(event))
+            });
+            cx.run_until_parked();
+        };
+        emit(cx, VaultEvent::OpenTogether(vec![web, db.clone()]));
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.tabs[1].focused, 0));
+
+        // The db's SFTP, not the focused web pane's.
+        emit(
+            cx,
+            VaultEvent::Open {
+                connection: db,
+                files: true,
+            },
+        );
+        workspace.read_with(cx, |workspace, _| {
+            let tab = &workspace.tabs[1];
+            assert_eq!(tab.focused, 1);
+            assert!(tab.files_open);
+            assert_eq!(tab.files_for.as_ref(), Some(&tab.panes[1]));
+        });
+    }
+
+    #[gpui::test]
     fn marks_tabs_with_unseen_output_and_bells(cx: &mut TestAppContext) {
         use tern_core::ssh::Event;
 
@@ -2026,11 +2269,24 @@ mod tests {
         );
         assert!(cx.debug_bounds("snippet-values").is_none());
 
-        // Escape leaves it untyped.
+        // Escape leaves it untyped, and the keyboard with the pane.
         click(cx, "snippet-0");
         cx.simulate_keystrokes("escape");
         assert!(cx.debug_bounds("snippet-values").is_none());
         assert_eq!(sent(&workspace, cx), [Vec::<u8>::new()]);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        cx.update(|window, cx| assert!(pane.read(cx).is_focused(window)));
+
+        // The values stay with the tab they were asked for in.
+        click(cx, "snippet-0");
+        click(cx, "new-local");
+        assert!(cx.debug_bounds("snippet-values").is_none());
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        click(cx, "snippet-run");
+        assert_eq!(sent(&workspace, cx), [b"tail -n  \r".to_vec()]);
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.tabs[1].focused().read(cx).sent.take().is_empty())
+        });
     }
 
     #[gpui::test]

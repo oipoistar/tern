@@ -123,8 +123,12 @@ pub struct Connection {
     pub agent_forwarding: bool,
     /// Environment variables the shell starts with.
     pub env: Vec<(String, String)>,
-    /// Typed into the shell once it starts.
+    /// Typed into the shell once it starts, at every login.
     pub on_login: Option<String>,
+    /// Typed after `on_login` at the first login only: a snippet run on
+    /// several hosts, or a key being installed. A reconnect doesn't type it
+    /// again, and a pane split from this one doesn't get it.
+    pub once: Option<String>,
     /// Port forwarding rules switched on for the host.
     pub forwards: Vec<Forward>,
     /// This computer's own shell instead of an SSH session.
@@ -165,6 +169,7 @@ impl Connection {
             agent_forwarding: false,
             env: Vec::new(),
             on_login: None,
+            once: None,
             forwards: Vec::new(),
             local: false,
         }

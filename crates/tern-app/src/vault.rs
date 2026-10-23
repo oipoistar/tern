@@ -62,6 +62,10 @@ const CARD_WIDTH: f32 = 320.;
 
 /// A session without a shell, carrying a host's rules that run without a
 /// terminal.
+/// How a failed Wake's notice starts, so a later one that works can clear
+/// it and leave other notices alone.
+const WAKE_FAILED: &str = "Can't wake it";
+
 struct Background {
     input: SessionInput,
     rules: Vec<Forward>,
@@ -457,7 +461,8 @@ impl VaultContent {
     /// Arrows move the selection, Enter connects, E edits; only while the
     /// hosts screen itself has focus, not a field on it.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus.is_focused(window) || self.editor.is_some() {
+        if !self.focus.is_focused(window) || self.editor.is_some() || self.section != Section::Hosts
+        {
             return;
         }
         let modifiers = &event.keystroke.modifiers;
@@ -610,11 +615,17 @@ impl VaultContent {
     }
 
     fn import(&mut self, hosts: Vec<Host>, group: &str, cx: &mut Context<Self>) {
-        if let Some(first) = hosts.first() {
+        let added = hosts.len();
+        self.vault.import(hosts, group);
+        // The first one added, under the name it got.
+        if let Some(first) = self
+            .vault
+            .groups
+            .iter()
+            .find(|have| have.name == group)
+            .and_then(|group| group.hosts.get(group.hosts.len().checked_sub(added)?))
+        {
             self.selected = first.name.clone();
-        }
-        for host in hosts {
-            self.vault.save(None, host, group);
         }
         self.persist(cx);
         self.refresh_keys();
@@ -850,6 +861,29 @@ impl VaultContent {
     /// Runs `forward` of `host` now without a terminal (`on`), or stops it.
     /// The host's rules share one session without a shell, which closes
     /// with its last rule.
+    /// Stops `forward` on `host` if it runs without a terminal.
+    fn stop_alone(&mut self, host: &str, forward: &Forward, cx: &mut Context<Self>) {
+        let running = self.background.get(host).is_some_and(|background| {
+            background
+                .rules
+                .iter()
+                .any(|rule| rule.id() == forward.id())
+        });
+        if running {
+            self.run_alone(host, forward, false, cx);
+        }
+    }
+
+    /// Ends `host`'s session without a terminal, if it has one.
+    fn end_alone(&mut self, host: &str, cx: &mut Context<Self>) {
+        if let Some(background) = self.background.remove(host) {
+            background.input.close();
+            for rule in background.rules {
+                self.set_forward_state(host.to_string(), &rule, ForwardState::Stopped, cx);
+            }
+        }
+    }
+
     fn run_alone(&mut self, host: &str, forward: &Forward, on: bool, cx: &mut Context<Self>) {
         if !on {
             if let Some(background) = self.background.get_mut(host) {
@@ -1220,12 +1254,14 @@ impl VaultContent {
                     return;
                 }
                 if let Some(old) = replacing {
+                    self.stop_alone(host, old, cx);
                     live.push((host.clone(), old.clone(), false));
                 }
                 live.push((host.clone(), forward.clone(), forward.on));
                 view.update(cx, |view, cx| view.saved(cx));
             }
             ForwardEvent::Delete { host, forward } => {
+                self.stop_alone(host, forward, cx);
                 self.vault.delete_forward(host, &forward.id());
                 live.push((host.clone(), forward.clone(), false));
             }
@@ -1353,7 +1389,13 @@ impl VaultContent {
                 match woken {
                     Ok(()) => {
                         this.copied = Some("wake");
-                        this.notice = None;
+                        if this
+                            .notice
+                            .as_ref()
+                            .is_some_and(|notice| notice.starts_with(WAKE_FAILED))
+                        {
+                            this.notice = None;
+                        }
                         this._copied = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(1500))
@@ -1364,7 +1406,7 @@ impl VaultContent {
                             });
                         }));
                     }
-                    Err(problem) => this.notice = Some(format!("Can't wake it: {problem}").into()),
+                    Err(problem) => this.notice = Some(format!("{WAKE_FAILED}: {problem}").into()),
                 }
                 cx.notify();
             }))
@@ -1501,16 +1543,15 @@ impl VaultContent {
                 }
             }
             SnippetEvent::Delete(name) => self.vault.delete_snippet(name),
-            // Each host's session types the snippet once its shell starts,
-            // after the host's own command.
+            // Each host's session types the snippet once its shell first
+            // starts, after the host's own command.
             SnippetEvent::Run { snippet, hosts } => {
                 let connections: Vec<Connection> = hosts
                     .iter()
                     .filter_map(|name| self.vault.find(name))
                     .filter_map(|host| self.vault.connection(host).ok())
                     .map(|mut connection| {
-                        connection.on_login =
-                            Some(snippet.after_login(connection.on_login.as_deref()));
+                        connection.once = Some(snippet.line());
                         connection
                     })
                     .collect();
@@ -1538,7 +1579,7 @@ impl VaultContent {
             return;
         };
         if let Ok(mut connection) = self.vault.connection(saved) {
-            connection.on_login = Some(keys::install_command(public));
+            connection.once = Some(keys::install_command(public));
             self.connect(connection, window, cx);
         }
     }
@@ -1602,6 +1643,10 @@ impl VaultContent {
             } => {
                 self.vault
                     .save(replacing.as_deref(), (**host).clone(), group);
+                // Rules run without a terminal go by the host's name.
+                if let Some(old) = replacing.as_deref().filter(|old| *old != host.name) {
+                    self.end_alone(old, cx);
+                }
                 self.persist(cx);
                 if let Some((place, latency_ms)) = checked {
                     self.monitor
@@ -1613,6 +1658,7 @@ impl VaultContent {
             EditorEvent::Delete(name) => {
                 let id = self.vault.find(name).map(|host| host.id.clone());
                 if self.vault.delete(name).is_ok() {
+                    self.end_alone(name, cx);
                     if let Some(id) = id {
                         let _ = sync::secrets(cx).forget(&tern_core::secrets::host_password(&id));
                     }
@@ -2576,7 +2622,7 @@ mod tests {
         });
         let connection = connects.borrow().last().cloned().expect("a session opens");
         assert_eq!(connection.target.host, "bastion.example.com");
-        let command = connection.on_login.expect("the install runs after login");
+        let command = connection.once.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
     }
 
@@ -2820,6 +2866,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn deleting_a_rule_stops_it_running_without_a_terminal(cx: &mut TestAppContext) {
+        use tern_core::forward::{Forward, ForwardKind};
+
+        // A server that never answers keeps the session signing in.
+        let quiet = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = quiet.local_addr().unwrap().port();
+        let mut hosts = Vault::default();
+        let mut host = Host::new("quiet", "me", "127.0.0.1", port);
+        host.forwards
+            .push(Forward::typed(ForwardKind::Local, "18081", "localhost:80").unwrap());
+        hosts.save(None, host, "Lab");
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(hosts, None, LiveSlots::default(), window, cx)
+        });
+        let running = |cx: &mut VisualTestContext| {
+            vault.read_with(cx, |vault, _| !vault.running_alone().is_empty())
+        };
+
+        click(cx, "nav-port-forwarding");
+        click(cx, "run-quiet-0");
+        assert!(running(cx));
+        click(cx, "forward-quiet-0");
+        click(cx, "delete-forward");
+        assert!(!running(cx));
+        drop(quiet);
+    }
+
+    #[gpui::test]
+    fn the_hosts_keys_only_work_on_the_hosts_screen(cx: &mut TestAppContext) {
+        let (vault, cx, connects) = open_vault(cx);
+        click(cx, "nav-snippets");
+        cx.update(|window, cx| vault.update(cx, |vault, cx| vault.focus(window, cx)));
+        cx.simulate_keystrokes("e enter down");
+        vault.read_with(cx, |vault, _| {
+            assert!(vault.editor.is_none());
+            assert_eq!(vault.selected, "prod-db-01");
+        });
+        assert!(connects.borrow().is_empty());
+    }
+
+    #[gpui::test]
     fn runs_a_snippet_on_several_hosts(cx: &mut TestAppContext) {
         let (vault, cx, _) = open_vault(cx);
         let together: Rc<RefCell<Vec<Connection>>> = Rc::default();
@@ -2850,11 +2939,9 @@ mod tests {
             .map(|connection| connection.host.clone().unwrap())
             .collect();
         assert_eq!(hosts, ["bastion", "prod-web-01"]);
+        // Typed once, not at every login like a host's own command.
         assert!(connections.iter().all(|connection| {
-            connection
-                .on_login
-                .as_deref()
-                .is_some_and(|typed| typed.ends_with(command.trim_end()))
+            connection.once.as_deref() == Some(command.trim_end()) && connection.on_login.is_none()
         }));
         // The chooser closes once it runs.
         assert!(cx.debug_bounds("run-snippet").is_none());

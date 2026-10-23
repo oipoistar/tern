@@ -40,6 +40,10 @@ enum Change {
 /// confirm.
 struct Form {
     change: Change,
+    /// Where it happens: the side and its folder when the form opened.
+    side: Side,
+    local_dir: PathBuf,
+    remote_dir: String,
     /// `None` for a delete.
     input: Option<Entity<InputState>>,
     problem: Option<SharedString>,
@@ -55,6 +59,8 @@ struct Transfer {
 
 pub struct FilesPanel {
     sftp: Option<Sftp>,
+    /// The session's host, naming its side.
+    host: SharedString,
     /// Why the host's side can't be shown, in one line.
     problem: Option<SharedString>,
     side: Side,
@@ -69,11 +75,12 @@ pub struct FilesPanel {
 }
 
 impl FilesPanel {
-    /// A panel for the SFTP session `opening` will give, starting in its
-    /// home folder there and in `local_dir` here.
+    /// A panel for the SFTP session on `host` that `opening` will give,
+    /// starting in its home folder there and in `local_dir` here.
     pub fn new(
         opening: impl Future<Output = Result<Sftp, String>> + 'static,
         local_dir: PathBuf,
+        host: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
         let task = cx.spawn(async move |this, cx| {
@@ -95,6 +102,7 @@ impl FilesPanel {
         let local = sftp::list_local(&local_dir).unwrap_or_default();
         Self {
             sftp: None,
+            host,
             problem: None,
             side: Side::Remote,
             remote_dir: "/".into(),
@@ -172,6 +180,9 @@ impl FilesPanel {
         });
         self.form = Some(Form {
             change,
+            side: self.side,
+            local_dir: self.local_dir.clone(),
+            remote_dir: self.remote_dir.clone(),
             input,
             problem: None,
             _enter: enter,
@@ -190,6 +201,8 @@ impl FilesPanel {
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
         let change = form.change.clone();
+        let (side, local_dir, remote_dir) =
+            (form.side, form.local_dir.clone(), form.remote_dir.clone());
         let name = match &change {
             Change::Rename(_) | Change::NewFolder => match sftp::check_name(&typed) {
                 Ok(name) => name.to_string(),
@@ -197,9 +210,9 @@ impl FilesPanel {
             },
             Change::Mode(entry) | Change::Delete(entry) => entry.name.clone(),
         };
-        match self.side {
+        match side {
             Side::Local => {
-                let path = |name: &str| self.local_dir.join(name);
+                let path = |name: &str| local_dir.join(name);
                 let done = match &change {
                     Change::Rename(entry) => sftp::rename_local(&path(&entry.name), &path(&name)),
                     Change::NewFolder => sftp::mkdir_local(&path(&name)),
@@ -212,7 +225,7 @@ impl FilesPanel {
                 let Some(sftp) = self.sftp.clone() else {
                     return;
                 };
-                let path = |name: &str| sftp::join(&self.remote_dir, name);
+                let path = |name: &str| sftp::join(&remote_dir, name);
                 let work: std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>> =
                     match &change {
                         Change::Rename(entry) => {
@@ -263,6 +276,7 @@ impl FilesPanel {
     }
 
     fn up(&mut self, cx: &mut Context<Self>) {
+        self.form = None;
         match self.side {
             Side::Remote => self.go_remote(sftp::parent(&self.remote_dir), cx),
             Side::Local => {
@@ -275,6 +289,9 @@ impl FilesPanel {
 
     /// A folder opens; a file copies to the other side's folder.
     fn open(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if entry.dir {
+            self.form = None;
+        }
         match (self.side, entry.dir) {
             (Side::Remote, true) => self.go_remote(sftp::join(&self.remote_dir, &entry.name), cx),
             (Side::Local, true) => self.go_local(self.local_dir.join(&entry.name), cx),
@@ -674,9 +691,9 @@ impl Render for FilesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::current(cx);
         let t = &theme;
-        let sides = [
-            (Side::Remote, "Remote", "files-remote"),
-            (Side::Local, "This computer", "files-local"),
+        let sides: [(Side, SharedString, &str); 2] = [
+            (Side::Remote, self.host.clone(), "files-remote"),
+            (Side::Local, "This computer".into(), "files-local"),
         ];
         let entries = match self.side {
             Side::Remote => &self.remote,
@@ -737,7 +754,10 @@ impl Render for FilesPanel {
                             .cursor_pointer()
                             .child(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.side = side;
+                                if this.side != side {
+                                    this.side = side;
+                                    this.form = None;
+                                }
                                 cx.notify();
                             }))
                     })),
@@ -830,6 +850,7 @@ mod tests {
             FilesPanel::new(
                 async { Err("the host doesn't offer SFTP".to_string()) },
                 start,
+                "web-01".into(),
                 cx,
             )
         });
@@ -890,6 +911,16 @@ mod tests {
         cx.simulate_input("memo.txt");
         cx.simulate_keystrokes("enter");
         assert_eq!(names(cx), ["box", "photos", "memo.txt"]);
+
+        // A change begun here doesn't follow into another folder or side.
+        click(cx, "file-delete-1");
+        click(cx, "file-0");
+        assert!(panel.read_with(cx, |panel, _| panel.form.is_none()));
+        click(cx, "files-up");
+        click(cx, "file-delete-1");
+        click(cx, "files-remote");
+        assert!(panel.read_with(cx, |panel, _| panel.form.is_none()));
+        click(cx, "files-local");
 
         // Delete asks first; Cancel leaves it.
         click(cx, "file-delete-1");

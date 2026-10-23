@@ -102,15 +102,22 @@ pub enum TerminalEvent {
         forward: Forward,
         state: ForwardState,
     },
-    /// The user typed or pasted this into the shell, for broadcasting to
-    /// other panes.
+    /// The user typed this into the shell, for broadcasting to other panes.
     Typed(Vec<u8>),
+    /// The user pasted this text (newlines as returns), for broadcasting:
+    /// each pane brackets it as its own shell asked.
+    Pasted(String),
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
 pub struct TerminalView {
     connection: Connection,
+    /// The connection's one-off command, taken out of it so that neither a
+    /// reconnect nor a pane split from this one types it again.
+    once: Option<String>,
+    /// What's typed here goes to the tab's other panes too.
+    pub broadcasting: bool,
     password: Option<String>,
     trust: Option<HostKey>,
     pub phase: Phase,
@@ -313,7 +320,7 @@ impl TerminalView {
     }
 
     /// A pane for `connection` that hasn't started connecting.
-    fn idle(connection: Connection, cx: &mut Context<Self>) -> Self {
+    fn idle(mut connection: Connection, cx: &mut Context<Self>) -> Self {
         let size = TermSize {
             cols: 100,
             rows: 30,
@@ -322,6 +329,8 @@ impl TerminalView {
         let terminal = settings::current(cx).terminal;
         let config = term_config(&terminal);
         Self {
+            once: connection.once.take(),
+            broadcasting: false,
             connection,
             password: None,
             trust: None,
@@ -506,7 +515,8 @@ impl TerminalView {
                 }
                 self.had_shell = true;
                 // Queued now, it reaches the shell as soon as it starts.
-                if let Some(command) = &self.connection.on_login {
+                let commands = [self.connection.on_login.clone(), self.once.take()];
+                for command in commands.into_iter().flatten() {
                     self.send(format!("{command}\r").into_bytes());
                 }
             }
@@ -839,7 +849,8 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        // Broadcast, it also reaches shells that may not take it bracketed.
+        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE) && !self.broadcasting;
         if settings::current(cx).terminal.confirm_paste && paste_needs_confirming(&text, bracketed)
         {
             self.pending_paste = Some(text);
@@ -850,15 +861,28 @@ impl TerminalView {
     }
 
     fn paste_text(&mut self, text: String, cx: &mut Context<Self>) {
-        // Terminals expect CR for newlines; bracketed paste lets the shell
-        // tell pasted text from typed text.
+        // Terminals expect CR for newlines.
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bytes = if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
-            format!("\x1b[200~{text}\x1b[201~")
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
+        self.send(self.pasted(&text));
+        cx.emit(TerminalEvent::Pasted(text));
+    }
+
+    /// A paste as this pane's shell takes it: bracketed when it asked, so
+    /// it can tell pasted text from typed.
+    fn pasted(&self, text: &str) -> Vec<u8> {
+        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+            format!("\x1b[200~{text}\x1b[201~").into_bytes()
         } else {
-            text
-        };
-        self.send_typed(bytes.into_bytes(), cx);
+            text.as_bytes().to_vec()
+        }
+    }
+
+    /// Pastes what another pane was given, while broadcasting.
+    pub fn type_paste(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = self.pasted(text);
+        self.type_text(bytes, cx);
     }
 
     /// The screen cell under `position` in the window as (line, column)

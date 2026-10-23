@@ -419,7 +419,9 @@ impl KeychainView {
     }
 
     fn details(&self, pair: &KeyPair, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
-        let palette = TermPalette::current(cx);
+        // Tern's own, not the terminals' colour scheme: a key isn't
+        // terminal output.
+        let palette = TermPalette::for_theme(t);
         let users: Vec<String> = pair
             .users(&self.vault)
             .iter()
