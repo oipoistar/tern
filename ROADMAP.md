@@ -202,6 +202,11 @@ claude.ai account). Each item below names the artboard it comes from.
 
 - Only tested on Windows so far (item 19); CI builds and tests on macOS and
   Linux too, but the app itself hasn't been run there.
+- Proxies take no username or password: the vault keeps no secrets, and
+  the credential store doesn't hold proxy logins yet.
+- Forwarding rules run without a terminal can't ask for anything: they
+  sign in with a key, the agent or a saved password, and a server that
+  asks a question (a one-time code) fails them.
 
 ## Next, in order
 
