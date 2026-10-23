@@ -25,26 +25,14 @@ pub fn importable_here(vault: &Vault) -> Vec<Host> {
 }
 
 /// The sessions' hosts, minus those the vault already has (same user,
-/// address and port). A name another host already uses gets " (PuTTY)".
+/// address and port). A name another host already uses becomes a free
+/// one: "name (PuTTY)", then "name (PuTTY) 2" and so on.
 pub fn importable(vault: &Vault, sessions: &[(String, Settings)], user: &str) -> Vec<Host> {
-    let mut hosts: Vec<Host> = Vec::new();
-    for (name, settings) in sessions {
-        let Some(mut host) = to_host(name, settings, user) else {
-            continue;
-        };
-        let known = || vault.hosts().chain(hosts.iter());
-        let same_place = |have: &Host| {
-            have.user == host.user && have.address == host.address && have.port == host.port
-        };
-        if known().any(same_place) {
-            continue;
-        }
-        if known().any(|have| have.name.eq_ignore_ascii_case(&host.name)) {
-            host.name = format!("{} ({GROUP})", host.name);
-        }
-        hosts.push(host);
-    }
-    hosts
+    let hosts = sessions
+        .iter()
+        .filter_map(|(name, settings)| to_host(name, settings, user))
+        .collect();
+    crate::openssh::new_hosts(vault, hosts, GROUP)
 }
 
 /// The host a session describes, or `None` for sessions Tern can't open
@@ -264,5 +252,24 @@ mod tests {
         let hosts = importable(&vault, &sessions, "me");
         let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
         assert_eq!(names, ["bastion (PuTTY)", "nas"]);
+    }
+
+    #[test]
+    fn picks_a_free_name_for_each_clash() {
+        let mut vault = Vault::sample();
+        vault.save(
+            None,
+            Host::new("bastion (PuTTY)", "x", "old.lan", 22),
+            GROUP,
+        );
+        let sessions = [
+            session("Bastion", &[("HostName", "ops@gw.example.com")]),
+            // Two sessions whose names read the same once decoded.
+            session("My%20NAS", &[("HostName", "admin@nas.lan")]),
+            session("My NAS", &[("HostName", "admin@nas2.lan")]),
+        ];
+        let hosts = importable(&vault, &sessions, "me");
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, ["Bastion (PuTTY) 2", "My NAS", "My NAS (PuTTY)"]);
     }
 }

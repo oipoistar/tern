@@ -78,25 +78,38 @@ pub fn importable_here(vault: &Vault) -> Vec<Host> {
 
 /// The hosts `text` describes (`Include`s are read relative to `dir`, the
 /// `~/.ssh` folder), minus those the vault already has at the same user,
-/// address and port. A name another host already uses gets " (OpenSSH)".
-/// `user` is the login for hosts that name none, as `ssh` uses yours.
+/// address and port, named as [`new_hosts`] names them. `user` is the
+/// login for hosts that name none, as `ssh` uses yours.
 pub fn importable(vault: &Vault, text: &str, dir: &Path, user: &str) -> Vec<Host> {
     let blocks = parse(text, dir);
-    let hosts = to_hosts(&blocks, dir, user);
-    // Names change when they clash; jump hosts follow.
+    new_hosts(vault, to_hosts(&blocks, dir, user), GROUP)
+}
+
+/// `hosts` minus those the vault, or one before them, already has at the
+/// same user, address and port. A name another host uses, in any case,
+/// becomes a free one: "web (OpenSSH)" for the `group` "OpenSSH", then
+/// "web (OpenSSH) 2" and so on. Jump hosts (named as in `hosts`, where
+/// no two hosts with jumps share a name) follow a rename, or lead to the
+/// host that was already there.
+pub(crate) fn new_hosts(vault: &Vault, hosts: Vec<Host>, group: &str) -> Vec<Host> {
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut kept: Vec<Host> = Vec::new();
     for mut host in hosts {
         let known = || vault.hosts().chain(kept.iter());
-        let same_place = |have: &&Host| {
-            have.user == host.user && have.address == host.address && have.port == host.port
-        };
-        if let Some(have) = known().find(same_place) {
+        if let Some(have) = known().find(|have| same_place(have, &host)) {
             renamed.insert(host.name.clone(), have.name.clone());
             continue;
         }
-        if known().any(|have| have.name.eq_ignore_ascii_case(&host.name)) {
-            let name = format!("{} ({GROUP})", host.name);
+        let taken = |name: &str| known().any(|have| have.name.eq_ignore_ascii_case(name));
+        let name = (1..)
+            .map(|n| match n {
+                1 => host.name.clone(),
+                2 => format!("{} ({group})", host.name),
+                n => format!("{} ({group}) {}", host.name, n - 1),
+            })
+            .find(|name| !taken(name))
+            .expect("an unused name");
+        if name != host.name {
             renamed.insert(host.name.clone(), name.clone());
             host.name = name;
         }
@@ -110,6 +123,12 @@ pub fn importable(vault: &Vault, text: &str, dir: &Path, user: &str) -> Vec<Host
         }
     }
     kept
+}
+
+/// Whether two hosts are reached as the same user at the same address and
+/// port.
+fn same_place(a: &Host, b: &Host) -> bool {
+    a.user == b.user && a.address == b.address && a.port == b.port
 }
 
 /// The blocks of `text`, following `Include` into files under `dir`.
@@ -702,6 +721,31 @@ Host *
             find(&hosts, "legacy").jump.as_deref(),
             Some("bastion (OpenSSH)")
         );
+    }
+
+    #[test]
+    fn picks_a_free_name_for_each_clash() {
+        let mut vault = Vault::default();
+        vault.save(None, Host::new("web", "a", "one.lan", 22), "Mine");
+        vault.save(None, Host::new("WEB (OpenSSH)", "b", "two.lan", 22), "Mine");
+        let config = "Host web\n  HostName three.lan\n  User c\n\
+                      Host app\n  HostName app.lan\n  User c\n  ProxyJump web\n";
+        let hosts = importable(&vault, config, Path::new("."), "me");
+        assert_eq!(find(&hosts, "web (OpenSSH) 2").target(), "c@three.lan");
+        assert_eq!(find(&hosts, "app").jump.as_deref(), Some("web (OpenSSH) 2"));
+
+        // Once imported, that name is taken too.
+        for host in hosts {
+            vault.save(None, host, GROUP);
+        }
+        let hosts = importable(
+            &vault,
+            "Host web\n  HostName four.lan\n",
+            Path::new("."),
+            "c",
+        );
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, ["web (OpenSSH) 3"]);
     }
 
     #[test]
