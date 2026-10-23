@@ -6,6 +6,7 @@
 //! frame, so the latency traces can move without redrawing the screens.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
@@ -13,6 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
+use tern_core::restore::{OpenTabs, Opened};
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, parse_command};
 
@@ -164,6 +166,11 @@ pub struct Workspace {
     /// The Settings dialog, while open.
     settings: Option<Entity<SettingsView>>,
     _settings_events: Option<Subscription>,
+    /// Where the open tabs are written down for the next start; not for
+    /// tests, or a start with flags.
+    tabs_file: Option<PathBuf>,
+    /// The active tab and each tab's panes when they were last written.
+    remembered: (Option<usize>, Vec<Vec<EntityId>>),
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -173,6 +180,16 @@ impl Workspace {
         let live = LiveSlots::default();
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
         let mut workspace = Self::with(vault, live, TerminalView::new, window, cx);
+        // A plain start opens the tabs open when Tern last quit, and from
+        // then on keeps track of them. Flags are for checks and leave both
+        // alone.
+        if !std::env::args().skip(1).any(|arg| arg.starts_with("--")) {
+            let file = tern_core::paths::tabs();
+            if settings::current(cx).reopen_tabs {
+                workspace.reopen(&OpenTabs::load(&file), window, cx);
+            }
+            workspace.remember_tabs_in(file, cx);
+        }
         // `tern --connect "ssh -p 2222 user@host"` opens a session at startup.
         let mut args = std::env::args()
             .skip_while(|arg| arg != "--connect")
@@ -301,6 +318,8 @@ impl Workspace {
             new_terminal,
             settings: None,
             _settings_events: None,
+            tabs_file: None,
+            remembered: (None, Vec::new()),
             _ticker: ticker,
             _subscriptions: vec![connect, appearance],
         }
@@ -314,28 +333,95 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_terminal = self.new_terminal;
         let first = self.tabs.len();
         for group in connections.chunks(4) {
-            let panes: Vec<Entity<TerminalView>> = group
-                .iter()
-                .map(|connection| cx.new(|cx| new_terminal(connection.clone(), cx)))
-                .collect();
-            for pane in &panes {
-                self.watch(pane, cx);
-            }
-            self.tabs.push(Tab {
-                panes,
-                focused: 0,
-                maximized: None,
-                broadcast: false,
-                files: None,
-                files_open: false,
-            });
+            self.push_tab(group, cx);
         }
         if self.tabs.len() > first {
             self.activate(Some(first), window, cx);
         }
+    }
+
+    /// A tab at the end with a pane for each connection.
+    fn push_tab(&mut self, connections: &[Connection], cx: &mut Context<Self>) {
+        let new_terminal = self.new_terminal;
+        let panes: Vec<Entity<TerminalView>> = connections
+            .iter()
+            .map(|connection| cx.new(|cx| new_terminal(connection.clone(), cx)))
+            .collect();
+        for pane in &panes {
+            self.watch(pane, cx);
+        }
+        self.tabs.push(Tab {
+            panes,
+            focused: 0,
+            maximized: None,
+            broadcast: false,
+            files: None,
+            files_open: false,
+        });
+    }
+
+    /// Opens the tabs written down at the last quit; hosts deleted since
+    /// are left out.
+    fn reopen(&mut self, open: &OpenTabs, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self.tabs.len();
+        let (tabs, active) = self.vault.read(cx).reopened(open);
+        for connections in &tabs {
+            self.push_tab(connections, cx);
+        }
+        self.activate(active.map(|active| first + active), window, cx);
+    }
+
+    /// Keeps `file` up to date with the open tabs from now on.
+    fn remember_tabs_in(&mut self, file: PathBuf, cx: &mut Context<Self>) {
+        self.tabs_file = Some(file);
+        cx.observe_self(|this, cx| this.remember_tabs(cx)).detach();
+    }
+
+    /// Writes the open tabs down when they've changed, for the next start.
+    /// Runs whenever the window changes, so it compares without
+    /// allocating first.
+    fn remember_tabs(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = &self.tabs_file else {
+            return;
+        };
+        let (active, panes) = &self.remembered;
+        let same = *active == self.active
+            && panes.len() == self.tabs.len()
+            && self.tabs.iter().zip(panes).all(|(tab, ids)| {
+                tab.panes.len() == ids.len()
+                    && tab
+                        .panes
+                        .iter()
+                        .zip(ids)
+                        .all(|(pane, id)| pane.entity_id() == *id)
+            });
+        if same {
+            return;
+        }
+        let open = OpenTabs {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    tab.panes
+                        .iter()
+                        .map(|pane| Opened::of(pane.read(cx).connection()))
+                        .collect()
+                })
+                .collect(),
+            active: self.active,
+        };
+        // Not written down, the tabs only don't come back.
+        let _ = open.save(file);
+        self.remembered = (
+            self.active,
+            self.tabs
+                .iter()
+                .map(|tab| tab.panes.iter().map(|pane| pane.entity_id()).collect())
+                .collect(),
+        );
     }
 
     /// Opens the command palette, its field focused.
@@ -1960,6 +2046,74 @@ mod tests {
     }
 
     #[gpui::test]
+    fn writes_down_the_open_tabs(cx: &mut TestAppContext) {
+        use tern_core::restore::{OpenTabs, Opened};
+
+        let dir = std::env::temp_dir().join(format!("tern-open-tabs-{}", std::process::id()));
+        let file = dir.join("tabs.json");
+        let (workspace, cx) = open_workspace(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.remember_tabs_in(file.clone(), cx)
+        });
+
+        click(cx, "new-local");
+        let open = OpenTabs::load(&file);
+        assert_eq!(open.tabs.len(), 2);
+        assert_eq!(open.tabs[1], [Opened::Local]);
+        assert_eq!(open.active, Some(1));
+
+        // The vault on screen is written down too.
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(OpenTabs::load(&file).active, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn reopens_the_tabs_written_down(cx: &mut TestAppContext) {
+        use tern_core::restore::{OpenTabs, Opened};
+
+        let (workspace, cx) = open_workspace(cx);
+        let host = |name: &str| Opened::Host {
+            id: None,
+            name: name.into(),
+        };
+        let open = OpenTabs {
+            tabs: vec![
+                vec![host("prod-web-01")],
+                vec![Opened::Local, host("prod-web-02")],
+                vec![host("deleted since")],
+            ],
+            active: Some(1),
+        };
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.reopen(&open, window, cx))
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            // After the tab that was already there; the deleted host's tab
+            // is left out.
+            let tabs: Vec<Vec<String>> = workspace.tabs[1..]
+                .iter()
+                .map(|tab| {
+                    tab.panes
+                        .iter()
+                        .map(|pane| pane.read(cx).label().to_string())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(tabs.len(), 2);
+            assert_eq!(tabs[1].len(), 2);
+            assert_eq!(workspace.active, Some(2));
+            let hosts: Vec<Option<String>> = workspace.tabs[2]
+                .panes
+                .iter()
+                .map(|pane| pane.read(cx).connection().host.clone())
+                .collect();
+            assert_eq!(hosts, [None, Some("prod-web-02".to_string())]);
+            assert!(workspace.tabs[2].panes[0].read(cx).connection().local);
+        });
+    }
+
+    #[gpui::test]
     fn the_palette_runs_what_it_finds(cx: &mut TestAppContext) {
         let (workspace, cx) = open_workspace(cx);
         let palette = if cfg!(target_os = "macos") {
@@ -2066,6 +2220,11 @@ mod tests {
         });
         cx.simulate_input("16");
         assert_eq!(current(cx).terminal.font_size, 16.);
+
+        assert!(current(cx).reopen_tabs);
+        click(cx, "settings-general");
+        click(cx, "reopen-tabs");
+        assert!(!current(cx).reopen_tabs);
 
         // The header's toggle sticks too; Escape closes.
         cx.simulate_keystrokes("escape");

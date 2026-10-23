@@ -192,6 +192,11 @@ claude.ai account). Each item below names the artboard it comes from.
       snippets and Tern's own screens and actions by a few of their
       letters; Up and Down pick, Enter runs, Escape gives the keyboard
       back
+- [x] Reopen tabs: a plain start opens the tabs open when Tern last
+      quit, panes and the tab on screen included, from tabs.json in the
+      data folder (saved hosts by id, typed connections by what was
+      typed, no passwords; hosts deleted since are left out); Settings,
+      General, Reopen tabs turns it off
 
 ## Known gaps in what's built
 

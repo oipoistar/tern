@@ -19,6 +19,7 @@ use tern_core::forward::{Forward, ForwardState};
 use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
+use tern_core::restore::OpenTabs;
 use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{
@@ -234,6 +235,12 @@ impl VaultContent {
     /// Whether the vault is the tab on screen.
     pub fn set_showing(&mut self, showing: bool) {
         self.showing = showing;
+    }
+
+    /// The connections that open `open`'s tabs again, and where the tab
+    /// on screen ends up.
+    pub fn reopened(&self, open: &OpenTabs) -> (Vec<Vec<Connection>>, Option<usize>) {
+        open.connections(&self.vault)
     }
 
     /// Every saved host's name and `user@address`, in vault order.

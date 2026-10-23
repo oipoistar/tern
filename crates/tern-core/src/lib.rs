@@ -22,6 +22,7 @@ pub mod putty;
 pub mod randomart;
 pub mod reach;
 pub mod reconnect;
+pub mod restore;
 pub mod schemes;
 pub mod secrets;
 pub mod settings;

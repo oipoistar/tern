@@ -40,6 +40,11 @@ pub fn history() -> PathBuf {
     data_dir().join("history.json")
 }
 
+/// The tabs open when Tern last quit.
+pub fn tabs() -> PathBuf {
+    data_dir().join("tabs.json")
+}
+
 /// Key pairs Tern generated or imported.
 pub fn keys() -> PathBuf {
     data_dir().join("keys")

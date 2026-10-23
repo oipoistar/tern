@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 use crate::sync::SyncSettings;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
@@ -19,6 +19,21 @@ pub struct Settings {
     /// When the appearance or terminal settings last changed, in
     /// milliseconds since the Unix epoch; sync keeps the newest.
     pub updated: u64,
+    /// Open the tabs that were open when Tern last quit; this device's
+    /// own, not synced.
+    pub reopen_tabs: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            appearance: Appearance::default(),
+            terminal: TerminalSettings::default(),
+            sync: SyncSettings::default(),
+            updated: 0,
+            reopen_tabs: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

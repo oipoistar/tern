@@ -545,33 +545,43 @@ impl SettingsView {
         match self.page {
             Page::General => {
                 let data = paths::data_dir();
-                div().child(Self::row(
-                    "Data folder",
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .font_family(MONO)
-                                .text_size(px(12.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis_start()
-                                .child(data.display().to_string()),
-                        )
-                        .child(
-                            button("open-data-folder", t)
-                                .child(icon(IconName::FolderOpen, 14., t.text))
-                                .child("Open")
-                                .on_click(move |_, _, cx| cx.reveal_path(&data)),
-                        ),
-                    t,
-                ))
+                div()
+                    .child(Self::row(
+                        "Reopen tabs",
+                        switch("reopen-tabs", settings.reopen_tabs, t)
+                            .debug_selector(|| "reopen-tabs".into())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                update(cx, |settings| settings.reopen_tabs = !settings.reopen_tabs)
+                            })),
+                        t,
+                    ))
+                    .child(Self::row(
+                        "Data folder",
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(MONO)
+                                    .text_size(px(12.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_start()
+                                    .child(data.display().to_string()),
+                            )
+                            .child(
+                                button("open-data-folder", t)
+                                    .child(icon(IconName::FolderOpen, 14., t.text))
+                                    .child("Open")
+                                    .on_click(move |_, _, cx| cx.reveal_path(&data)),
+                            ),
+                        t,
+                    ))
             }
             Page::Terminal => div()
                 .flex()
