@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::{Auth, new_id};
+use crate::host::{Auth, Unknown, new_id};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -19,6 +19,9 @@ pub struct Identity {
     /// When it last changed, in milliseconds since the Unix epoch.
     #[serde(default)]
     pub updated: u64,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl Identity {
@@ -29,6 +32,7 @@ impl Identity {
             user: user.into(),
             auth,
             updated: 0,
+            unknown: Unknown::new(),
         }
     }
 }
@@ -78,12 +82,27 @@ pub fn check(
         user: user.into(),
         auth,
         updated: previous.map_or(0, |identity| identity.updated),
+        unknown: previous
+            .map(|identity| identity.unknown.clone())
+            .unwrap_or_default(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_keeps_what_this_tern_doesnt_know() {
+        let mut ops = Identity::new("ops", "deploy", Auth::Agent);
+        ops.unknown.insert("fido".into(), "yes".into());
+        let all = [ops.clone()];
+        let edited = check(&all, Some(&ops.id), "ops", "root", Auth::Agent).unwrap();
+        assert_eq!(
+            (edited.user.as_str(), &edited.unknown),
+            ("root", &ops.unknown)
+        );
+    }
 
     #[test]
     fn checks_what_an_identity_needs() {

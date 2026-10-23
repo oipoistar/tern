@@ -6,6 +6,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::host::Unknown;
 use crate::paths;
 use crate::sync::SyncSettings;
 
@@ -84,6 +85,9 @@ pub struct TerminalSettings {
     /// app's look.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colors: Option<String>,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl TerminalSettings {
@@ -133,6 +137,7 @@ impl Default for TerminalSettings {
             copy_on_select: false,
             confirm_paste: true,
             colors: None,
+            unknown: Unknown::new(),
         }
     }
 }

@@ -12,6 +12,13 @@
 //! derives a key from it and a random salt, and XChaCha20-Poly1305 seals
 //! the JSON. A file is `TERNSYN1`, the salt (16 bytes), the nonce (24) and
 //! the sealed data.
+//!
+//! Devices on different versions of Tern sync safely. Hosts, snippets,
+//! identities, their proxies and rules, and terminal settings keep fields
+//! this version doesn't know ([`Unknown`](crate::host::Unknown)), so they go
+//! back out as they came. A change that can't travel that way raises
+//! [`FORMAT`], and a device that meets a newer format stops syncing until
+//! it's updated, rather than merge what it may get wrong.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +39,12 @@ use crate::vault::{Tombstone, Vault};
 /// The folder inside the chosen one that holds the devices' files.
 pub const FOLDER: &str = "Tern";
 const MAGIC: &[u8; 8] = b"TERNSYN1";
+/// The format this version writes. Raise it for a change an older Tern
+/// would get wrong even carrying what it doesn't know: a new kind of value
+/// (another way to sign in, another kind of rule), a field inside a type
+/// that doesn't keep unknown ones, or a changed meaning. Added fields don't
+/// need it.
+pub const FORMAT: u32 = 1;
 const SALT: usize = 16;
 const NONCE: usize = 24;
 /// Argon2id's cost: 64 MiB, three passes, one lane.
@@ -92,6 +105,9 @@ pub fn default_device_name() -> String {
 /// What one device wrote.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// [`FORMAT`] as the device that wrote it knew it; none before formats.
+    #[serde(default)]
+    pub format: u32,
     pub device: String,
     pub device_id: String,
     /// When it was written, in milliseconds since the Unix epoch.
@@ -181,6 +197,7 @@ pub fn snapshot(vault: &Vault, settings: &Settings, keys: Vec<SyncedKey>) -> Sna
         Vec::new()
     };
     Snapshot {
+        format: FORMAT,
         device: sync.device.clone(),
         device_id: sync.device_id.clone(),
         written: now_ms(),
@@ -435,6 +452,15 @@ pub fn receive_keys(dir: &Path, synced: &[SyncedKey], have: &[KeyPair]) -> Resul
     Ok(written)
 }
 
+/// What every format of a sync file starts with.
+#[derive(Deserialize)]
+struct Header {
+    #[serde(default)]
+    format: u32,
+    #[serde(default)]
+    device: String,
+}
+
 /// Seals and opens sync files with one passphrase, remembering the keys it
 /// derived so a sync doesn't redo Argon2 for every file.
 pub struct Syncer {
@@ -517,6 +543,15 @@ impl Syncer {
                 continue;
             };
             let opened = self.unseal(&file)?;
+            // The format first: a newer one may not read as a snapshot here.
+            let header: Header =
+                serde_json::from_slice(&opened).map_err(|error| error.to_string())?;
+            if header.format > FORMAT {
+                return Err(format!(
+                    "{} syncs with a newer Tern: update this one to sync",
+                    header.device
+                ));
+            }
             let snapshot: Snapshot =
                 serde_json::from_slice(&opened).map_err(|error| error.to_string())?;
             snapshots.push(snapshot);
@@ -753,6 +788,78 @@ mod tests {
 
         assert!(Syncer::new("wrong").read(&folder, "here").is_err());
         assert!(ours.read(&folder.join("missing"), "here").is_err());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn carries_what_it_doesnt_know_through() {
+        // A newer Tern's file: fields this one has never heard of, on a
+        // host, its proxy and rule, a snippet and an identity.
+        let mut newer = Vault::sample();
+        let rule = crate::forward::Forward::typed(
+            crate::forward::ForwardKind::Local,
+            "8080",
+            "localhost:80",
+        );
+        newer.groups[0].hosts[0].forwards.push(rule.unwrap());
+        newer.groups[0].hosts[0].proxy =
+            Some(crate::proxy::Proxy::parse("socks5://p.lan").unwrap());
+        newer
+            .identities
+            .push(Identity::new("ops", "deploy", Auth::Agent));
+        // Its settings changed last, so they come across.
+        let laptop = Settings {
+            updated: 1,
+            ..settings("Laptop")
+        };
+        let mut file = serde_json::to_value(snapshot(&newer, &laptop, Vec::new())).unwrap();
+        file["hosts"][0]["shell"] = "fish".into();
+        file["hosts"][0]["proxy"]["login"] = "ops".into();
+        file["hosts"][0]["forwards"][0]["label"] = "web".into();
+        file["snippets"][0]["pinned"] = true.into();
+        file["identities"][0]["fido"] = "yes".into();
+        file["settings"]["terminal"]["ligatures"] = true.into();
+        let file: Snapshot = serde_json::from_value(file).unwrap();
+
+        // Merged here, then written for the others: all of it goes back out.
+        let here = settings("Desk");
+        let merged = merge(&Vault::default(), &here, &[file]);
+        let mut ours = here.clone();
+        if let Some(synced) = merged.settings {
+            ours.terminal = synced.terminal;
+        }
+        let out = serde_json::to_value(snapshot(&merged.vault, &ours, Vec::new())).unwrap();
+        assert_eq!(out["format"], FORMAT);
+        assert_eq!(out["hosts"][0]["shell"], "fish");
+        assert_eq!(out["hosts"][0]["proxy"]["login"], "ops");
+        assert_eq!(out["hosts"][0]["forwards"][0]["label"], "web");
+        assert_eq!(out["snippets"][0]["pinned"], true);
+        assert_eq!(out["identities"][0]["fido"], "yes");
+        assert_eq!(out["settings"]["terminal"]["ligatures"], true);
+    }
+
+    #[test]
+    fn stops_at_a_newer_format() {
+        let folder = std::env::temp_dir().join(format!("tern-sync-format-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut theirs = Syncer::new("open sesame");
+        let read = |folder: &Path| Syncer::new("open sesame").read(folder, "desk");
+
+        // A file from before formats reads as it did.
+        let mut older = snapshot(&Vault::sample(), &settings("Old"), Vec::new());
+        older.format = 0;
+        theirs.write(&folder, &older).unwrap();
+        assert_eq!(read(&folder).unwrap().len(), 1);
+
+        // A newer one stops the sync, even one that isn't a snapshot here.
+        let newer = br#"{"format": 2, "device": "Laptop", "hosts": {"changed": true}}"#;
+        let path = folder.join(FOLDER).join("laptop.tern");
+        std::fs::write(&path, theirs.seal(newer).unwrap()).unwrap();
+        assert_eq!(
+            read(&folder).unwrap_err(),
+            "Laptop syncs with a newer Tern: update this one to sync"
+        );
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

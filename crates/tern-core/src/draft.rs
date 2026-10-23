@@ -195,6 +195,16 @@ impl HostDraft {
         }
 
         let previous = replacing.and_then(|old| vault.find(old));
+        // While it's the same proxy, it keeps what this Tern doesn't know of
+        // it.
+        let proxy = match (proxy, previous.and_then(|host| host.proxy.as_ref())) {
+            (Some(typed), Some(old))
+                if (typed.kind, &typed.host, typed.port) == (old.kind, &old.host, old.port) =>
+            {
+                Some(old.clone())
+            }
+            (typed, _) => typed,
+        };
         let on_login = self.on_login.trim();
         Ok(Host {
             id: previous.map_or_else(crate::host::new_id, |host| host.id.clone()),
@@ -219,6 +229,9 @@ impl HostDraft {
                 .map(|host| host.forwards.clone())
                 .unwrap_or_default(),
             updated: previous.map_or(0, |host| host.updated),
+            unknown: previous
+                .map(|host| host.unknown.clone())
+                .unwrap_or_default(),
         })
     }
 }
@@ -242,6 +255,31 @@ pub fn normalize_tags(tags: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_keeps_what_this_tern_doesnt_know() {
+        // A host as a newer Tern saved it, with fields this one doesn't
+        // know on the host and on its proxy.
+        let mut host = Host::new("web", "deploy", "10.0.0.1", 22);
+        host.unknown.insert("shell".into(), "fish".into());
+        let mut proxy = crate::proxy::Proxy::parse("socks5://p.lan").unwrap();
+        proxy.unknown.insert("login".into(), "ops".into());
+        host.proxy = Some(proxy);
+        let mut vault = Vault::default();
+        vault.save(None, host.clone(), "Hosts");
+
+        let mut draft = HostDraft::edit(&host, "Hosts");
+        draft.notes = "edited here".into();
+        let saved = draft.check(&vault, Some("web")).unwrap();
+        assert_eq!(saved.unknown, host.unknown);
+        assert_eq!(saved.proxy, host.proxy);
+
+        // Another proxy is a new one, without the old one's extras.
+        draft.proxy = Some("http://other.lan".into());
+        let saved = draft.check(&vault, Some("web")).unwrap();
+        assert!(saved.proxy.unwrap().unknown.is_empty());
+        assert_eq!(saved.unknown, host.unknown);
+    }
 
     fn fields(result: Result<Host, Vec<Problem>>) -> Vec<Field> {
         result

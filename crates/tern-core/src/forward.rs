@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::host::Unknown;
 use crate::ssh::{Event, describe};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,6 +44,9 @@ pub struct Forward {
     /// Runs whenever a session to the host is open.
     #[serde(default)]
     pub on: bool,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 fn is_zero(port: &u16) -> bool {
@@ -121,6 +125,7 @@ impl Forward {
             to_host,
             to_port,
             on: true,
+            unknown: Unknown::new(),
         })
     }
 }

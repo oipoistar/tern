@@ -198,6 +198,12 @@ claude.ai account). Each item below names the artboard it comes from.
       data folder (saved hosts by id, typed connections by what was
       typed, no passwords; hosts deleted since are left out); Settings,
       General, Reopen tabs turns it off
+- [x] Sync across versions: hosts, snippets and identities, with their
+      proxies and rules, and terminal settings keep fields this Tern
+      doesn't know, in the vault, settings and sync files, and edits
+      keep them too; sync files carry a format number, and a device that
+      meets a newer one stops syncing, with a one-line reason, until
+      it's updated
 
 ## Known gaps in what's built
 
@@ -211,10 +217,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - A jump host that signs in with a password asks for it only through the
   server's own questions (keyboard-interactive); one that has those turned
   off needs the password saved.
-- Sync files carry no format version. An older Tern syncing with this one
-  drops the host fields it doesn't know (identity, proxy, environment,
-  notes, MAC address) and syncs the stripped hosts back, so every device
-  needs the same build until hosts carry unknown fields through.
+- A device still on a Tern built before sync kept unknown fields (October
+  2026) drops the host fields it doesn't know (identity, proxy,
+  environment, notes, MAC address) and syncs the stripped hosts back, so
+  every device needs updating once.
 
 ## Next, in order
 

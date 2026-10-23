@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::new_id;
+use crate::host::{Unknown, new_id};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snippet {
@@ -17,6 +17,9 @@ pub struct Snippet {
     /// When it last changed, in milliseconds since the Unix epoch.
     #[serde(default)]
     pub updated: u64,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl Snippet {
@@ -27,6 +30,7 @@ impl Snippet {
             name: name.into(),
             command: command.into(),
             updated: 0,
+            unknown: Unknown::new(),
         }
     }
 
@@ -143,14 +147,13 @@ pub fn check(
     }) {
         return Err("Another snippet is already called that".into());
     }
-    let id = replacing
-        .and_then(|old| saved.iter().find(|snippet| snippet.name == old))
-        .map_or_else(|| typed.id.clone(), |old| old.id.clone());
+    let replaced = replacing.and_then(|old| saved.iter().find(|snippet| snippet.name == old));
     Ok(Snippet {
-        id,
+        id: replaced.map_or_else(|| typed.id.clone(), |old| old.id.clone()),
         name: name.into(),
         command: command.into(),
         updated: typed.updated,
+        unknown: replaced.map(|old| old.unknown.clone()).unwrap_or_default(),
     })
 }
 
@@ -205,6 +208,18 @@ mod tests {
         assert_eq!(
             docker.filled(&values).command,
             "docker ps --format '{{.Names}} {{json .}}' {{ v2 }}"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_what_this_tern_doesnt_know() {
+        let mut disk = snippet("Disk", "df -h");
+        disk.unknown.insert("pinned".into(), true.into());
+        let saved = [disk.clone()];
+        let edited = check(&saved, Some("Disk"), &snippet("Disk", "df -hT")).unwrap();
+        assert_eq!(
+            (edited.command.as_str(), &edited.unknown),
+            ("df -hT", &disk.unknown)
         );
     }
 

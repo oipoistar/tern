@@ -59,6 +59,7 @@ fn rule(kind: ForwardKind, listen: u16, to: u16) -> Forward {
         },
         to_port: if kind == ForwardKind::Dynamic { 0 } else { to },
         on: true,
+        unknown: Default::default(),
     }
 }
 

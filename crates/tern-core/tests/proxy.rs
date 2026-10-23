@@ -103,11 +103,13 @@ async fn connects_through_proxies() {
         kind: ProxyKind::Socks5,
         host: "127.0.0.1".into(),
         port: socks5_proxy().await,
+        unknown: Default::default(),
     };
     let http = Proxy {
         kind: ProxyKind::Http,
         host: "127.0.0.1".into(),
         port: http_proxy().await,
+        unknown: Default::default(),
     };
 
     for proxy in [&socks, &http] {

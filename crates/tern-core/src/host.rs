@@ -95,7 +95,15 @@ pub struct Host {
     /// keeps the newest.
     #[serde(default)]
     pub updated: u64,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
+
+/// Fields a newer Tern wrote that this one doesn't know: kept as they came
+/// (flattened into the type that has them), so that saving or syncing here
+/// doesn't drop them. An edit carries the original's across.
+pub type Unknown = serde_json::Map<String, serde_json::Value>;
 
 /// A fresh id for a host or snippet.
 pub fn new_id() -> String {
@@ -140,6 +148,7 @@ impl Host {
             notes: String::new(),
             mac: None,
             updated: 0,
+            unknown: Unknown::new(),
         }
     }
 

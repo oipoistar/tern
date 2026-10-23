@@ -107,5 +107,14 @@ at startup, for looking at it without clicking.
   own file in its data folder. `TERN_DATA_DIR` and `TERN_SYSTEM_KNOWN_HOSTS`
   redirect both for tests, and `TERN_SSH_DIR` the `~/.ssh` the Keychain
   lists, so a check never shows your own keys.
+- **Synced types keep what they don't know.** `Host`, `Snippet`,
+  `Identity`, `Proxy`, `Forward` and `TerminalSettings` flatten JSON fields
+  they don't know into `unknown`, so an older Tern carries a newer one's
+  fields through its vault, settings and sync files. Code that rebuilds one
+  from a form (a draft's or a snippet's check) copies the original's
+  `unknown` across. A change an older Tern would get wrong anyway (a new enum
+  variant, a field inside another type, a new meaning) raises
+  `sync::FORMAT`: a device that reads a newer format stops syncing, with a
+  one-line reason, until it's updated.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.

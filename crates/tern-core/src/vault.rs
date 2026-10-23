@@ -388,7 +388,11 @@ impl Vault {
             return Err("Another rule already listens on that port".into());
         }
         match replacing.and_then(|id| saved.forwards.iter().position(|f| f.id() == *id)) {
-            Some(index) => saved.forwards[index] = forward,
+            // What this Tern doesn't know of the rule stays with it.
+            Some(index) => {
+                let unknown = std::mem::take(&mut saved.forwards[index].unknown);
+                saved.forwards[index] = Forward { unknown, ..forward };
+            }
             None => saved.forwards.push(forward),
         }
         saved.updated = now_ms();
@@ -996,6 +1000,38 @@ mod tests {
             std::fs::read_to_string(dir.join("vault.json.unreadable")).unwrap(),
             "{ not json"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_what_this_tern_doesnt_know() {
+        use crate::forward::{Forward, ForwardKind};
+
+        let mut vault = Vault::sample();
+        let rule = Forward::typed(ForwardKind::Local, "8080", "localhost:80").unwrap();
+        vault.save_forward("bastion", None, rule.clone()).unwrap();
+        let bastion = vault.host_mut("bastion").unwrap();
+        bastion.unknown.insert("shell".into(), "fish".into());
+        bastion.forwards[0]
+            .unknown
+            .insert("label".into(), "web".into());
+
+        // An edit of the rule keeps its extras.
+        let edited = Forward::typed(ForwardKind::Local, "8081", "localhost:80").unwrap();
+        vault
+            .save_forward("bastion", Some(&rule.id()), edited)
+            .unwrap();
+        let bastion = vault.find("bastion").unwrap();
+        assert_eq!(bastion.forwards[0].listen_port, 8081);
+        assert_eq!(bastion.forwards[0].unknown["label"], "web");
+
+        // So does the file.
+        let dir = scratch("unknown");
+        let path = dir.join("vault.json");
+        vault.save_to(&path).unwrap();
+        let reopened = open(&path).vault;
+        assert_eq!(reopened.find("bastion"), vault.find("bastion"));
+        assert_eq!(reopened.find("bastion").unwrap().unknown["shell"], "fish");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

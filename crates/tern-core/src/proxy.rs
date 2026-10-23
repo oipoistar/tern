@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
+use crate::host::Unknown;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyKind {
@@ -19,6 +21,9 @@ pub struct Proxy {
     pub kind: ProxyKind,
     pub host: String,
     pub port: u16,
+    /// What a newer Tern added that this one doesn't know, kept as it came.
+    #[serde(flatten)]
+    pub unknown: Unknown,
 }
 
 impl Proxy {
@@ -64,6 +69,7 @@ impl Proxy {
             kind,
             host: host.to_string(),
             port,
+            unknown: Unknown::new(),
         })
     }
 }
@@ -201,7 +207,8 @@ mod tests {
             Proxy {
                 kind: ProxyKind::Socks5,
                 host: "proxy.lan".into(),
-                port: 1081
+                port: 1081,
+                unknown: Default::default(),
             }
         );
         assert_eq!(socks.to_string(), "socks5://proxy.lan:1081");
