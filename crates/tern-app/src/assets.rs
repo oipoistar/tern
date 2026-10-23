@@ -14,6 +14,7 @@ gpui_kit::assets::icon_assets!(
         CodeXml,
         Columns2,
         Download,
+        FilePen,
         FolderPlus,
         Funnel,
         Globe,

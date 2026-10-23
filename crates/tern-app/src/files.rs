@@ -4,18 +4,21 @@
 //! progress bar and a check when done. Clicking a file copies it to the
 //! other side's folder; files dropped on the panel upload to the host's
 //! folder. Hovering a row offers rename, permissions (on the host) and
-//! delete, which a line under the path bar takes or confirms. Once its
-//! pane has reconnected, Refresh or showing the panel again opens SFTP on
-//! the new connection.
+//! delete, which a line under the path bar takes or confirms; a host's
+//! file can be edited in this computer's app for it, each save going back
+//! (asking first if the host's file changed meanwhile). Once its pane has
+//! reconnected, Refresh or showing the panel again opens SFTP on the new
+//! connection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tern_core::sftp::{self, Entry, Progress, Sftp};
+use tern_core::edits::{self, Edit};
+use tern_core::sftp::{self, Entry, Progress, Sftp, Stamp};
 
 use crate::terminal::TerminalView;
 use crate::theme::{self, MONO, Theme};
@@ -23,6 +26,8 @@ use crate::ui::icon;
 
 /// How often transfers redraw their progress while running.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
+/// How often edited copies are checked for saves.
+const EDIT_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
@@ -37,6 +42,9 @@ enum Change {
     NewFolder,
     Mode(Entry),
     Delete(Entry),
+    /// Write a saved copy over the host's file (by path), which changed
+    /// since: the copy as it is now.
+    Replace(String, Stamp),
 }
 
 /// The line under the path bar: a name or mode to type, or a delete to
@@ -51,6 +59,13 @@ struct Form {
     input: Option<Entity<InputState>>,
     problem: Option<SharedString>,
     _enter: Option<Subscription>,
+}
+
+/// A host's file open in an editor here.
+struct Editing {
+    edit: Edit,
+    /// Checking the host, writing back or asking: the next check waits.
+    busy: bool,
 }
 
 struct Transfer {
@@ -77,8 +92,13 @@ pub struct FilesPanel {
     local: Vec<Entry>,
     transfers: Vec<Transfer>,
     form: Option<Form>,
+    edits: Vec<Editing>,
+    /// Files opened in this computer's apps, for tests.
+    #[cfg(test)]
+    opened: Vec<PathBuf>,
     _opening: Task<()>,
     _ticker: Option<Task<()>>,
+    _watch: Option<Task<()>>,
 }
 
 impl FilesPanel {
@@ -99,8 +119,12 @@ impl FilesPanel {
             local,
             transfers: Vec::new(),
             form: None,
+            edits: Vec::new(),
+            #[cfg(test)]
+            opened: Vec::new(),
             _opening: Task::ready(()),
             _ticker: None,
+            _watch: None,
         };
         panel.open_sftp(pane, None, cx);
         panel
@@ -174,6 +198,40 @@ impl FilesPanel {
         self.session
     }
 
+    /// Edits the host's file `name` in the folder shown, as its row's
+    /// button does.
+    #[cfg(test)]
+    pub fn edit_named(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(entry) = self.remote.iter().find(|entry| entry.name == name).cloned() {
+            self.edit(&entry, cx);
+        }
+    }
+
+    /// The files opened in this computer's apps.
+    #[cfg(test)]
+    pub fn opened(&self) -> &[PathBuf] {
+        &self.opened
+    }
+
+    /// Whether the line under the path bar asks to write over a host's
+    /// file that changed.
+    #[cfg(test)]
+    pub fn asks_to_replace(&self) -> bool {
+        matches!(
+            self.form,
+            Some(Form {
+                change: Change::Replace(..),
+                ..
+            })
+        )
+    }
+
+    /// Says yes to what the line under the path bar asks.
+    #[cfg(test)]
+    pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        self.apply(cx);
+    }
+
     /// The folder this computer's side starts in: Downloads, or home.
     pub fn default_local_dir() -> PathBuf {
         let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -218,11 +276,12 @@ impl FilesPanel {
     /// Opens the line under the path bar for `change`, with the field
     /// focused and filled with what's there now.
     fn begin(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss();
         let value = match &change {
             Change::Rename(entry) => Some(entry.name.clone()),
             Change::NewFolder => Some(String::new()),
             Change::Mode(entry) => Some(format!("{:o}", entry.mode.unwrap_or(0o644))),
-            Change::Delete(_) => None,
+            Change::Delete(_) | Change::Replace(..) => None,
         };
         let input = value.map(|value| {
             let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
@@ -248,11 +307,30 @@ impl FilesPanel {
         cx.notify();
     }
 
+    /// Closes the line under the path bar; an edited copy it asked about
+    /// waits for its next save.
+    fn dismiss(&mut self) {
+        if let Some(Form {
+            change: Change::Replace(remote, ours),
+            ..
+        }) = self.form.take()
+            && let Some(editing) = self.edits.iter_mut().find(|e| e.edit.remote == remote)
+        {
+            editing.edit.ours = ours;
+            editing.busy = false;
+        }
+    }
+
     /// Does what the line under the path bar says; a problem keeps it open.
     fn apply(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.form else {
             return;
         };
+        if let Change::Replace(remote, ours) = &form.change {
+            let (remote, ours) = (remote.clone(), *ours);
+            self.form = None;
+            return self.write_back(remote, ours, cx);
+        }
         let typed = form
             .input
             .as_ref()
@@ -267,6 +345,7 @@ impl FilesPanel {
                 Err(problem) => return self.refuse(problem, cx),
             },
             Change::Mode(entry) | Change::Delete(entry) => entry.name.clone(),
+            Change::Replace(..) => return,
         };
         match side {
             Side::Local => {
@@ -275,7 +354,7 @@ impl FilesPanel {
                     Change::Rename(entry) => sftp::rename_local(&path(&entry.name), &path(&name)),
                     Change::NewFolder => sftp::mkdir_local(&path(&name)),
                     Change::Delete(entry) => sftp::remove_local(&path(&entry.name), entry.dir),
-                    Change::Mode(_) => Ok(()),
+                    Change::Mode(_) | Change::Replace(..) => Ok(()),
                 };
                 self.finish(done, cx);
             }
@@ -297,6 +376,7 @@ impl FilesPanel {
                             Ok(mode) => Box::pin(sftp.set_mode(&path(&entry.name), mode)),
                             Err(problem) => return self.refuse(problem, cx),
                         },
+                        Change::Replace(..) => return,
                     };
                 cx.spawn(async move |this, cx| {
                     let done = work.await;
@@ -318,7 +398,7 @@ impl FilesPanel {
     fn finish(&mut self, done: Result<(), String>, cx: &mut Context<Self>) {
         match done {
             Ok(()) => {
-                self.form = None;
+                self.dismiss();
                 self.refresh(cx);
             }
             Err(problem) => self.refuse(problem, cx),
@@ -340,7 +420,7 @@ impl FilesPanel {
     }
 
     fn up(&mut self, cx: &mut Context<Self>) {
-        self.form = None;
+        self.dismiss();
         match self.side {
             Side::Remote => self.go_remote(sftp::parent(&self.remote_dir), cx),
             Side::Local => {
@@ -354,7 +434,7 @@ impl FilesPanel {
     /// A folder opens; a file copies to the other side's folder.
     fn open(&mut self, entry: &Entry, cx: &mut Context<Self>) {
         if entry.dir {
-            self.form = None;
+            self.dismiss();
         }
         match (self.side, entry.dir) {
             (Side::Remote, true) => self.go_remote(sftp::join(&self.remote_dir, &entry.name), cx),
@@ -377,7 +457,7 @@ impl FilesPanel {
             .unwrap_or_default();
         let progress = Progress::default();
         let copy = sftp.upload(local, &self.remote_dir, progress.clone());
-        self.track(name, progress, async move { copy.await.map(|_| ()) }, cx);
+        self.track(name, progress, copy, |_, _, _| {}, cx);
     }
 
     fn download(&mut self, remote: String, name: String, cx: &mut Context<Self>) {
@@ -386,15 +466,191 @@ impl FilesPanel {
         };
         let progress = Progress::default();
         let copy = sftp.download(&remote, self.local_dir.clone(), progress.clone());
-        self.track(name, progress, async move { copy.await.map(|_| ()) }, cx);
+        self.track(name, progress, copy, |_, _, _| {}, cx);
     }
 
-    /// Shows a transfer until it ends, then refreshes the side it went to.
-    fn track(
+    /// Opens the host's file in this computer's app for it, from a copy in
+    /// a folder of its own, and watches the copy: each save goes back.
+    fn edit(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        let Some(sftp) = self.sftp.clone() else {
+            return;
+        };
+        let remote = sftp::join(&self.remote_dir, &entry.name);
+        if let Some(editing) = self.edits.iter().find(|e| e.edit.remote == remote) {
+            let local = editing.edit.local.clone();
+            return self.open_here(&local, cx);
+        }
+        let folder = match edits::folder(&std::env::temp_dir()) {
+            Ok(folder) => folder,
+            Err(problem) => {
+                self.problem = Some(problem.to_string().into());
+                return cx.notify();
+            }
+        };
+        let progress = Progress::default();
+        let copying = progress.clone();
+        let from = remote.clone();
+        // The host's file as it was before the copy, so a change during it
+        // counts as one.
+        let copy = async move {
+            let theirs = sftp.stamp(&from).await?;
+            let local = sftp.download(&from, folder, copying).await?;
+            Ok((local, theirs))
+        };
+        let name = entry.name.clone();
+        let then = move |this: &mut Self,
+                         copied: Result<(PathBuf, Stamp), String>,
+                         cx: &mut Context<Self>| {
+            let Ok((local, theirs)) = copied else {
+                return;
+            };
+            match edits::stamp(&local) {
+                Ok(ours) => {
+                    this.open_here(&local, cx);
+                    this.edits.push(Editing {
+                        edit: Edit {
+                            remote,
+                            local,
+                            theirs,
+                            ours,
+                        },
+                        busy: false,
+                    });
+                    this.watch(cx);
+                }
+                Err(problem) => this.problem = Some(problem.to_string().into()),
+            }
+        };
+        self.track(name, progress, copy, then, cx);
+    }
+
+    /// Opens this computer's file in the app the system has for it.
+    fn open_here(&mut self, path: &Path, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        cx.open_with_system(path);
+        #[cfg(test)]
+        self.opened.push(path.to_path_buf());
+        cx.notify();
+    }
+
+    /// Checks the edited copies every second while there are any.
+    fn watch(&mut self, cx: &mut Context<Self>) {
+        if self._watch.is_some() {
+            return;
+        }
+        self._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(EDIT_POLL).await;
+                let going = this.update(cx, |this, cx| {
+                    this.check_edits(cx);
+                    let going = !this.edits.is_empty();
+                    if !going {
+                        this._watch = None;
+                    }
+                    going
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Looks for copies saved since they last matched the host's files.
+    fn check_edits(&mut self, cx: &mut Context<Self>) {
+        let Some(sftp) = self.sftp.clone() else {
+            return;
+        };
+        // A copy that's gone isn't being edited any more.
+        self.edits.retain(|editing| editing.edit.local.exists());
+        for editing in self.edits.iter_mut().filter(|editing| !editing.busy) {
+            let Ok(ours) = edits::stamp(&editing.edit.local) else {
+                continue;
+            };
+            if !editing.edit.changed_here(&ours) {
+                continue;
+            }
+            editing.busy = true;
+            let remote = editing.edit.remote.clone();
+            let theirs = sftp.stamp(&remote);
+            cx.spawn(async move |this, cx| {
+                let theirs = theirs.await;
+                let _ = this.update(cx, |this, cx| this.saved(remote, ours, theirs, cx));
+            })
+            .detach();
+        }
+    }
+
+    /// After a save here: the copy goes back, or, if the host's file
+    /// changed too, the line under the path bar asks first.
+    fn saved(
+        &mut self,
+        remote: String,
+        ours: Stamp,
+        theirs: Result<Stamp, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editing) = self.edits.iter_mut().find(|e| e.edit.remote == remote) else {
+            return;
+        };
+        match theirs {
+            // Another change is being made here: ask once it's done.
+            Ok(_) if self.form.is_some() => editing.busy = false,
+            Ok(theirs) if editing.edit.changed_there(&theirs) => {
+                self.form = Some(Form {
+                    change: Change::Replace(remote, ours),
+                    side: Side::Remote,
+                    local_dir: self.local_dir.clone(),
+                    remote_dir: self.remote_dir.clone(),
+                    input: None,
+                    problem: None,
+                    _enter: None,
+                });
+            }
+            Ok(_) => self.write_back(remote, ours, cx),
+            Err(problem) => {
+                editing.busy = false;
+                self.problem = Some(problem.into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Writes the edited copy of `remote`, as it was when `ours` was taken,
+    /// over the host's file.
+    fn write_back(&mut self, remote: String, ours: Stamp, cx: &mut Context<Self>) {
+        let Some(sftp) = self.sftp.clone() else {
+            return;
+        };
+        let Some(editing) = self.edits.iter_mut().find(|e| e.edit.remote == remote) else {
+            return;
+        };
+        editing.busy = true;
+        let progress = Progress::default();
+        let copy = sftp.replace(editing.edit.local.clone(), &remote, progress.clone());
+        let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+        let then =
+            move |this: &mut Self, replaced: Result<Stamp, String>, _: &mut Context<Self>| {
+                if let Some(editing) = this.edits.iter_mut().find(|e| e.edit.remote == remote) {
+                    // A copy that couldn't go back waits for its next save.
+                    editing.edit.ours = ours;
+                    if let Ok(theirs) = replaced {
+                        editing.edit.theirs = theirs;
+                    }
+                    editing.busy = false;
+                }
+            };
+        self.track(name, progress, copy, then, cx);
+    }
+
+    /// Shows a transfer until it ends, then refreshes both sides; `then`
+    /// gets what the copy gave.
+    fn track<T: 'static>(
         &mut self,
         name: String,
         progress: Progress,
-        copy: impl Future<Output = Result<(), String>> + 'static,
+        copy: impl Future<Output = Result<T, String>> + 'static,
+        then: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let index = self.transfers.len();
@@ -404,9 +660,11 @@ impl FilesPanel {
             outcome: None,
         });
         cx.spawn(async move |this, cx| {
-            let outcome = copy.await;
+            let copied = copy.await;
             let _ = this.update(cx, |this, cx| {
-                this.transfers[index].outcome = Some(outcome);
+                this.transfers[index].outcome =
+                    Some(copied.as_ref().map(|_| ()).map_err(Clone::clone));
+                then(this, copied, cx);
                 // Both sides may have changed.
                 this.go_remote(this.remote_dir.clone(), cx);
                 this.go_local(this.local_dir.clone(), cx);
@@ -548,6 +806,35 @@ impl FilesPanel {
         };
         let permissions = (self.side == Side::Remote && entry.mode.is_some())
             .then(|| action("mode", IconName::Lock, Change::Mode(entry.clone())));
+        // A host's file can be edited here; one being edited shows it.
+        let edit = (self.side == Side::Remote && !entry.dir).then(|| {
+            let remote = sftp::join(&self.remote_dir, &entry.name);
+            let editing = self.edits.iter().any(|e| e.edit.remote == remote);
+            let id = format!("file-edit-{index}");
+            let edited = entry.clone();
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
+                .size(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.))
+                .when(!editing, |d| {
+                    d.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.))
+                })
+                .hover(|s| s.bg(t.card))
+                .child(icon(
+                    IconName::FilePen,
+                    13.,
+                    if editing { t.text } else { t.text2 },
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.edit(&edited, cx);
+                }))
+        });
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
@@ -590,6 +877,7 @@ impl FilesPanel {
                 div()
                     .flex()
                     .flex_none()
+                    .children(edit)
                     .child(action(
                         "rename",
                         IconName::Pencil,
@@ -627,6 +915,7 @@ impl FilesPanel {
         };
         let action = match &form.change {
             Change::Delete(_) => ("files-confirm", "Delete", t.danger),
+            Change::Replace(..) => ("files-confirm", "Replace", t.danger),
             _ => ("files-confirm", "Save", t.text),
         };
         div()
@@ -652,7 +941,7 @@ impl FilesPanel {
                     // Escape leaves things as they were.
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
-                            this.form = None;
+                            this.dismiss();
                             cx.stop_propagation();
                             cx.notify();
                         }
@@ -674,6 +963,17 @@ impl FilesPanel {
                                 .truncate()
                                 .child(format!("Delete {}?", entry.name)),
                         ),
+                        (None, Change::Replace(remote, _)) => d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.))
+                                .truncate()
+                                .child(format!(
+                                    "{} changed on the host",
+                                    remote.rsplit('/').next().unwrap_or(remote)
+                                )),
+                        ),
                         (None, _) => d,
                     })
                     .child(
@@ -683,7 +983,7 @@ impl FilesPanel {
                     .child(
                         button("files-cancel", "Cancel", t.text2).on_click(cx.listener(
                             |this, _, _, cx| {
-                                this.form = None;
+                                this.dismiss();
                                 cx.notify();
                             },
                         )),
@@ -823,7 +1123,7 @@ impl Render for FilesPanel {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if this.side != side {
                                     this.side = side;
-                                    this.form = None;
+                                    this.dismiss();
                                 }
                                 cx.notify();
                             }))

@@ -222,6 +222,13 @@ claude.ai account). Each item below names the artboard it comes from.
       shell without typing its login command again, a later pane to the
       host finds a shell left running, and closing a pane by hand ends
       its shell on the host
+- [x] Edit host files here: a host's file in the Files panel has an
+      edit button that copies it into a folder of its own and opens it
+      in this computer's app for it; each save is written back over the
+      host's file (its permissions kept, shown with the transfers), and
+      if the host's file changed meanwhile, one line asks first
+      (Replace or Cancel). The button stays inked while the file is
+      being edited
 
 ## Known gaps in what's built
 

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use russh::{ChannelMsg, client};
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::ssh::spawn;
@@ -39,6 +40,14 @@ pub struct Entry {
     pub items: Option<usize>,
     /// Permission bits (`0o755`), where the side reports them.
     pub mode: Option<u32>,
+}
+
+/// A file as it was at a moment: its size and when it last changed (in
+/// whatever unit its side keeps), to tell whether it changed since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub size: u64,
+    pub modified: Option<u64>,
 }
 
 /// How far a copy has got. Clones share it, so the copy updates it and a
@@ -273,6 +282,61 @@ impl Sftp {
             }
             target.shutdown().await.map_err(failed)?;
             Ok(remote)
+        })
+    }
+
+    /// The host's file `path` as it is now; its time is in seconds.
+    pub fn stamp(&self, path: &str) -> impl Future<Output = Result<Stamp, String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move {
+            let metadata = sftp
+                .metadata(path)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Stamp {
+                size: metadata.len(),
+                modified: metadata.mtime.map(u64::from),
+            })
+        })
+    }
+
+    /// Writes this computer's file `local` over the host's file `remote`,
+    /// keeping its permissions: how an edited copy goes back. Returns the
+    /// host's file as it is afterwards.
+    pub fn replace(
+        &self,
+        local: PathBuf,
+        remote: &str,
+        progress: Progress,
+    ) -> impl Future<Output = Result<Stamp, String>> + 'static {
+        let (sftp, remote) = (self.0.clone(), remote.to_string());
+        spawn(async move {
+            let failed = |error: std::io::Error| error.to_string();
+            let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
+            progress.start(source.metadata().await.map_err(failed)?.len());
+            let flags = OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE;
+            let mut target = sftp
+                .open_with_flags(&remote, flags)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut buffer = vec![0u8; CHUNK];
+            loop {
+                let read = source.read(&mut buffer).await.map_err(failed)?;
+                if read == 0 {
+                    break;
+                }
+                target.write_all(&buffer[..read]).await.map_err(failed)?;
+                progress.add(read);
+            }
+            target.shutdown().await.map_err(failed)?;
+            let metadata = sftp
+                .metadata(remote)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Stamp {
+                size: metadata.len(),
+                modified: metadata.mtime.map(u64::from),
+            })
         })
     }
 

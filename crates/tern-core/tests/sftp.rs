@@ -219,6 +219,23 @@ async fn copies_files_both_ways() {
         assert!(!served.join("cm").exists());
     }
 
+    // An edited copy goes back over the host's file, which says when it
+    // changed.
+    std::fs::write(served.join("motd"), "old").unwrap();
+    let before = sftp.stamp("/motd").await.unwrap();
+    assert_eq!(before.size, 3);
+    std::fs::write(scratch.join("motd"), "brand new").unwrap();
+    let after = sftp
+        .replace(scratch.join("motd"), "/motd", Progress::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(served.join("motd")).unwrap(),
+        "brand new"
+    );
+    assert_eq!(after.size, 9);
+    assert_eq!(after, sftp.stamp("/motd").await.unwrap());
+
     // And on this computer.
     mkdir_local(&here.join("box")).unwrap();
     rename_local(&here.join("big.bin"), &here.join("box").join("big.bin")).unwrap();

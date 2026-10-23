@@ -103,6 +103,21 @@ fn wait(
     }
 }
 
+/// Waits, up to half a minute, until `done` holds, the test clock keeping
+/// step with the real one.
+fn until(cx: &mut VisualTestContext, what: &str, done: impl Fn(&mut VisualTestContext) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never {what}");
+        std::thread::sleep(Duration::from_millis(50));
+        cx.executor().advance_clock(Duration::from_millis(50));
+    }
+}
+
 /// Waits for the pane to stop connecting; where it got to.
 fn settled(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> String {
     wait(view, cx, "settled", |view| {
@@ -191,6 +206,49 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         panel.update(cx, |panel, cx| panel.refresh(cx));
         lists(&fresh, cx);
         println!("ok    Refresh opens Files again on the new connection");
+
+        // A host's file edited here: each save goes back, and after a
+        // change on the host it asks before writing over it.
+        let edited = format!("edited-{}.txt", std::process::id());
+        let on_host = || {
+            docker(&[
+                "exec",
+                "tern-lab-key-1",
+                "cat",
+                &format!("/home/lab/{edited}"),
+            ])
+        };
+        shell(
+            &view,
+            cx,
+            &format!("echo one > {edited} && echo made-$((3+4))"),
+            "made-7",
+        );
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        lists(&edited, cx);
+        panel.update(cx, |panel, cx| panel.edit_named(&edited, cx));
+        until(cx, "the copy opened", |cx| {
+            panel.read_with(cx, |p, _| !p.opened().is_empty())
+        });
+        let copy = panel.read_with(cx, |panel, _| panel.opened()[0].clone());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "one\n");
+        std::fs::write(&copy, "two\n").unwrap();
+        until(cx, "the save went back", |_| on_host() == "two");
+        docker(&[
+            "exec",
+            "tern-lab-key-1",
+            "sh",
+            "-c",
+            &format!("echo three > /home/lab/{edited}"),
+        ]);
+        std::fs::write(&copy, "four\n").unwrap();
+        until(cx, "asked to replace", |cx| {
+            panel.read_with(cx, |p, _| p.asks_to_replace())
+        });
+        assert_eq!(on_host(), "three");
+        panel.update(cx, |panel, cx| panel.confirm(cx));
+        until(cx, "the copy replaced it", |_| on_host() == "four");
+        println!("ok    a host's file edited here goes back, asking after a change there");
     }
 
     // A kept shell: the server ends the connection, the pane reconnects by
