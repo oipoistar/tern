@@ -118,9 +118,30 @@ pub struct Connection {
     pub on_login: Option<String>,
     /// Port forwarding rules switched on for the host.
     pub forwards: Vec<Forward>,
+    /// This computer's own shell instead of an SSH session.
+    pub local: bool,
 }
 
 impl Connection {
+    /// A shell on this computer ([`Session::local`]).
+    pub fn local() -> Self {
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_default();
+        Self {
+            local: true,
+            keep_alive: false,
+            ..Self::typed(
+                Target {
+                    host: "localhost".into(),
+                    port: 0,
+                    user,
+                },
+                None,
+            )
+        }
+    }
+
     /// A destination typed or passed on the command line, with defaults.
     pub fn typed(target: Target, identity: Option<PathBuf>) -> Self {
         Self {
@@ -135,6 +156,7 @@ impl Connection {
             env: Vec::new(),
             on_login: None,
             forwards: Vec::new(),
+            local: false,
         }
     }
 
@@ -284,7 +306,7 @@ pub struct Prompts {
 /// How many rounds of questions a sign-in may take before Tern gives up.
 const MAX_PROMPT_ROUNDS: usize = 8;
 
-enum Input {
+pub(crate) enum Input {
     Data(Vec<u8>),
     Resize(TermSize),
     /// Start (`true`) or stop a port forwarding rule.
@@ -397,6 +419,21 @@ impl Session {
                 let _ = event_tx.send(Event::Failed(error));
             }
         });
+        Self {
+            input: SessionInput(input_tx),
+            events: event_rx,
+        }
+    }
+
+    /// A shell on this computer, on a pseudo-terminal of `size`; its
+    /// events and input are an SSH session's.
+    pub fn local(size: TermSize) -> Self {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("tern-local-shell".into())
+            .spawn(move || crate::local::run(size, input_rx, event_tx))
+            .expect("failed to start a thread for the local shell");
         Self {
             input: SessionInput(input_tx),
             events: event_rx,

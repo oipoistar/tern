@@ -352,6 +352,9 @@ impl TerminalView {
     /// Tab label: the remote title if the shell set one, else `user@host`.
     pub fn title(&self) -> SharedString {
         self.title.clone().unwrap_or_else(|| {
+            if self.connection.local {
+                return shell_name().into();
+            }
             let target = &self.connection.target;
             format!("{}@{}", target.user, target.host).into()
         })
@@ -375,6 +378,7 @@ impl TerminalView {
     pub fn label(&self) -> SharedString {
         match &self.connection.host {
             Some(host) => host.clone().into(),
+            None if self.connection.local => "This computer".into(),
             None => {
                 let target = &self.connection.target;
                 format!("{}@{}", target.user, target.host).into()
@@ -418,7 +422,10 @@ impl TerminalView {
 
     /// Ends the attempt with `message` on screen, and reports it.
     fn end(&mut self, message: SharedString, cx: &mut Context<Self>) {
-        cx.emit(TerminalEvent::Finished(self.visit(&message)));
+        // History is for connections; a local shell isn't one.
+        if !self.connection.local {
+            cx.emit(TerminalEvent::Finished(self.visit(&message)));
+        }
         self.phase = Phase::Ended(message);
         self.live_since = None;
     }
@@ -428,19 +435,24 @@ impl TerminalView {
         if !matches!(self.phase, Phase::Trust { .. } | Phase::Password { .. }) {
             self.started = history::now();
         }
-        // Jump hosts sign in with their own saved passwords.
-        let store = crate::sync::secrets(cx);
-        let request = self.connection.request(
-            self.size,
-            self.password.as_deref(),
-            self.trust.clone(),
-            |jump| {
-                jump.host_id
-                    .as_deref()
-                    .and_then(|id| store.load(&tern_core::secrets::host_password(id)))
-            },
-        );
-        let (input, mut events) = Session::open(request).into_parts();
+        let session = if self.connection.local {
+            Session::local(self.size)
+        } else {
+            // Jump hosts sign in with their own saved passwords.
+            let store = crate::sync::secrets(cx);
+            let request = self.connection.request(
+                self.size,
+                self.password.as_deref(),
+                self.trust.clone(),
+                |jump| {
+                    jump.host_id
+                        .as_deref()
+                        .and_then(|id| store.load(&tern_core::secrets::host_password(id)))
+                },
+            );
+            Session::open(request)
+        };
+        let (input, mut events) = session.into_parts();
         self.input = Some(input);
         self.phase = Phase::Connecting;
         self._events = Some(cx.spawn(async move |this, cx| {
@@ -656,6 +668,10 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // The window's own shortcuts, like switching tabs, go up to it.
+        if crate::workspace::shortcut(keystroke).is_some() {
+            return;
+        }
         // Keys typed in the find bar pass through here too: only closing
         // it is ours, the rest is the field's.
         if !self.focus.is_focused(window) {
@@ -1455,6 +1471,7 @@ impl TerminalView {
                         .into_any_element(),
                 ),
             ),
+            Phase::Connecting if self.connection.local => card(self.label(), None),
             Phase::Connecting => card(target.into(), None),
             Phase::Trust {
                 host, fingerprint, ..
@@ -1564,8 +1581,16 @@ impl TerminalView {
                     div()
                         .flex()
                         .child(
-                            button("reconnect", "Reconnect", true)
-                                .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
+                            button(
+                                "reconnect",
+                                if self.connection.local {
+                                    "Restart"
+                                } else {
+                                    "Reconnect"
+                                },
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
                         )
                         .into_any_element(),
                 ),
@@ -1984,6 +2009,15 @@ fn resolve(color: AnsiColor, colors: &Colors, palette: &TermPalette) -> Hsla {
             }
         }
     }
+}
+
+/// The local shell's name, like `pwsh` or `zsh`, for a local tab's title.
+fn shell_name() -> String {
+    let shell = tern_core::local::default_shell();
+    std::path::Path::new(&shell)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or(shell)
 }
 
 /// Ctrl+Shift+`key`, or Cmd+`key` on macOS: the terminal's own shortcuts,

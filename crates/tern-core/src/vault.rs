@@ -256,6 +256,7 @@ impl Vault {
                 .filter(|forward| forward.on)
                 .cloned()
                 .collect(),
+            local: false,
         })
     }
 

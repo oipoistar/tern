@@ -213,6 +213,11 @@ impl VaultContent {
         self.showing = showing;
     }
 
+    /// Gives the vault the keyboard, for moving through hosts.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus.focus(window, cx);
+    }
+
     /// Switches the screen beside the sidebar. Screens that show files
     /// read them again, for changes made meanwhile.
     fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {

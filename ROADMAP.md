@@ -124,6 +124,12 @@ claude.ai account). Each item below names the artboard it comes from.
       pane one question at a time, pasting allowed; jump hosts are asked
       too, and may now sign in with a password (their saved one, or
       asked)
+- [x] Local terminal tabs: this computer's shell (PowerShell 7 or
+      Windows PowerShell, $SHELL elsewhere) on a pseudo-terminal, from
+      the button at the end of the tab strip, Ctrl+Shift+T (Cmd+T) or
+      tern --local; panes split as local shells too, there's no Files or
+      History for them, and Restart brings an exited shell back.
+      Ctrl+Tab and Ctrl+Shift+Tab go round the tabs, the vault included
 
 ## Known gaps in what's built
 

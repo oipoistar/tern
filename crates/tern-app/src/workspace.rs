@@ -34,6 +34,33 @@ const MAX_PANES: usize = 4;
 /// that doesn't connect, in tests.
 type NewTerminal = fn(Connection, &mut Context<TerminalView>) -> TerminalView;
 
+/// What the window's own keyboard shortcuts do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortcut {
+    /// Ctrl+Shift+T (Cmd+T on macOS): a local terminal tab.
+    NewLocal,
+    /// Ctrl+Tab and Ctrl+Shift+Tab: the next and previous tab, the vault
+    /// included.
+    NextTab,
+    PreviousTab,
+}
+
+/// The window shortcut `keystroke` is, if any. Panes leave these alone.
+pub fn shortcut(keystroke: &Keystroke) -> Option<Shortcut> {
+    let m = &keystroke.modifiers;
+    match keystroke.key.as_str() {
+        "t" if (m.control && m.shift && !m.alt) || (m.platform && !m.shift) => {
+            Some(Shortcut::NewLocal)
+        }
+        "tab" if m.control && !m.alt => Some(if m.shift {
+            Shortcut::PreviousTab
+        } else {
+            Shortcut::NextTab
+        }),
+        _ => None,
+    }
+}
+
 /// A session tab: one to four panes, laid out by how many there are
 /// (single, side by side, main plus stack, grid of four).
 struct Tab {
@@ -87,6 +114,10 @@ impl Workspace {
                 }
                 Err(error) => eprintln!("--connect: {error}"),
             }
+        }
+        // `tern --local` opens a local terminal at startup.
+        if std::env::args().any(|arg| arg == "--local") {
+            workspace.open_local(window, cx);
         }
         // `tern --edit [host]` opens the host editor (a new host without a
         // name), for screenshots and checks.
@@ -175,6 +206,31 @@ impl Workspace {
             _ticker: ticker,
             _subscriptions: vec![connect, appearance],
         }
+    }
+
+    /// A tab with a shell on this computer.
+    fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_session(Connection::local(), window, cx);
+    }
+
+    /// The window's shortcuts, which panes pass up.
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shortcut) = shortcut(&event.keystroke) else {
+            return;
+        };
+        // The vault, then each tab, round again.
+        let count = self.tabs.len() + 1;
+        let at = self.active.map_or(0, |index| index + 1);
+        let step = |by: usize| match (at + by) % count {
+            0 => None,
+            next => Some(next - 1),
+        };
+        match shortcut {
+            Shortcut::NewLocal => self.open_local(window, cx),
+            Shortcut::NextTab => self.activate(step(1), window, cx),
+            Shortcut::PreviousTab => self.activate(step(count - 1), window, cx),
+        }
+        cx.stop_propagation();
     }
 
     fn open_session(
@@ -313,6 +369,7 @@ impl Workspace {
                 self.share_sessions(cx);
                 self.vault.update(cx, |vault, cx| {
                     vault.refresh_keys();
+                    vault.focus(window, cx);
                     cx.notify();
                 });
             }
@@ -482,6 +539,7 @@ impl Workspace {
     /// and Broadcast.
     fn toolbar(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let focused = tab.focused().read(cx);
+        let local = focused.connection().local;
         let host = focused.host().map(str::to_string);
         let target = focused.connection().target.clone();
         let trace = host
@@ -508,14 +566,22 @@ impl Workspace {
                 div()
                     .text_size(px(15.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(host.clone().unwrap_or_else(|| target.host.clone())),
+                    .child(if local {
+                        focused.label().to_string()
+                    } else {
+                        host.clone().unwrap_or_else(|| target.host.clone())
+                    }),
             )
             .child(
                 div()
                     .font_family(MONO)
                     .text_size(px(12.))
                     .text_color(theme.text2)
-                    .child(format!("{}@{}:{}", target.user, target.host, target.port)),
+                    .child(if local {
+                        tern_core::local::default_shell()
+                    } else {
+                        format!("{}@{}:{}", target.user, target.host, target.port)
+                    }),
             )
             .when_some(trace, |d, trace| {
                 let (ink, faint, seed) = (theme.text, theme.text3, marks::seed(&target.host));
@@ -567,47 +633,49 @@ impl Workspace {
                             })
                     })),
             )
-            .child(
-                div()
-                    .id("toggle-files")
-                    .debug_selector(|| "toggle-files".into())
-                    .h(px(40.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(13.))
-                    .border_1()
-                    .border_color(if tab.files_open {
-                        theme.text
-                    } else {
-                        theme.line
-                    })
-                    .bg(if tab.files_open {
-                        theme.text
-                    } else {
-                        theme.card
-                    })
-                    .text_color(if tab.files_open {
-                        theme.card
-                    } else {
-                        theme.text
-                    })
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .child(icon(
-                        IconName::FolderOpen,
-                        15.,
-                        if tab.files_open {
+            .when(!local, |d| {
+                d.child(
+                    div()
+                        .id("toggle-files")
+                        .debug_selector(|| "toggle-files".into())
+                        .h(px(40.))
+                        .px(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .rounded(px(13.))
+                        .border_1()
+                        .border_color(if tab.files_open {
+                            theme.text
+                        } else {
+                            theme.line
+                        })
+                        .bg(if tab.files_open {
+                            theme.text
+                        } else {
+                            theme.card
+                        })
+                        .text_color(if tab.files_open {
                             theme.card
                         } else {
                             theme.text
-                        },
-                    ))
-                    .child("Files")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_files(cx))),
-            )
+                        })
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .child(icon(
+                            IconName::FolderOpen,
+                            15.,
+                            if tab.files_open {
+                                theme.card
+                            } else {
+                                theme.text
+                            },
+                        ))
+                        .child("Files")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_files(cx))),
+                )
+            })
             .child(
                 div()
                     .id("broadcast")
@@ -972,6 +1040,20 @@ impl Workspace {
                     cx.listener(move |this, _, window, cx| this.activate(Some(index), window, cx)),
                 )
             }))
+            .child(
+                div()
+                    .id("new-local")
+                    .debug_selector(|| "new-local".into())
+                    .size(px(34.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.card))
+                    .child(icon(IconName::SquareTerminal, 16., theme.text2))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx))),
+            )
     }
 }
 
@@ -1056,6 +1138,7 @@ impl Render for Workspace {
             .relative()
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(Self::key_down))
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
@@ -1134,6 +1217,46 @@ mod tests {
                 .map(|pane| pane.read(cx).sent.take())
                 .collect()
         })
+    }
+
+    #[gpui::test]
+    fn opens_local_terminals_and_switches_tabs(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let active = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.active);
+        let local = |cx: &mut VisualTestContext, index: usize| {
+            workspace.read_with(cx, |w, cx| {
+                w.tabs[index].focused().read(cx).connection().local
+            })
+        };
+        // Focus a pane, as a user typing would have.
+        cx.update(|window, cx| {
+            let pane = workspace.read(cx).tabs[0].focused().clone();
+            pane.update(cx, |pane, cx| pane.focus(window, cx));
+        });
+
+        // The shortcut passes through the pane to the window.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-t"
+        } else {
+            "ctrl-shift-t"
+        });
+        assert_eq!(active(cx), Some(1));
+        assert!(local(cx, 1));
+        assert!(!local(cx, 0));
+        // A local tab has no Files.
+        assert!(cx.debug_bounds("toggle-files").is_none());
+        click(cx, "new-local");
+        assert_eq!(active(cx), Some(2));
+
+        // Ctrl+Tab goes round: the vault, then each tab.
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(active(cx), None);
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(active(cx), Some(0));
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(active(cx), None);
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(active(cx), Some(2));
     }
 
     #[gpui::test]

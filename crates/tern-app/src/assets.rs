@@ -30,6 +30,7 @@ gpui_kit::assets::icon_assets!(
         Shield,
         ShieldCheck,
         SlidersHorizontal,
+        SquareTerminal,
         Trash,
         Upload,
         Usb,
