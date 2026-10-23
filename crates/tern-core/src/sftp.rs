@@ -1,9 +1,11 @@
 //! Files over a session's connection, with SFTP: listing folders on the host
 //! and on this computer, copying files either way with progress, and
 //! renaming, deleting, making folders and changing permissions. A copy
-//! never replaces a file; it takes the next free name instead.
+//! never replaces a file; it takes the next free name instead. A name that
+//! comes from the other side has to be one name where it lands, never a
+//! path out of the folder.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -230,12 +232,15 @@ impl Sftp {
         let (sftp, remote_dir) = (self.0.clone(), remote_dir.to_string());
         spawn(async move {
             let failed = |error: std::io::Error| error.to_string();
-            let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
-            progress.start(source.metadata().await.map_err(failed)?.len());
             let name = local
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .ok_or("that isn't a file")?;
+            // A `\` is legal in a name here on Unix, but a host on Windows
+            // would read it as a folder.
+            one_name(&name, &['/', '\\'])?;
+            let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
+            progress.start(source.metadata().await.map_err(failed)?.len());
             let mut remote = join(&remote_dir, &name);
             for n in 2.. {
                 if !sftp.try_exists(&remote).await.unwrap_or(false) {
@@ -272,13 +277,16 @@ impl Sftp {
         let (sftp, remote) = (self.0.clone(), remote.to_string());
         spawn(async move {
             let failed = |error: std::io::Error| error.to_string();
+            // The host names the file, so the name could be a path here
+            // (`..\Startup\run.bat`, `c:run.bat` on Windows).
+            let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+            local_name(&name)?;
             let mut source = sftp
                 .open(&remote)
                 .await
                 .map_err(|error| error.to_string())?;
             let size = source.metadata().await.map(|m| m.len()).unwrap_or(0);
             progress.start(size);
-            let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
             let local = free_local_name(&local_dir, &name);
             let mut target = tokio::fs::File::create_new(&local).await.map_err(failed)?;
             let mut buffer = vec![0u8; CHUNK];
@@ -313,7 +321,9 @@ async fn remove_remote(sftp: &SftpSession, path: String, dir: bool) -> Result<()
         pending.push((folder.clone(), true));
         for entry in sftp.read_dir(folder.clone()).await.map_err(failed)? {
             let name = entry.file_name();
-            if name == "." || name == ".." {
+            // The folder itself, its parent, and a name with a `/` that
+            // would be somewhere else: none of them are this folder's.
+            if name == "." || name == ".." || name.contains('/') {
                 continue;
             }
             let child = join(&folder, &name);
@@ -341,8 +351,11 @@ fn name_of(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Renames `from` to `to` on this computer; refused if `to` exists.
+/// Renames `from` to `to` on this computer. Refused if `to` exists, so
+/// nothing is replaced, and if `to` doesn't end in a name this computer
+/// keeps in one folder.
 pub fn rename_local(from: &Path, to: &Path) -> Result<(), String> {
+    local_target(to)?;
     if to.exists() {
         let name = to.file_name().unwrap_or_default().to_string_lossy();
         return Err(format!("{name} already exists"));
@@ -350,8 +363,10 @@ pub fn rename_local(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to).map_err(|error| error.to_string())
 }
 
-/// Makes the folder `path` on this computer.
+/// Makes the folder `path` on this computer; refused if `path` doesn't end
+/// in a name this computer keeps in one folder.
 pub fn mkdir_local(path: &Path) -> Result<(), String> {
+    local_target(path)?;
     std::fs::create_dir(path).map_err(|error| error.to_string())
 }
 
@@ -367,19 +382,91 @@ pub fn remove_local(path: &Path, dir: bool) -> Result<(), String> {
 }
 
 /// A file or folder name as typed for renaming or a new folder: trimmed,
-/// and refused if empty, `.` or `..`, or holding a path separator.
+/// and refused if empty, `.` or `..`, or holding a path separator. It suits
+/// either side; this computer has rules of its own, which
+/// [`rename_local`] and [`mkdir_local`] keep.
 pub fn check_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
+    one_name(name, &['/', '\\'])?;
+    Ok(name)
+}
+
+/// Refuses an empty name, `.`, `..`, and a name holding one of
+/// `separators`.
+fn one_name(name: &str, separators: &[char]) -> Result<(), String> {
     if name.is_empty() {
         return Err("A name is required".into());
     }
     if name == "." || name == ".." {
         return Err(format!("{name} can't be a name"));
     }
-    if name.contains(['/', '\\']) {
+    if name.contains(separators) {
         return Err("A name can't contain / or \\".into());
     }
-    Ok(name)
+    Ok(())
+}
+
+/// Refuses a name this computer wouldn't keep as one entry of a folder: on
+/// Windows, a `\` and what [`windows_name`] refuses too.
+fn local_name(name: &str) -> Result<(), String> {
+    if cfg!(windows) {
+        one_name(name, &['/', '\\'])?;
+        windows_name(name)
+    } else {
+        one_name(name, &['/'])
+    }
+}
+
+/// Refuses what Windows forbids in a name, which a path there reads as
+/// something else: a drive (`d:notes`), a file's hidden stream
+/// (`notes:old`), a device (`CON`, `nul.txt`), wildcards, control
+/// characters, and a name ending in a dot or a space, which it drops.
+fn windows_name(name: &str) -> Result<(), String> {
+    if let Some(c) = name.chars().find(|c| r#"<>:"|?*"#.contains(*c)) {
+        return Err(format!("A name on Windows can't contain {c}"));
+    }
+    if name.chars().any(|c| c < ' ') {
+        return Err("A name on Windows can't contain control characters".into());
+    }
+    if name.ends_with(['.', ' ']) {
+        return Err("A name on Windows can't end in a dot or a space".into());
+    }
+    // Before any extension, and ignoring spaces at its end.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let numbered_device = ["COM", "LPT"].into_iter().any(|device| {
+        let mut number = stem.strip_prefix(device).unwrap_or_default().chars();
+        matches!(
+            (number.next(), number.next()),
+            (Some('0'..='9' | '¹' | '²' | '³'), None)
+        )
+    });
+    if numbered_device || ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) {
+        return Err(format!("{name} is reserved on Windows"));
+    }
+    Ok(())
+}
+
+/// Refuses a path on this computer that doesn't end in a name it keeps in
+/// one folder ([`local_name`]). A name with a drive replaces the folder
+/// it's joined to (`d:notes` lands in drive D's current folder), so a path
+/// that has a drive but no root is all name.
+fn local_target(path: &Path) -> Result<(), String> {
+    let drive_only =
+        matches!(path.components().next(), Some(Component::Prefix(_))) && !path.has_root();
+    let name = if drive_only {
+        path.as_os_str()
+    } else {
+        path.components()
+            .next_back()
+            .map(Component::as_os_str)
+            .unwrap_or_default()
+    };
+    local_name(&name.to_string_lossy())
 }
 
 /// Permission bits as `ls` shows them: `rwxr-xr-x`.
@@ -526,6 +613,8 @@ mod tests {
         assert!(check_name("..").is_err());
         assert!(check_name("a/b").unwrap_err().contains('/'));
         assert!(check_name("a\\b").is_err());
+        // A host on Unix keeps any other character.
+        assert_eq!(check_name("10:30 <draft>?"), Ok("10:30 <draft>?"));
 
         assert_eq!(mode_text(0o755), "rwxr-xr-x");
         assert_eq!(mode_text(0o640), "rw-r-----");
@@ -536,6 +625,57 @@ mod tests {
         assert!(parse_mode("999").is_err());
         assert!(parse_mode("rwxrwxrwz").is_err());
         assert!(parse_mode("xw-r--r--").is_err());
+    }
+
+    #[test]
+    fn keeps_names_from_the_other_side_in_their_folder() {
+        assert_eq!(local_name("notes.txt"), Ok(()));
+        assert!(local_name("").is_err());
+        assert!(local_name("..").unwrap_err().contains(".."));
+        // Windows reads both slashes as folders and `:` as a drive.
+        for name in [r"..\..\Startup\run.bat", r"C:\run.bat", "c:run.bat"] {
+            assert_eq!(local_name(name).is_err(), cfg!(windows), "{name}");
+        }
+
+        // Windows' own rules, on every system.
+        assert_eq!(windows_name("notes (2).txt"), Ok(()));
+        assert!(windows_name("d:notes").unwrap_err().contains(':'));
+        assert!(windows_name("notes.txt:old").unwrap_err().contains(':'));
+        for name in ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"] {
+            assert!(windows_name(name).is_err(), "{name}");
+        }
+        assert!(windows_name("tab\there").unwrap_err().contains("control"));
+        assert!(windows_name("notes.").unwrap_err().contains("end in"));
+        assert!(windows_name("notes ").unwrap_err().contains("end in"));
+        for name in [
+            "CON",
+            "nul.txt",
+            "Aux.tar.gz",
+            "com1",
+            "LPT9.log",
+            "COM¹",
+            "prn .txt",
+        ] {
+            assert!(
+                windows_name(name).unwrap_err().contains("reserved"),
+                "{name}"
+            );
+        }
+        for name in ["CONSOLE", "com10", "lpt", "nul-device.txt", "notes.con"] {
+            assert_eq!(windows_name(name), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn keeps_typed_names_in_their_folder() {
+        let folder = std::env::temp_dir().join("tern-names");
+        assert_eq!(local_target(&folder.join("notes")), Ok(()));
+        assert!(local_target(&folder.join("..")).is_err());
+        // Joined to a folder, a name with a drive replaces it on Windows.
+        let drive = folder.join("d:notes");
+        assert_eq!(local_target(&drive).is_err(), cfg!(windows), "{drive:?}");
+        let stream = folder.join("notes.txt:old");
+        assert_eq!(local_target(&stream).is_err(), cfg!(windows), "{stream:?}");
     }
 
     #[test]

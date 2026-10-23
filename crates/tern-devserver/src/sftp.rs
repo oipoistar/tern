@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
@@ -47,10 +47,24 @@ impl FsSftp {
         parts
     }
 
-    fn local(&self, path: &str) -> PathBuf {
+    /// Where an SFTP path is in the root. A part this computer would read
+    /// as more than a name isn't there: on Windows a `\` parts folders and
+    /// a drive (`C:`) replaces the root.
+    fn local(&self, path: &str) -> Result<PathBuf, StatusCode> {
         Self::parts(path)
             .into_iter()
-            .fold(self.root.clone(), |local, part| local.join(part))
+            .try_fold(self.root.clone(), |local, part| {
+                let mut parts = Path::new(part).components();
+                let name = matches!(
+                    (parts.next(), parts.next()),
+                    (Some(Component::Normal(_)), None)
+                ) && !(cfg!(windows) && part.contains(':'));
+                if name {
+                    Ok(local.join(part))
+                } else {
+                    Err(StatusCode::NoSuchFile)
+                }
+            })
     }
 
     fn remember(&mut self, opened: Opened) -> String {
@@ -120,7 +134,7 @@ impl russh_sftp::server::Handler for FsSftp {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let metadata = std::fs::metadata(self.local(&path)).map_err(code)?;
+        let metadata = std::fs::metadata(self.local(&path)?).map_err(code)?;
         Ok(Attrs {
             id,
             attrs: attributes(&metadata),
@@ -143,7 +157,7 @@ impl russh_sftp::server::Handler for FsSftp {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(self.local(&path)).map_err(code)? {
+        for entry in std::fs::read_dir(self.local(&path)?).map_err(code)? {
             let entry = entry.map_err(code)?;
             if let Ok(metadata) = entry.metadata() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -177,7 +191,7 @@ impl russh_sftp::server::Handler for FsSftp {
         _: FileAttributes,
     ) -> Result<Handle, Self::Error> {
         let file = std::fs::OpenOptions::from(flags)
-            .open(self.local(&filename))
+            .open(self.local(&filename)?)
             .map_err(code)?;
         Ok(Handle {
             id,
@@ -231,17 +245,17 @@ impl russh_sftp::server::Handler for FsSftp {
         path: String,
         _: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        std::fs::create_dir(self.local(&path)).map_err(code)?;
+        std::fs::create_dir(self.local(&path)?).map_err(code)?;
         Ok(ok(id))
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
-        std::fs::remove_dir(self.local(&path)).map_err(code)?;
+        std::fs::remove_dir(self.local(&path)?).map_err(code)?;
         Ok(ok(id))
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        std::fs::remove_file(self.local(&filename)).map_err(code)?;
+        std::fs::remove_file(self.local(&filename)?).map_err(code)?;
         Ok(ok(id))
     }
 
@@ -251,7 +265,7 @@ impl russh_sftp::server::Handler for FsSftp {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        std::fs::rename(self.local(&oldpath), self.local(&newpath)).map_err(code)?;
+        std::fs::rename(self.local(&oldpath)?, self.local(&newpath)?).map_err(code)?;
         Ok(ok(id))
     }
 
@@ -264,7 +278,7 @@ impl russh_sftp::server::Handler for FsSftp {
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
         if let Some(mode) = attrs.permissions {
-            let local = self.local(&path);
+            let local = self.local(&path)?;
             let mut permissions = std::fs::metadata(&local).map_err(code)?.permissions();
             #[cfg(unix)]
             {
@@ -288,12 +302,16 @@ mod tests {
         let sftp = FsSftp::new("/srv/root".into());
         assert_eq!(
             sftp.local("/a/./b/../c"),
-            std::path::Path::new("/srv/root").join("a").join("c")
+            Ok(std::path::Path::new("/srv/root").join("a").join("c"))
         );
         assert_eq!(
             sftp.local("../../etc/passwd"),
-            std::path::Path::new("/srv/root").join("etc").join("passwd")
+            Ok(std::path::Path::new("/srv/root").join("etc").join("passwd"))
         );
         assert_eq!(FsSftp::parts("/"), Vec::<&str>::new());
+        // On Windows, `\` and a drive would lead out; on Unix they're names.
+        for path in [r"/..\..\etc", "/c:/Windows", r"/a/C:\Windows"] {
+            assert_eq!(sftp.local(path).is_err(), cfg!(windows), "{path}");
+        }
     }
 }

@@ -1,7 +1,8 @@
 //! End-to-end checks of SFTP over a session, against the in-process server
 //! serving a scratch folder: listing with item counts, downloading and
-//! uploading with progress, never replacing a file, and renaming, making
-//! folders, changing permissions and deleting.
+//! uploading with progress, never replacing a file nor leaving the chosen
+//! folder, and renaming, making folders, changing permissions and
+//! deleting.
 
 mod common;
 
@@ -86,6 +87,24 @@ async fn copies_files_both_ways() {
         .unwrap();
     assert_eq!(again, here.join("hello (2).txt"));
 
+    // The host names what it sends, and a name that would be a path here
+    // is refused before anything is written.
+    let refused = sftp
+        .download("/docs/..", here.clone(), Progress::default())
+        .await
+        .unwrap_err();
+    assert!(refused.contains(".."), "{refused}");
+    if cfg!(windows) {
+        for (remote, problem) in [(r"/docs/..\escaped.txt", "\\"), ("/c:escaped.txt", ":")] {
+            let refused = sftp
+                .download(remote, here.clone(), Progress::default())
+                .await
+                .unwrap_err();
+            assert!(refused.contains(problem), "{refused}");
+        }
+    }
+    assert!(!scratch.join("escaped.txt").exists());
+
     // Up: a file bigger than one chunk lands whole in the chosen folder.
     let big: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
     let local = here.join("big.bin");
@@ -107,6 +126,18 @@ async fn copies_files_both_ways() {
         .unwrap();
     assert_eq!(put, "/docs/big (2).bin");
     assert_eq!(sftp.list("/").await.unwrap()[0].items, Some(4));
+    if cfg!(unix) {
+        // A `\` belongs to a name on Unix, but would part folders on a
+        // host running Windows.
+        let odd = here.join(r"odd\name.txt");
+        std::fs::write(&odd, "odd").unwrap();
+        let refused = sftp
+            .upload(odd.clone(), "/docs", Progress::default())
+            .await
+            .unwrap_err();
+        assert!(refused.contains('\\'), "{refused}");
+        std::fs::remove_file(odd).unwrap();
+    }
 
     // This computer lists the same way.
     let names: Vec<String> = list_local(&here)
@@ -178,6 +209,13 @@ async fn copies_files_both_ways() {
     assert!(rename_local(&here.join("hello.txt"), &here.join("hello (2).txt")).is_err());
     remove_local(&here.join("box"), true).unwrap();
     assert!(!here.join("box").exists());
+    if cfg!(windows) {
+        // Joined to a folder, a name with a drive would replace it.
+        let refused = mkdir_local(&here.join("q:notes")).unwrap_err();
+        assert!(refused.contains(':'), "{refused}");
+        let refused = rename_local(&here.join("hello.txt"), &here.join("hello.txt:old"));
+        assert!(refused.unwrap_err().contains(':'));
+    }
 
     drop((input, events));
     let _ = std::fs::remove_dir_all(&scratch);
