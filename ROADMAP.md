@@ -112,6 +112,12 @@ claude.ai account). Each item below names the artboard it comes from.
       route; the first hop is dialled through it, reachability checks
       too, and the proxy's refusal is the error shown. Proxies that need
       a password aren't supported, since the vault file keeps no secrets
+- [x] Import from OpenSSH: hosts in ~/.ssh/config the vault lacks are
+      offered beside PuTTY's; each alias gets what ssh would use (first
+      value wins, Host * included, Include followed, Match skipped):
+      HostName, User, Port, IdentityFile, ProxyJump chains and the older
+      ProxyCommand ssh -W, nc proxies, Local/Remote/DynamicForward,
+      SetEnv, ForwardAgent and ServerAliveInterval
 
 ## Known gaps in what's built
 

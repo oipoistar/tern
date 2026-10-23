@@ -23,7 +23,7 @@ use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
 use tern_core::sync::{Merged, Syncer};
-use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, paths, putty};
+use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
 use tern_core::{keys, known_hosts};
 
 use crate::bench;
@@ -154,6 +154,8 @@ pub struct VaultContent {
     /// Saved PuTTY sessions not in the vault yet; the import button shows
     /// only while there are some.
     putty: Vec<Host>,
+    /// Hosts in `~/.ssh/config` not in the vault yet, likewise.
+    openssh: Vec<Host>,
     /// What the background checks found.
     monitor: Monitor,
     /// The vault is the tab on screen; checks run only then.
@@ -484,6 +486,7 @@ impl VaultContent {
             destination: None,
             editor: None,
             putty: Vec::new(),
+            openssh: Vec::new(),
             monitor: Monitor::default(),
             showing: true,
             _checks: None,
@@ -497,7 +500,7 @@ impl VaultContent {
             _sync_loop: None,
         };
         content.refresh_keys();
-        content.putty = putty::importable_here(&content.vault);
+        content.refresh_imports();
         content
     }
 
@@ -505,15 +508,44 @@ impl VaultContent {
     /// selects the first.
     fn import_putty(&mut self, cx: &mut Context<Self>) {
         let hosts = std::mem::take(&mut self.putty);
+        self.import(hosts, putty::GROUP, cx);
+    }
+
+    /// Adds every `~/.ssh/config` host not in the vault yet to the OpenSSH
+    /// group and selects the first.
+    fn import_openssh(&mut self, cx: &mut Context<Self>) {
+        let hosts = std::mem::take(&mut self.openssh);
+        self.import(hosts, openssh::GROUP, cx);
+    }
+
+    fn import(&mut self, hosts: Vec<Host>, group: &str, cx: &mut Context<Self>) {
         if let Some(first) = hosts.first() {
             self.selected = first.name.clone();
         }
         for host in hosts {
-            self.vault.save(None, host, putty::GROUP);
+            self.vault.save(None, host, group);
         }
         self.persist(cx);
         self.refresh_keys();
+        // Either source may have offered what the other just added.
+        let vault = &self.vault;
+        let in_vault = |host: &Host| {
+            vault.hosts().any(|have| {
+                have.user == host.user && have.address == host.address && have.port == host.port
+            })
+        };
+        self.putty.retain(|host| !in_vault(host));
+        self.openssh.retain(|host| !in_vault(host));
         cx.notify();
+    }
+
+    /// Re-reads what PuTTY and `~/.ssh/config` have that the vault lacks.
+    /// Tests offer their own instead of reading this computer's.
+    fn refresh_imports(&mut self) {
+        if cfg!(not(test)) {
+            self.putty = putty::importable_here(&self.vault);
+            self.openssh = openssh::importable_here(&self.vault);
+        }
     }
 
     /// Writes the vault to its file, if it has one. A failure stays on
@@ -660,6 +692,11 @@ impl VaultContent {
     #[cfg(test)]
     fn offer_putty(&mut self, hosts: Vec<Host>) {
         self.putty = hosts;
+    }
+
+    #[cfg(test)]
+    fn offer_openssh(&mut self, hosts: Vec<Host>) {
+        self.openssh = hosts;
     }
 
     /// Re-reads which hosts have a trusted key (known_hosts files only, read
@@ -1127,7 +1164,7 @@ impl VaultContent {
         // A deleted import can come back; a host edited to match a session
         // makes it redundant.
         if !matches!(event, EditorEvent::Close) {
-            self.putty = putty::importable_here(&self.vault);
+            self.refresh_imports();
         }
         self.editor = None;
         self._editor_events = None;
@@ -1509,6 +1546,19 @@ impl VaultContent {
                         .child(icon(IconName::Import, 16., theme.text))
                         .child("Import from PuTTY")
                         .on_click(cx.listener(|this, _, _, cx| this.import_putty(cx))),
+                )
+            })
+            .when(!self.openssh.is_empty(), |d| {
+                d.child(
+                    button("import-openssh", theme)
+                        .debug_selector(|| "import-openssh".into())
+                        .h(px(46.))
+                        .px(px(16.))
+                        .rounded(px(16.))
+                        .text_size(px(14.))
+                        .child(icon(IconName::Import, 16., theme.text))
+                        .child("Import from OpenSSH")
+                        .on_click(cx.listener(|this, _, _, cx| this.import_openssh(cx))),
                 )
             })
             // The screen's primary action, so the one solid ink button.
@@ -1993,6 +2043,30 @@ mod tests {
             cx.debug_bounds("import-putty").is_none(),
             "nothing is left to import"
         );
+    }
+
+    #[gpui::test]
+    fn importing_from_openssh_keeps_jump_hosts(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        // Seeded here rather than read from this computer's ~/.ssh/config.
+        let config = "Host gw\n  HostName gw.lan\n  User ops\nHost app\n  HostName app.lan\n  User ops\n  ProxyJump gw\n";
+        let hosts = vault.read_with(cx, |vault, _| {
+            tern_core::openssh::importable(&vault.vault, config, std::path::Path::new("."), "me")
+        });
+        vault.update(cx, |vault, cx| {
+            vault.offer_openssh(hosts);
+            cx.notify();
+        });
+
+        click(cx, "import-openssh");
+        vault.read_with(cx, |vault, _| {
+            assert_eq!(vault.vault.group_of("app"), Some("OpenSSH"));
+            let app = vault.vault.find("app").unwrap();
+            let connection = vault.vault.connection(app).unwrap();
+            assert_eq!(connection.jumps[0].target.host, "gw.lan");
+            assert_eq!(vault.selected, "gw");
+        });
+        assert!(cx.debug_bounds("import-openssh").is_none());
     }
 
     #[gpui::test]

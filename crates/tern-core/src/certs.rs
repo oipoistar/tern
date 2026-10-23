@@ -60,7 +60,7 @@ fn matches_patterns(patterns: &str, host: &str, port: u16) -> bool {
 }
 
 /// Glob matching with `*` (any run) and `?` (any one character).
-fn wildcard(pattern: &str, text: &str) -> bool {
+pub(crate) fn wildcard(pattern: &str, text: &str) -> bool {
     let (pattern, text): (Vec<char>, Vec<char>) =
         (pattern.chars().collect(), text.chars().collect());
     let (mut p, mut t) = (0, 0);

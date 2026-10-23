@@ -12,6 +12,7 @@ pub mod host;
 pub mod keys;
 pub mod known_hosts;
 pub mod links;
+pub mod openssh;
 pub mod paths;
 pub mod proxy;
 pub mod putty;

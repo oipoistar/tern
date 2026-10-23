@@ -54,7 +54,7 @@ text (`links.rs`), proxies (`proxy.rs`), port forwarding
 (`forward.rs`), agent forwarding (`agent.rs`), SFTP (`sftp.rs`), settings
 (`settings.rs`), sync (`sync.rs`), the system's credential store
 (`secrets.rs`), reading
-PuTTY's saved sessions (`putty.rs`) and paths and safe writes
+PuTTY's saved sessions (`putty.rs`) and OpenSSH's config (`openssh.rs`) and paths and safe writes
 (`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
 root (header, tabs, a session tab's panes, toolbar and snippet bar, live
 layer), `files.rs` is a session tab's SFTP panel, `settings.rs` holds the
