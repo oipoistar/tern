@@ -256,6 +256,20 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         println!("ok    a saved host through two jump hosts");
     }
 
+    // An encrypted key: its passphrase asked as a question, once the server
+    // says it would take the key.
+    {
+        let locked = Auth::Key(keys().join("id_locked"));
+        let (view, cx) = pane(cx, here(2202, Some(locked)));
+        let asked = settled(&view, cx);
+        assert!(asked.contains("Passphrase for id_locked"), "{asked}");
+        cx.simulate_input("lab-pass");
+        cx.simulate_keystrokes("enter");
+        wait(&view, cx, "live", |view| matches!(view.phase, Phase::Live));
+        shell(&view, cx, "echo user-$(whoami)", "user-lab");
+        println!("ok    an encrypted key's passphrase, asked in the pane");
+    }
+
     // The server's key changed: refused, with the line to look at.
     {
         docker(&[

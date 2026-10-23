@@ -92,6 +92,20 @@ impl russh::server::Handler for TestServer {
         })
     }
 
+    /// A key offered without a signature yet: yes only for the one it
+    /// would take, as OpenSSH answers from authorized_keys. With a user CA,
+    /// any key may come with a certificate, checked after.
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        key: &PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        if self.user_ca.is_some() {
+            return Ok(Auth::Accept);
+        }
+        self.auth_publickey(user, key).await
+    }
+
     /// With an `otp`: "Password:", then "Verification code:".
     async fn auth_keyboard_interactive<'a>(
         &'a mut self,

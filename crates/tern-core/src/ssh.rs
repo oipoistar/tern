@@ -1137,6 +1137,18 @@ async fn authenticate(
                 tried.push("agent".to_string());
                 with_agent(handle, user).await
             }
+            Credential::KeyFile {
+                path,
+                passphrase: None,
+            } if is_encrypted(path) => {
+                tried.push(format!("key {}", path.display()));
+                // Once the server has said it would take the key, it waits
+                // for the signature: without the passphrase, this sign-in
+                // can go no further.
+                Ok(with_encrypted_key(handle, target, path, asker)
+                    .await
+                    .map_err(other)?)
+            }
             Credential::KeyFile { path, passphrase } => {
                 tried.push(format!("key {}", path.display()));
                 with_key_file(handle, user, path, passphrase.as_deref()).await
@@ -1262,6 +1274,128 @@ async fn with_key_file(
         .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key, hash))
         .await?;
     Ok(result.success())
+}
+
+/// Whether the key file can only be read with a passphrase.
+fn is_encrypted(path: &Path) -> bool {
+    matches!(
+        russh::keys::load_secret_key(path, None),
+        Err(russh::keys::Error::KeyIsEncrypted)
+    )
+}
+
+/// Signs in with an encrypted key file as ssh does: its public half is
+/// offered first, and only if the server would take it is the passphrase
+/// asked for (three tries). False when the server won't take it; an error
+/// when it would, but there's no passphrase to sign with.
+async fn with_encrypted_key(
+    handle: &mut client::Handle<Verifier>,
+    target: &Target,
+    path: &Path,
+    asker: &mut Asker<'_>,
+) -> Result<bool, String> {
+    // An OpenSSH key keeps its public half readable; an older one has it
+    // beside it, as `.pub`.
+    let public = russh::keys::ssh_key::PrivateKey::read_openssh_file(path)
+        .map(|key| key.public_key().clone())
+        .or_else(|_| {
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(".pub");
+            russh::keys::load_public_key(PathBuf::from(beside))
+        });
+    let Ok(public) = public else {
+        return Ok(false);
+    };
+    let user = target.user.as_str();
+    let hash = handle
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|error| error.to_string())?
+        .flatten();
+    let mut unlock = Unlock {
+        path,
+        target,
+        asker,
+        key: None,
+    };
+    // With a certificate beside it, that's offered first, then the bare key.
+    if let Some(cert) = certs::user_certificate(path)
+        && handle
+            .authenticate_certificate_with(user, cert, hash, &mut unlock)
+            .await
+            .map_err(|error| error.to_string())?
+            .success()
+    {
+        return Ok(true);
+    }
+    let result = handle
+        .authenticate_publickey_with(user, public, hash, &mut unlock)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(result.success())
+}
+
+/// Signs for an encrypted key file once the server has said it would take
+/// the key, asking for the passphrase then; it keeps the key it unlocked.
+struct Unlock<'a, 'b> {
+    path: &'a Path,
+    target: &'a Target,
+    asker: &'a mut Asker<'b>,
+    key: Option<russh::keys::PrivateKey>,
+}
+
+impl Unlock<'_, '_> {
+    /// The key, unlocked with a passphrase the user gives: asked up to three
+    /// times, as ssh does.
+    async fn key(&mut self) -> Result<&russh::keys::PrivateKey> {
+        let name = self.path.file_name().map_or_else(
+            || self.path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        for _ in 0..3 {
+            if self.key.is_some() {
+                break;
+            }
+            let _ = self.asker.events.send(Event::Prompts(Prompts {
+                from: format!("{}@{}", self.target.user, self.target.host),
+                instructions: String::new(),
+                questions: vec![(format!("Passphrase for {name}:"), false)],
+            }));
+            let Some(answers) = self.asker.inbox.answers().await else {
+                bail!("signing in was stopped");
+            };
+            let typed = answers.into_iter().next().unwrap_or_default();
+            self.key = russh::keys::load_secret_key(self.path, Some(&typed)).ok();
+        }
+        self.key
+            .as_ref()
+            .with_context(|| format!("{name}: the passphrase wasn't right"))
+    }
+}
+
+impl russh::Signer for Unlock<'_, '_> {
+    type Error = anyhow::Error;
+
+    async fn auth_sign(
+        &mut self,
+        _: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        mut to_sign: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        use russh::keys::signature::Signer as _;
+        use russh::keys::ssh_key::encoding::Encode as _;
+        use russh::keys::ssh_key::private::KeypairData;
+
+        let key = self.key().await?;
+        // RSA signs with the hash the server agreed to; the rest have one.
+        let signature: russh::keys::ssh_key::Signature = match key.key_data() {
+            KeypairData::Rsa(rsa) => (rsa, hash_alg).try_sign(&to_sign)?,
+            _ => key.try_sign(&to_sign)?,
+        };
+        // As an agent answers: the data, then the signature as a string.
+        signature.encode_vec()?.as_slice().encode(&mut to_sign)?;
+        Ok(to_sign)
+    }
 }
 
 async fn with_agent(handle: &mut client::Handle<Verifier>, user: &str) -> Result<bool> {

@@ -204,6 +204,10 @@ claude.ai account). Each item below names the artboard it comes from.
       keep them too; sync files carry a format number, and a device that
       meets a newer one stops syncing, with a one-line reason, until
       it's updated
+- [x] Encrypted key files: a key file that needs a passphrase is offered
+      to the server first, and its passphrase is asked in the pane
+      (three tries) only once the server says it would take the key, as
+      OpenSSH does; a jump host's asks the same way
 
 ## Known gaps in what's built
 

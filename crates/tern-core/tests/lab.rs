@@ -385,12 +385,65 @@ async fn lab() {
         ),
     )
     .await;
-    lab.check(
-        "an encrypted key without its passphrase is refused",
-        refused(request(here(KEY, "lab"), vec![key("id_locked")]), |error| {
-            matches!(error, ConnectError::AuthFailed { .. })
-        }),
-    )
+    lab.check("an encrypted key asks for its passphrase", async {
+        let mut asked = Vec::new();
+        let mut session = open_with(
+            request(here(KEY, "lab"), vec![key("id_locked")]),
+            true,
+            |prompts| {
+                asked.extend(
+                    prompts
+                        .questions
+                        .iter()
+                        .map(|(question, _)| question.clone()),
+                );
+                Some(vec!["lab-pass".into()])
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let user = value(&mut session, "user", "whoami").await?;
+        expect(&format!("asked {asked:?}, signed in as"), user, "lab")
+    })
+    .await;
+    lab.check("three wrong passphrases end the sign-in", async {
+        let mut asked = 0;
+        match open_with(
+            request(here(KEY, "lab"), vec![key("id_locked")]),
+            true,
+            |_| {
+                asked += 1;
+                Some(vec!["nope".into()])
+            },
+        )
+        .await
+        {
+            Err(error) if asked == 3 => Ok(format!("asked 3 times: {error}")),
+            Err(error) => Err(format!("asked {asked} times: {error}")),
+            Ok(_) => Err("signed in".into()),
+        }
+    })
+    .await;
+    lab.check("a key the server won't take isn't unlocked", async {
+        // The password server takes no keys: no passphrase asked, and the
+        // password after it still signs in.
+        let mut asked = Vec::new();
+        let mut session = open_with(
+            request(here(PASSWORD, "lab"), vec![key("id_locked"), password()]),
+            true,
+            |prompts| {
+                asked.push(format!("{:?}", prompts.questions));
+                None
+            },
+        )
+        .await
+        .map_err(|error| format!("{error}, asked {asked:?}"))?;
+        expect(
+            "not asked, signed in as",
+            value(&mut session, "user", "whoami").await?,
+            "lab",
+        )
+    })
     .await;
     lab.check("password, then a one-time code", async {
         let mut asked = Vec::new();
