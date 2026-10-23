@@ -626,11 +626,14 @@ impl TerminalView {
             match event {
                 TermEvent::PtyWrite(text) => self.send(text.into_bytes()),
                 TermEvent::Title(title) => {
-                    self.title = Some(if self.connection.local {
-                        tern_core::local::title(&title).into()
-                    } else {
-                        title.into()
-                    })
+                    // A Windows console's title is its program's path: a
+                    // local tab reads better as the program, a remote one
+                    // as its host.
+                    self.title = match tern_core::local::program(&title) {
+                        Some(program) if self.connection.local => Some(program.to_string().into()),
+                        Some(_) => None,
+                        None => Some(title.into()),
+                    }
                 }
                 TermEvent::ResetTitle => self.title = None,
                 TermEvent::ColorRequest(index, reply) => {

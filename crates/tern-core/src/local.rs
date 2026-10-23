@@ -32,18 +32,15 @@ pub fn default_shell() -> String {
     }
 }
 
-/// What to call a local shell, given the title it set: a Windows console
-/// starts out titled with its program's full path, which reads better as
-/// the program's name. Other titles stay as they are.
-pub fn title(title: &str) -> String {
-    let name = title.rsplit(['/', '\\']).next().unwrap_or(title);
+/// The program a terminal title names, when the title is only that
+/// program's path: what a Windows console shows until something sets a
+/// title, locally or through an SSH server on Windows.
+pub fn program(title: &str) -> Option<&str> {
+    let name = title.rsplit(['/', '\\']).next()?;
     let program = name
         .strip_suffix(".exe")
-        .or_else(|| name.strip_suffix(".EXE"));
-    match program {
-        Some(program) if !program.is_empty() && name.len() < title.len() => program.to_string(),
-        _ => title.to_string(),
-    }
+        .or_else(|| name.strip_suffix(".EXE"))?;
+    (!program.is_empty() && name.len() < title.len()).then_some(program)
 }
 
 fn pty_size(size: TermSize) -> PtySize {
@@ -150,16 +147,19 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::title;
+    use super::program;
 
     #[test]
-    fn names_a_console_by_its_program() {
+    fn finds_a_consoles_program_in_its_title() {
         assert_eq!(
-            title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"),
-            "powershell"
+            program(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            Some("powershell")
         );
-        assert_eq!(title(r"Administrator: C:\Windows\system32\cmd.exe"), "cmd");
-        assert_eq!(title("~/src: vim"), "~/src: vim");
-        assert_eq!(title("pwsh.exe"), "pwsh.exe");
+        assert_eq!(
+            program(r"Administrator: C:\Windows\system32\cmd.exe"),
+            Some("cmd")
+        );
+        assert_eq!(program("~/src: vim"), None);
+        assert_eq!(program("pwsh.exe"), None);
     }
 }
