@@ -45,6 +45,11 @@ pub fn tabs() -> PathBuf {
     data_dir().join("tabs.json")
 }
 
+/// The commands waiting for hosts to come back, which never sync.
+pub fn waiting() -> PathBuf {
+    data_dir().join("waiting.json")
+}
+
 /// The commands that fill groups here, which never sync.
 pub fn sources() -> PathBuf {
     data_dir().join("sources.json")

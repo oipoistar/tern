@@ -39,6 +39,7 @@ pub mod sources;
 pub mod ssh;
 pub mod sync;
 pub mod vault;
+pub mod waiting;
 pub mod wol;
 
 pub use host::{Auth, Host, HostGroup, HostStatus};

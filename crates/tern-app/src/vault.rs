@@ -29,6 +29,7 @@ use tern_core::ssh::{
     known_host_key, probe, quick_destination,
 };
 use tern_core::sync::{Merged, Syncer};
+use tern_core::waiting::Waiting;
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
 use tern_core::{keys, known_hosts};
 
@@ -101,6 +102,9 @@ pub enum VaultEvent {
     },
     /// Open these side by side, as split panes.
     OpenTogether(Vec<Connection>),
+    /// A host came back: open a tab for it, out of the way, running the
+    /// connection's one-off command.
+    Run(Connection),
 }
 
 /// The screens the sidebar switches between.
@@ -200,6 +204,11 @@ pub struct VaultContent {
     sources: Sources,
     sources_file: Option<PathBuf>,
     source_form: Option<SourceForm>,
+    /// Commands waiting for hosts to come back (by host id), where they're
+    /// kept, and the line for one being typed (the host's id and field).
+    waiting: Waiting,
+    waiting_file: Option<PathBuf>,
+    wait_line: Option<(String, Entity<InputState>, Subscription)>,
     /// Groups whose command is running, and why a group's failed last.
     refreshing: HashSet<String>,
     source_problems: HashMap<String, SharedString>,
@@ -245,6 +254,8 @@ impl VaultContent {
         content.history_file = Some(paths::history());
         content.sources = Sources::load(&paths::sources());
         content.sources_file = Some(paths::sources());
+        content.waiting = Waiting::load(&paths::waiting());
+        content.waiting_file = Some(paths::waiting());
         content.start_checks(window, cx);
         // Sync at start, then every minute for other devices' changes.
         content._sync_loop = Some(cx.spawn(async move |this, cx| {
@@ -411,14 +422,18 @@ impl VaultContent {
     }
 
     /// Looks every second for checks that are due, and runs them while the
-    /// vault shows in the active window.
-    fn start_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// vault shows in the active window; those of hosts a command waits
+    /// for, always.
+    pub(crate) fn start_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._checks = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 let alive = this.update_in(cx, |this, window, cx| {
                     let on_screen = this.showing && this.section == Section::Hosts;
                     if on_screen && window.is_window_active() {
-                        this.run_due_checks(cx);
+                        this.run_due_checks(false, cx);
+                    } else if !this.waiting.is_empty() {
+                        // A host something waits for is watched regardless.
+                        this.run_due_checks(true, cx);
                     }
                 });
                 if alive.is_err() {
@@ -429,17 +444,24 @@ impl VaultContent {
         }));
     }
 
-    fn run_due_checks(&mut self, cx: &mut Context<Self>) {
+    /// Checks the hosts due a check: all of them, or `waited` only those
+    /// a command waits for.
+    fn run_due_checks(&mut self, waited: bool, cx: &mut Context<Self>) {
         let mut places: Vec<Place> = Vec::new();
         let mut proxies = Vec::new();
+        let mut among: Vec<Place> = Vec::new();
         for host in self.vault.hosts() {
             let place = self.vault.first_hop(host);
+            let wanted = !waited || self.waiting.command(&host.id).is_some();
+            if wanted && !among.contains(&place) {
+                among.push(place.clone());
+            }
             if !places.contains(&place) {
                 proxies.push(self.vault.first_hop_host(host).proxy.clone());
                 places.push(place);
             }
         }
-        let due = self.monitor.due(&places, Instant::now());
+        let due = self.monitor.due_among(&places, &among, Instant::now());
         if due.is_empty() {
             return;
         }
@@ -453,6 +475,9 @@ impl VaultContent {
                 let latency_ms = check.await.ok().map(|reached| reached.latency_ms);
                 let _ = this.update(cx, |this, cx| {
                     this.monitor.record(&place, latency_ms, Instant::now());
+                    if latency_ms.is_some() {
+                        this.run_waiting(&place, cx);
+                    }
                     cx.notify();
                 });
             })
@@ -608,6 +633,9 @@ impl VaultContent {
             sources: Sources::default(),
             sources_file: None,
             source_form: None,
+            waiting: Waiting::default(),
+            waiting_file: None,
+            wait_line: None,
             refreshing: HashSet::new(),
             source_problems: HashMap::new(),
             openssh: Vec::new(),
@@ -626,6 +654,162 @@ impl VaultContent {
         content.refresh_keys();
         content.refresh_imports();
         content
+    }
+
+    /// Runs what waited for the hosts reached through `place`, which
+    /// answered: each in a tab of its own, opened out of the way.
+    fn run_waiting(&mut self, place: &Place, cx: &mut Context<Self>) {
+        let back: Vec<Host> = self
+            .vault
+            .hosts()
+            .filter(|host| self.vault.first_hop(host) == *place)
+            .filter(|host| self.waiting.command(&host.id).is_some())
+            .cloned()
+            .collect();
+        if back.is_empty() {
+            return;
+        }
+        for host in back {
+            let Some(command) = self.waiting.take(&host.id) else {
+                continue;
+            };
+            if let Ok(mut connection) = self.vault.connection(&host) {
+                connection.once = Some(command);
+                cx.emit(VaultEvent::Run(connection));
+            }
+        }
+        self.save_waiting();
+        cx.notify();
+    }
+
+    /// Opens the line for a command to run once the host `id` is back.
+    fn open_wait_line(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command"));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let enter = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.queue_wait(cx);
+            }
+        });
+        self.wait_line = Some((id, input, enter));
+        cx.notify();
+    }
+
+    /// Has the line's command wait for its host.
+    fn queue_wait(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, input, _)) = self.wait_line.take() {
+            let command = input.read(cx).value().to_string();
+            self.waiting.set(&id, &command);
+            self.save_waiting();
+        }
+        cx.notify();
+    }
+
+    fn save_waiting(&self) {
+        if let Some(file) = &self.waiting_file {
+            // Not written down, it only doesn't wait past a restart.
+            let _ = self.waiting.save(file);
+        }
+    }
+
+    /// For a host that doesn't answer: Run when back, its line while a
+    /// command is typed, or the command waiting with a way to drop it.
+    fn waiting_row(&self, host: &Host, t: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
+        let id = host.id.clone();
+        if let Some((typing, input, _)) = &self.wait_line
+            && *typing == id
+        {
+            return Some(
+                div()
+                    .h(px(38.))
+                    .pl(px(12.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(11.))
+                    .bg(t.card2)
+                    .child(icon(IconName::Clock, 13., t.text2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .child(Input::new(input).appearance(false)),
+                    )
+                    .child(
+                        ink_button("wait-queue", t)
+                            .debug_selector(|| "wait-queue".into())
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(9.))
+                            .text_size(px(12.5))
+                            .child("Queue")
+                            .on_click(cx.listener(|this, _, _, cx| this.queue_wait(cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(command) = self.waiting.command(&id) {
+            let command = command.to_string();
+            return Some(
+                div()
+                    .h(px(38.))
+                    .pl(px(12.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(11.))
+                    .border_1()
+                    .border_color(t.line)
+                    .child(icon(IconName::Clock, 13., t.text))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .truncate()
+                            .child(command),
+                    )
+                    .child(
+                        div()
+                            .id("wait-cancel")
+                            .debug_selector(|| "wait-cancel".into())
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(9.))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.card2))
+                            .child(icon(IconName::Close, 12., t.text2))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.waiting.set(&id, "");
+                                this.save_waiting();
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let place = self.vault.first_hop(host);
+        (self.monitor.status(&place) == HostStatus::Offline).then(|| {
+            button("wait", t)
+                .debug_selector(|| "wait".into())
+                .justify_center()
+                .h(px(34.))
+                .rounded(px(11.))
+                .text_size(px(12.5))
+                .child(icon(IconName::Clock, 13., t.text2))
+                .child("Run when back")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_wait_line(id.clone(), window, cx)
+                }))
+                .into_any_element()
+        })
     }
 
     /// Opens the line for filling a group from a command: `group`'s, with
@@ -1428,7 +1612,8 @@ impl VaultContent {
                     )
                     .when_some(host.mac.clone(), |d, mac| {
                         d.child(self.wake_button(&mac, t, cx))
-                    }),
+                    })
+                    .children(self.waiting_row(host, t, cx)),
             )
             .when(!host.notes.is_empty(), |d| {
                 d.child(
@@ -2526,11 +2711,28 @@ impl VaultContent {
                             .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(15.))
-                                    .line_height(px(19.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(host.name.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px(15.))
+                                            .line_height(px(19.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .child(host.name.clone()),
+                                    )
+                                    // Something waits for it to come back.
+                                    .when(self.waiting.command(&host.id).is_some(), |d| {
+                                        let id = format!("waiting-{}", host.name);
+                                        d.child(
+                                            div()
+                                                .debug_selector(move || id)
+                                                .flex_none()
+                                                .child(icon(IconName::Clock, 13., t.text2)),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -3558,7 +3760,7 @@ mod tests {
                     .borrow_mut()
                     .push((connection.host.clone().unwrap_or_default(), *files)),
                 VaultEvent::Forward { on, .. } => seen_switch.borrow_mut().push(*on),
-                VaultEvent::Connect(_) | VaultEvent::OpenTogether(_) => {}
+                VaultEvent::Connect(_) | VaultEvent::OpenTogether(_) | VaultEvent::Run(_) => {}
             })
             .detach()
         });
@@ -3589,6 +3791,61 @@ mod tests {
         vault.read_with(cx, |vault, _| {
             assert!(!vault.vault.find("bastion").unwrap().forwards[0].on)
         });
+    }
+
+    #[gpui::test]
+    fn a_command_waits_for_its_host_to_come_back(cx: &mut TestAppContext) {
+        use std::time::Instant;
+
+        let (vault, cx, _) = open_vault(cx);
+        let ran: Rc<RefCell<Vec<Connection>>> = Rc::default();
+        let seen = ran.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                if let VaultEvent::Run(connection) = event {
+                    seen.borrow_mut().push(connection.clone());
+                }
+            })
+            .detach()
+        });
+        click(cx, "host-bastion");
+        assert!(cx.debug_bounds("wait").is_none());
+
+        // A host that doesn't answer offers to run something once it does.
+        let place = vault.update(cx, |vault, cx| {
+            let place = vault.vault.first_hop(vault.vault.find("bastion").unwrap());
+            vault.monitor.record(&place, None, Instant::now());
+            cx.notify();
+            place
+        });
+        click(cx, "wait");
+        cx.simulate_input("sudo reboot-check");
+        click(cx, "wait-queue");
+        assert!(cx.debug_bounds("waiting-bastion").is_some());
+        assert!(cx.debug_bounds("wait-cancel").is_some());
+
+        // It answers: the command runs in a tab of its own, once.
+        vault.update(cx, |vault, cx| {
+            vault.monitor.record(&place, Some(20), Instant::now());
+            vault.run_waiting(&place, cx);
+            vault.run_waiting(&place, cx);
+        });
+        assert_eq!(ran.borrow().len(), 1);
+        assert_eq!(ran.borrow()[0].once.as_deref(), Some("sudo reboot-check"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waiting-bastion").is_none());
+        assert!(cx.debug_bounds("wait").is_none());
+
+        // Dropped before then, nothing runs.
+        vault.update(cx, |vault, cx| {
+            vault.monitor.record(&place, None, Instant::now());
+            let id = vault.vault.find("bastion").unwrap().id.clone();
+            vault.waiting.set(&id, "uptime");
+            cx.notify();
+        });
+        click(cx, "wait-cancel");
+        vault.update(cx, |vault, cx| vault.run_waiting(&place, cx));
+        assert_eq!(ran.borrow().len(), 1);
     }
 
     #[gpui::test]
@@ -3935,7 +4192,7 @@ mod tests {
         };
         assert_eq!(status(cx), HostStatus::Unknown);
 
-        vault.update(cx, |vault, cx| vault.run_due_checks(cx));
+        vault.update(cx, |vault, cx| vault.run_due_checks(false, cx));
         assert_eq!(status(cx), HostStatus::Connecting);
         let deadline = Instant::now() + Duration::from_secs(10);
         while status(cx) == HostStatus::Connecting && Instant::now() < deadline {

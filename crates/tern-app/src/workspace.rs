@@ -390,6 +390,11 @@ impl Workspace {
                     VaultEvent::OpenTogether(connections) => {
                         this.open_together(connections.clone(), window, cx)
                     }
+                    // Out of the way: a tab at the end, not shown.
+                    VaultEvent::Run(connection) => {
+                        this.push_tab(std::slice::from_ref(connection), cx);
+                        cx.notify();
+                    }
                     VaultEvent::Forward { host, forward, on } => {
                         for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
                             let terminal = pane.read(cx);
@@ -2808,6 +2813,25 @@ mod tests {
             // Before SFTP opens, it'll start there.
             assert_eq!(files.following(), Some("/srv/my app"));
             assert_eq!(pane.read(cx).folder(), Some("/srv/my app"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_host_back_opens_its_tab_out_of_the_way(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let (vault, active) = workspace.read_with(cx, |workspace, _| {
+            (workspace.vault.clone(), workspace.active)
+        });
+        let sample = Vault::sample();
+        let mut connection = sample.connection(sample.find("bastion").unwrap()).unwrap();
+        connection.once = Some("uptime".into());
+        vault.update(cx, |_, cx| cx.emit(VaultEvent::Run(connection)));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert_eq!(workspace.active, active);
+            let pane = workspace.tabs[1].focused().read(cx);
+            assert_eq!(pane.connection().host.as_deref(), Some("bastion"));
         });
     }
 

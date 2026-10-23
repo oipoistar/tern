@@ -477,6 +477,73 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         println!("ok    an encrypted key's passphrase, asked in the pane");
     }
 
+    // A command waiting for a host that's down runs, in a session of its
+    // own, once a check finds the host back; the vault needn't be showing.
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::live::LiveSlots;
+        use crate::vault::{VaultContent, VaultEvent};
+
+        let mut hosts = Vault::default();
+        let host = Host {
+            auth: key(),
+            ..Host::new("lab-key", "lab", "127.0.0.1", 2202)
+        };
+        hosts.save(None, host, "Lab");
+        docker(&["stop", "-t", "1", "tern-lab-key-1"]);
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(hosts, None, LiveSlots::default(), window, cx)
+        });
+        // Checks run while the vault shows in the active window.
+        cx.update(|window, cx| {
+            window.activate_window();
+            vault.update(cx, |vault, cx| vault.start_checks(window, cx));
+        });
+        let ran: Rc<RefCell<Vec<Connection>>> = Rc::default();
+        let seen = ran.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                if let VaultEvent::Run(connection) = event {
+                    seen.borrow_mut().push(connection.clone());
+                }
+            })
+            .detach()
+        });
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "host-lab-key");
+        until(cx, "a check finds lab-key down", |cx| {
+            cx.debug_bounds("wait").is_some()
+        });
+        click(cx, "wait");
+        cx.simulate_input("echo waited-$((6*7))");
+        click(cx, "wait-queue");
+        vault.update(cx, |vault, _| vault.set_showing(false));
+        docker(&["start", "tern-lab-key-1"]);
+
+        // Checks come every half minute.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while ran.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "the command never ran");
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(100));
+            cx.executor().advance_clock(Duration::from_millis(100));
+        }
+        let connection = ran.borrow()[0].clone();
+        let (view, cx) = pane(cx, connection);
+        trust_until_live(&view, cx);
+        wait(&view, cx, "the waiting command's output", |view| {
+            view.output_text().contains("waited-42")
+        });
+        println!("ok    a command waiting for a host runs once it's back");
+    }
+
     // The server's key changed: refused, with the line to look at.
     {
         docker(&[

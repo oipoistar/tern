@@ -45,10 +45,16 @@ impl Monitor {
     /// as running until [`Monitor::record`]. Places no longer listed are
     /// forgotten.
     pub fn due(&mut self, places: &[Place], now: Instant) -> Vec<Place> {
+        self.due_among(places, places, now)
+    }
+
+    /// Like [`Monitor::due`], but only of the places `among`: the rest of
+    /// `places` keep what their checks found.
+    pub fn due_among(&mut self, places: &[Place], among: &[Place], now: Instant) -> Vec<Place> {
         self.watches.retain(|place, _| places.contains(place));
         let mut running = self.watches.values().filter(|watch| watch.running).count();
         let mut due = Vec::new();
-        for place in places {
+        for place in among {
             if running >= AT_ONCE {
                 break;
             }
@@ -165,5 +171,20 @@ mod tests {
         monitor.due(&[place("web")], now);
         assert_eq!(monitor.status(&db), HostStatus::Unknown);
         assert!(monitor.samples(&db).0.is_empty());
+    }
+
+    #[test]
+    fn checking_some_places_keeps_the_others() {
+        let mut monitor = Monitor::default();
+        let (db, web) = (place("db"), place("web"));
+        let places = [db.clone(), web.clone()];
+        let now = Instant::now();
+        monitor.record(&db, Some(9), now);
+
+        let later = now + CHECK_EVERY;
+        let among = std::slice::from_ref(&web);
+        assert_eq!(monitor.due_among(&places, among, later), among);
+        assert_eq!(monitor.status(&db), HostStatus::online(9));
+        assert_eq!(monitor.status(&web), HostStatus::Connecting);
     }
 }

@@ -287,6 +287,13 @@ claude.ai account). Each item below names the artboard it comes from.
       starting there if SFTP is still opening; a button in its path bar
       moves the shell into the folder shown (cd, quoted; a guarded host
       asks first), inked while the shell is there
+- [x] Run when it's back: a host whose check failed offers Run when back
+      in its side panel; the command typed there waits (one per host, a
+      clock beside the host's name, dropped with its ×) and the host keeps
+      being checked even while the vault isn't showing. The first check
+      that finds it back opens a session tab out of the way that runs the
+      command once (a guarded host asks first). Waiting commands stay in
+      waiting.json in the data folder and never sync
 
 ## Known gaps in what's built
 
