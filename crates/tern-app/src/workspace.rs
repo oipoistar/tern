@@ -15,6 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
 use tern_core::forward::ForwardState;
+use tern_core::probe::Vitals;
 use tern_core::restore::{OpenTabs, Opened};
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, parse_command};
@@ -22,7 +23,7 @@ use tern_core::ssh::{Connection, parse_command};
 use crate::bench;
 use crate::files::FilesPanel;
 use crate::live::{LiveSlots, live_layer};
-use crate::marks;
+use crate::marks::{self, Trace};
 use crate::settings::{self, Page, SettingsEvent, SettingsView};
 use crate::sync::{self, Status};
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
@@ -88,6 +89,73 @@ impl Tab {
     fn focused(&self) -> &Entity<TerminalView> {
         &self.panes[self.focused]
     }
+}
+
+/// A host's vitals, each as its icon, a trace of its recent readings and
+/// the latest value: the load (against the host's CPUs), and the shares
+/// of memory and disk in use. One never read isn't shown.
+fn vitals(vitals: &Vitals, theme: &Theme) -> Vec<AnyElement> {
+    let cpus = vitals.cpus.max(1) as f32;
+    let load = |load: f32| (format!("{load:.2}"), load / cpus);
+    // Rounded up, as df does: a disk in use isn't 0% full.
+    let share = |share: f32| (format!("{:.0}%", (share * 100.).ceil()), share);
+    [
+        (
+            "vital-load",
+            IconName::Cpu,
+            &vitals.load,
+            &load as &dyn Fn(f32) -> (String, f32),
+        ),
+        (
+            "vital-memory",
+            IconName::MemoryStick,
+            &vitals.memory,
+            &share,
+        ),
+        ("vital-disk", IconName::HardDrive, &vitals.disk, &share),
+    ]
+    .into_iter()
+    .filter_map(|(id, glyph, readings, shown)| {
+        let latest = readings.iter().rev().flatten().next().copied()?;
+        let samples: Vec<Option<u32>> = readings
+            .iter()
+            .map(|reading| reading.map(|reading| (shown(reading).1 * 100.).round() as u32))
+            .collect();
+        let trace = Trace {
+            status: HostStatus::online(0),
+            samples: samples.into(),
+            sampled_at: None,
+        };
+        let (ink, faint) = (theme.text, theme.text3);
+        Some(
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.))
+                .child(icon(glyph, 13., theme.text2))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            marks::paint_trace(bounds, &trace, 0, 0., ink, faint, window)
+                        },
+                    )
+                    .w(px(48.))
+                    .h(px(16.)),
+                )
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .child(shown(latest).0),
+                )
+                .into_any_element(),
+        )
+    })
+    .collect()
 }
 
 /// A square outlined button in the header, holding an icon.
@@ -1428,6 +1496,7 @@ impl Workspace {
                 )
                 .child(div().font_family(MONO).text_size(px(12.)).child(latency))
             })
+            .children(vitals(focused.vitals(), theme))
             .child(self.opened_ports(tab, theme, cx))
             .child(
                 div()
@@ -2381,6 +2450,30 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn draws_a_hosts_vitals_once_read(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        let shown = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            ["vital-load", "vital-memory", "vital-disk"].map(|id| cx.debug_bounds(id).is_some())
+        };
+        assert_eq!(shown(cx), [false; 3]);
+        // A host that doesn't say how full its disk is leaves that out.
+        pane.update(cx, |pane, cx| {
+            pane.probed(4, Vec::new(), Some(1.5), Some(0.25), None, cx)
+        });
+        assert_eq!(shown(cx), [true, true, false]);
+        pane.update(cx, |pane, cx| {
+            pane.probed(4, Vec::new(), Some(0.5), Some(0.3), Some(0.8), cx)
+        });
+        assert_eq!(shown(cx), [true; 3]);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.vitals().load, [Some(1.5), Some(0.5)]);
+            assert_eq!(pane.vitals().cpus, 4);
+        });
     }
 
     #[gpui::test]

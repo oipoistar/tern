@@ -236,6 +236,10 @@ claude.ai account). Each item below names the artboard it comes from.
       the same port here (inked; then a click opens it in the browser,
       and its stop ends forwarding), a failure draws the danger outline,
       and a port that closes goes with its forward
+- [x] Host vitals: the same reading of /proc draws the host's load
+      (against its CPUs), memory and disk in use as small traces in the
+      toolbar, each with its icon and latest value (shares rounded up,
+      as df does); a vital the host doesn't report isn't shown
 
 ## Known gaps in what's built
 

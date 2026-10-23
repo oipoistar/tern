@@ -401,6 +401,11 @@ impl TerminalView {
             .collect()
     }
 
+    /// The host's recent vitals.
+    pub fn vitals(&self) -> &Vitals {
+        &self.vitals
+    }
+
     /// Forwards a port the host opened to the same port here, or stops
     /// forwarding it; one that failed is tried again.
     pub fn toggle_port(&mut self, port: u16, cx: &mut Context<Self>) {
