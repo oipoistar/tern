@@ -165,6 +165,9 @@ claude.ai account). Each item below names the artboard it comes from.
       ssh command line (port, key, -J chain, -A, proxy, rules switched
       on) or as a ~/.ssh/config block that the importer reads back as
       the same host
+- [x] Host notes: a Notes field in the host editor, shown under the
+      selected host in the side panel and matched by search. Vault file
+      version 9
 
 ## Known gaps in what's built
 

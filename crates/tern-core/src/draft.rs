@@ -25,6 +25,7 @@ pub struct HostDraft {
     pub on_login: String,
     /// `NAME=value` pairs, as [`crate::env::parse`] reads them.
     pub env: String,
+    pub notes: String,
 }
 
 /// A form field a problem belongs to.
@@ -65,6 +66,7 @@ impl HostDraft {
             agent_forwarding: false,
             on_login: String::new(),
             env: String::new(),
+            notes: String::new(),
         }
     }
 
@@ -84,6 +86,7 @@ impl HostDraft {
             agent_forwarding: host.agent_forwarding,
             on_login: host.on_login.clone().unwrap_or_default(),
             env: crate::env::format(&host.env),
+            notes: host.notes.clone(),
         }
     }
 
@@ -198,6 +201,7 @@ impl HostDraft {
             agent_forwarding: self.agent_forwarding,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
             env,
+            notes: self.notes.trim_end().to_string(),
             forwards: previous
                 .map(|host| host.forwards.clone())
                 .unwrap_or_default(),

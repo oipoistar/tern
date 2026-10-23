@@ -84,6 +84,9 @@ pub struct Host {
     /// Port forwarding rules, each switched on or off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
+    /// Whatever the user wants to remember about the host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
     /// When it last changed, in milliseconds since the Unix epoch; sync
     /// keeps the newest.
     #[serde(default)]
@@ -130,6 +133,7 @@ impl Host {
             on_login: None,
             env: Env::new(),
             forwards: Vec::new(),
+            notes: String::new(),
             updated: 0,
         }
     }
@@ -153,15 +157,16 @@ impl Host {
     }
 
     /// Whether a search query matches this host. Each whitespace-separated
-    /// term must appear (case-insensitively) in the name, `user@address` or
-    /// a tag; an empty query matches everything.
+    /// term must appear (case-insensitively) in the name, `user@address`, a
+    /// tag or the notes; an empty query matches everything.
     pub fn matches(&self, query: &str) -> bool {
         let haystack = format!(
-            "{} {}@{} {}",
+            "{} {}@{} {} {}",
             self.name,
             self.user,
             self.address,
-            self.tags.join(" ")
+            self.tags.join(" "),
+            self.notes
         )
         .to_lowercase();
         query

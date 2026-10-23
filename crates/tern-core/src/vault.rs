@@ -419,8 +419,8 @@ impl Vault {
 /// misread the file (dropping something it doesn't know when it saves);
 /// older versions then leave it alone instead. 2 added snippets, 3 port
 /// forwarding rules, 4 ids, change times and deletions for sync, 5 agent
-/// forwarding, 6 environment variables, 7 proxies, 8 identities.
-pub const FILE_VERSION: u32 = 8;
+/// forwarding, 6 environment variables, 7 proxies, 8 identities, 9 notes.
+pub const FILE_VERSION: u32 = 9;
 
 /// The vault file as written.
 #[derive(Serialize)]
@@ -789,7 +789,7 @@ mod tests {
 
         vault.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 8"), "{text}");
+        assert!(text.contains("\"version\": 9"), "{text}");
         assert!(text.contains("df -h"), "snippets are kept too");
         assert!(!text.contains("latency") && !text.contains("status"));
         assert!(!dir.join("vault.json.tmp").exists());

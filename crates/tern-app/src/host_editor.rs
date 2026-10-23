@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::draft::{Field, HostDraft, Problem};
@@ -81,6 +81,7 @@ pub struct HostEditor {
     env: Entity<InputState>,
     /// The proxy's URL, used while `proxy_on`.
     proxy: Entity<InputState>,
+    notes: Entity<TextareaState>,
     proxy_on: bool,
     /// For password sign-in: typed to save it, empty to keep the one saved.
     password: Entity<InputState>,
@@ -135,6 +136,14 @@ impl HostEditor {
         let tag = text_input("", "Add tag", window, cx);
         let on_login = text_input(&draft.on_login, "", window, cx);
         let env = text_input(&draft.env, "NAME=value", window, cx);
+        let notes = {
+            let value = draft.notes.clone();
+            cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(3, 10)
+                    .default_value(value)
+            })
+        };
         let proxy = text_input(
             draft.proxy.as_deref().unwrap_or_default(),
             "socks5://host:1080",
@@ -193,6 +202,7 @@ impl HostEditor {
             tag,
             on_login,
             env,
+            notes,
             proxy_on: draft.proxy.is_some(),
             proxy,
             password,
@@ -244,6 +254,7 @@ impl HostEditor {
             agent_forwarding: self.agent_forwarding,
             on_login: text(&self.on_login),
             env: text(&self.env),
+            notes: self.notes.read(cx).value().to_string(),
         }
     }
 
@@ -1005,6 +1016,28 @@ impl HostEditor {
             })
     }
 
+    /// Free text about the host, shown beside it in the vault.
+    fn notes_card(&self, t: &Theme) -> impl IntoElement {
+        card(t).child(
+            labelled("Notes", t).child(
+                div()
+                    .debug_selector(|| "host-notes-field".into())
+                    .min_h(px(70.))
+                    .px(px(10.))
+                    .py(px(8.))
+                    .rounded(px(12.))
+                    .bg(t.card2)
+                    .text_size(px(13.))
+                    .child(Textarea::new(&self.notes).appearance(false)),
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn notes_input(&self) -> Entity<TextareaState> {
+        self.notes.clone()
+    }
+
     fn options_card(&self, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
         card(t)
             .child(
@@ -1358,7 +1391,8 @@ impl Render for HostEditor {
                                     .flex_col()
                                     .gap(px(14.))
                                     .child(self.place_card(t, cx))
-                                    .child(self.sign_in_card(t, cx)),
+                                    .child(self.sign_in_card(t, cx))
+                                    .child(self.notes_card(t)),
                             )
                             .child(
                                 div()

@@ -1107,6 +1107,20 @@ impl VaultContent {
                             .child(self.copy_button("copy-config", "Copy config", host, t, cx)),
                     ),
             )
+            .when(!host.notes.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("host-notes")
+                        .debug_selector(|| "host-notes".into())
+                        .p(px(14.))
+                        .rounded(px(22.))
+                        .bg(t.card)
+                        .shadow(t.shadow())
+                        .text_size(px(13.))
+                        .text_color(t.text2)
+                        .child(host.notes.clone()),
+                )
+            })
             .when(!host.forwards.is_empty(), |d| {
                 d.child(
                     div()
@@ -2496,6 +2510,39 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn keeps_notes_about_a_host(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        click(cx, "host-bastion");
+        click(cx, "edit-host");
+        cx.update(|window, cx| {
+            let editor = vault.read(cx).editor.clone().expect("the editor is open");
+            let input = editor.read(cx).notes_input();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_input("Reboots on Sundays");
+        click(cx, "save-host");
+        vault.read_with(cx, |vault, _| {
+            assert_eq!(
+                vault.vault.find("bastion").unwrap().notes,
+                "Reboots on Sundays"
+            )
+        });
+        assert!(cx.debug_bounds("host-notes").is_some());
+
+        // Search finds a host by its notes.
+        cx.update(|window, cx| {
+            let search = vault.read(cx).search.clone();
+            search.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_input("sundays");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("host-bastion").is_some());
+        assert!(cx.debug_bounds("host-prod-db-01").is_none());
     }
 
     #[gpui::test]
