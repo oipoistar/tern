@@ -88,6 +88,12 @@ pub fn importable(vault: &Vault, text: &str, dir: &Path, user: &str) -> Vec<Host
     new_hosts(vault, to_hosts(&blocks, dir, user), GROUP)
 }
 
+/// Every host `text` describes, whatever the vault has: what a group filled
+/// by a command holds ([`sources`](crate::sources)).
+pub fn described(text: &str, dir: &Path, user: &str) -> Vec<Host> {
+    to_hosts(&parse(text, dir), dir, user)
+}
+
 /// `hosts` minus those the vault, or one before them, already has at the
 /// same user, address and port, reached the same way. A name another host
 /// uses, in any case,

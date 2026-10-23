@@ -32,6 +32,7 @@ pub mod settings;
 pub mod sftp;
 pub mod shells;
 pub mod snippet;
+pub mod sources;
 pub mod ssh;
 pub mod sync;
 pub mod vault;

@@ -246,6 +246,16 @@ claude.ai account). Each item below names the artboard it comes from.
       (listed again as it opens) gives each by name and image, and picks
       open a pane beside it with a shell inside the container (bash, else
       sh), in a tab of its own when the tab is full
+- [x] Groups that fill themselves: Group from a command (or a sourced
+      group's pencil) takes a group's name and a command run here (cmd
+      on Windows, sh elsewhere) that prints hosts in OpenSSH's config
+      form (Tailscale, a cloud's CLI, an inventory, a script); Fill and
+      the group's Refresh keep the group to what it prints, by name:
+      hosts keep their ids and what was added to them here, new ones
+      come in ("name (group)" when another group has the name), gone
+      ones go unless another host goes through them, and output with no
+      hosts changes nothing. The commands stay in sources.json in the
+      data folder and never sync
 
 ## Known gaps in what's built
 

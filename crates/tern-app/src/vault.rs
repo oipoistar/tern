@@ -2,16 +2,17 @@
 //! session with [`VaultEvent::Connect`], opens the host editor over itself
 //! to add or change hosts, and saves every change to the vault file. While
 //! it shows in the active window it checks in the background that the hosts
-//! answer, and their traces draw what the checks measured.
+//! answer, and their traces draw what the checks measured. A group can be
+//! filled by a command run here, and refreshed from it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::filter::{self, Filter, Reach};
@@ -22,6 +23,7 @@ use tern_core::reach::{Monitor, Place};
 use tern_core::restore::OpenTabs;
 use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::snippet::Snippet;
+use tern_core::sources::{self, Sources};
 use tern_core::ssh::{
     ConnectError, Connection, Event, Session, SessionInput, Target, TermSize, key_art,
     known_host_key, probe, quick_destination,
@@ -47,6 +49,17 @@ use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{
     Ui, art_tile, button, group_heading, icon, ink_button, search_field, status_dot, switch,
 };
+
+/// The line for filling a group from a command run here.
+struct SourceForm {
+    group: Entity<InputState>,
+    command: Entity<InputState>,
+    /// Why the last run failed, in one line.
+    problem: Option<SharedString>,
+    /// The command running.
+    _run: Option<Task<()>>,
+    _enter: Subscription,
+}
 
 /// How long after a change, or after starting, a sync waits.
 const SYNC_SETTLE: Duration = Duration::from_secs(2);
@@ -182,6 +195,14 @@ pub struct VaultContent {
     /// Saved PuTTY sessions not in the vault yet; the import button shows
     /// only while there are some.
     putty: Vec<Host>,
+    /// The commands filling groups here, and where they're kept (nowhere
+    /// for tests). They never sync.
+    sources: Sources,
+    sources_file: Option<PathBuf>,
+    source_form: Option<SourceForm>,
+    /// Groups whose command is running, and why a group's failed last.
+    refreshing: HashSet<String>,
+    source_problems: HashMap<String, SharedString>,
     /// Hosts in `~/.ssh/config` not in the vault yet, likewise.
     openssh: Vec<Host>,
     /// What the background checks found.
@@ -222,6 +243,8 @@ impl VaultContent {
         content.notice = opened.notice.map(Into::into);
         content.history = History::load(&paths::history());
         content.history_file = Some(paths::history());
+        content.sources = Sources::load(&paths::sources());
+        content.sources_file = Some(paths::sources());
         content.start_checks(window, cx);
         // Sync at start, then every minute for other devices' changes.
         content._sync_loop = Some(cx.spawn(async move |this, cx| {
@@ -582,6 +605,11 @@ impl VaultContent {
             destination: None,
             editor: None,
             putty: Vec::new(),
+            sources: Sources::default(),
+            sources_file: None,
+            source_form: None,
+            refreshing: HashSet::new(),
+            source_problems: HashMap::new(),
             openssh: Vec::new(),
             monitor: Monitor::default(),
             showing: true,
@@ -598,6 +626,241 @@ impl VaultContent {
         content.refresh_keys();
         content.refresh_imports();
         content
+    }
+
+    /// Opens the line for filling a group from a command: `group`'s, with
+    /// its command, or a new one.
+    fn open_source(&mut self, group: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let name = group.unwrap_or_default();
+        let command = self.sources.command(&name).unwrap_or_default().to_string();
+        let new = name.is_empty();
+        let group = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Group")
+                .default_value(name)
+        });
+        let command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Command")
+                .default_value(command)
+        });
+        let first = if new { &group } else { &command };
+        first.update(cx, |input, cx| input.focus(window, cx));
+        let enter = cx.subscribe_in(&command, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.fill_from_form(cx);
+            }
+        });
+        self.source_form = Some(SourceForm {
+            group,
+            command,
+            problem: None,
+            _run: None,
+            _enter: enter,
+        });
+        cx.notify();
+    }
+
+    /// Runs the line's command and fills its group with the hosts it
+    /// prints, keeping the command for refreshes; an empty command stops
+    /// the group being filled.
+    fn fill_from_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.source_form else {
+            return;
+        };
+        let group = form.group.read(cx).value().trim().to_string();
+        let command = form.command.read(cx).value().trim().to_string();
+        if group.is_empty() {
+            form.problem = Some("A group needs a name".into());
+            return cx.notify();
+        }
+        if command.is_empty() {
+            self.sources.set(&group, "");
+            self.save_sources();
+            self.source_form = None;
+            return cx.notify();
+        }
+        let run = cx.background_spawn({
+            let command = command.clone();
+            async move { sources::run(&command, sources::WAIT) }
+        });
+        form.problem = None;
+        form._run = Some(cx.spawn(async move |this, cx| {
+            let printed = run.await;
+            let _ = this.update(cx, |this, cx| {
+                match this.refill(&group, &command, printed, cx) {
+                    Ok(()) => this.source_form = None,
+                    Err(problem) => {
+                        if let Some(form) = &mut this.source_form {
+                            form.problem = Some(problem.into());
+                            form._run = None;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Runs `group`'s command again and keeps the group to what it prints.
+    fn refresh_source(&mut self, group: String, cx: &mut Context<Self>) {
+        let Some(command) = self.sources.command(&group).map(str::to_string) else {
+            return;
+        };
+        if !self.refreshing.insert(group.clone()) {
+            return;
+        }
+        let run = cx.background_spawn({
+            let command = command.clone();
+            async move { sources::run(&command, sources::WAIT) }
+        });
+        cx.spawn(async move |this, cx| {
+            let printed = run.await;
+            let _ = this.update(cx, |this, cx| {
+                this.refreshing.remove(&group);
+                match this.refill(&group, &command, printed, cx) {
+                    Ok(()) => this.source_problems.remove(&group),
+                    Err(problem) => this.source_problems.insert(group, problem.into()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Fills `group` with the hosts a run of `command` printed, in
+    /// OpenSSH's config form, and keeps the command for it.
+    fn refill(
+        &mut self,
+        group: &str,
+        command: &str,
+        printed: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let printed = printed?;
+        let dir = paths::ssh_dir().unwrap_or_default();
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_default();
+        let hosts = openssh::described(&printed, &dir, &user);
+        sources::refill(&mut self.vault, group, hosts)?;
+        self.sources.set(group, command);
+        self.save_sources();
+        if self.vault.find(&self.selected).is_none() {
+            self.selected = self
+                .vault
+                .hosts()
+                .next()
+                .map(|host| host.name.clone())
+                .unwrap_or_default();
+        }
+        self.persist(cx);
+        self.refresh_keys();
+        Ok(())
+    }
+
+    fn save_sources(&self) {
+        if let Some(file) = &self.sources_file {
+            // Not written down, a source only isn't there next time.
+            let _ = self.sources.save(file);
+        }
+    }
+
+    /// The line for filling a group from a command: its group and command,
+    /// Fill and Cancel, and why the last run failed below.
+    fn source_line(
+        &self,
+        form: &SourceForm,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let running = form._run.is_some();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .h(px(46.))
+                    .pl(px(14.))
+                    .pr(px(5.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(16.))
+                    .bg(theme.card)
+                    .border_1()
+                    .border_color(if form.problem.is_some() {
+                        theme.danger
+                    } else {
+                        theme.line
+                    })
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.source_form = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .child(icon(IconName::SquareTerminal, 16., theme.text2))
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex_none()
+                            .text_size(px(13.))
+                            .child(Input::new(&form.group).appearance(false)),
+                    )
+                    .child(div().w(px(1.)).h(px(22.)).bg(theme.line))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(MONO)
+                            .text_size(px(12.5))
+                            .child(Input::new(&form.command).appearance(false)),
+                    )
+                    .child(
+                        ink_button("fill-source", theme)
+                            .debug_selector(|| "fill-source".into())
+                            .h(px(36.))
+                            .px(px(16.))
+                            .rounded(px(12.))
+                            .text_size(px(13.))
+                            .map(|d| {
+                                if running {
+                                    d.child(icon(IconName::LoaderCircle, 15., theme.card))
+                                } else {
+                                    d.child("Fill")
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.fill_from_form(cx))),
+                    )
+                    .child(
+                        button("cancel-source", theme)
+                            .debug_selector(|| "cancel-source".into())
+                            .h(px(36.))
+                            .px(px(14.))
+                            .rounded(px(12.))
+                            .text_size(px(13.))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.source_form = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(form.problem.clone(), |d, problem| {
+                d.child(
+                    div()
+                        .px(px(4.))
+                        .text_size(px(12.))
+                        .text_color(theme.danger)
+                        .truncate()
+                        .child(problem),
+                )
+            })
     }
 
     /// Adds every PuTTY session not in the vault yet to the PuTTY group and
@@ -1699,6 +1962,9 @@ impl VaultContent {
             .flex_col()
             .gap(px(22.))
             .child(self.toolbar(theme, cx))
+            .when_some(self.source_form.as_ref(), |d, form| {
+                d.child(self.source_line(form, theme, cx))
+            })
             .when_some(self.notice.clone(), |d, notice| {
                 d.child(
                     div()
@@ -1761,12 +2027,70 @@ impl VaultContent {
                                 .map(|host| self.host_row(host, ui, cx).into_any_element()),
                         ),
                     };
+                    // A group a command fills: Refresh runs it again (its
+                    // icon turning while it runs), the pencil opens it.
+                    let sourced = self.sources.command(&group.name).is_some().then(|| {
+                        let (refresh, change) = (
+                            format!("refresh-group-{}", group.name),
+                            format!("source-group-{}", group.name),
+                        );
+                        let (again, open) = (group.name.clone(), group.name.clone());
+                        let running = self.refreshing.contains(&group.name);
+                        let small = |id: String, glyph: IconName| {
+                            div()
+                                .id(SharedString::from(id.clone()))
+                                .debug_selector(move || id)
+                                .size(px(28.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(9.))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(theme.card2))
+                                .child(icon(glyph, 13., theme.text2))
+                        };
+                        div()
+                            .flex()
+                            .child(
+                                small(
+                                    refresh,
+                                    if running {
+                                        IconName::LoaderCircle
+                                    } else {
+                                        IconName::RefreshCw
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.refresh_source(again.clone(), cx),
+                                )),
+                            )
+                            .child(small(change, IconName::Pencil).on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_source(Some(open.clone()), window, cx)
+                                },
+                            )))
+                    });
+                    let problem = self.source_problems.get(&group.name).cloned();
                     Some(
                         div()
                             .flex()
                             .flex_col()
                             .gap(px(14.))
-                            .child(group_heading(group.name.clone(), theme).children(open_all))
+                            .child(
+                                group_heading(group.name.clone(), theme)
+                                    .children(open_all)
+                                    .children(sourced),
+                            )
+                            .when_some(problem, |d, problem| {
+                                d.child(
+                                    div()
+                                        .px(px(4.))
+                                        .text_size(px(12.))
+                                        .text_color(theme.danger)
+                                        .truncate()
+                                        .child(problem),
+                                )
+                            })
                             .child(hosts),
                     )
                 })
@@ -2103,6 +2427,19 @@ impl VaultContent {
                         .on_click(cx.listener(|this, _, _, cx| this.import_openssh(cx))),
                 )
             })
+            .child(
+                button("new-source", theme)
+                    .debug_selector(|| "new-source".into())
+                    .h(px(46.))
+                    .px(px(16.))
+                    .rounded(px(16.))
+                    .text_size(px(14.))
+                    .child(icon(IconName::SquareTerminal, 16., theme.text))
+                    .child("Group from a command")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_source(None, window, cx)),
+                    ),
+            )
             // The screen's primary action, so the one solid ink button.
             .child(
                 div()
@@ -2563,6 +2900,87 @@ mod tests {
         vault.read_with(cx, |vault, cx| {
             assert!(vault.search.read(cx).value().is_empty())
         });
+    }
+
+    #[gpui::test]
+    fn fills_a_group_from_a_command_and_keeps_to_it(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::InputState;
+
+        use super::SourceForm;
+
+        let (vault, cx, _) = open_vault(cx);
+        let typed = |cx: &mut VisualTestContext,
+                     field: fn(&SourceForm) -> Entity<InputState>,
+                     text: &str| {
+            cx.update(|window, cx| {
+                let form = vault.read(cx).source_form.as_ref().map(field);
+                let input = form.expect("the line is open");
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            });
+            cx.simulate_input(text);
+        };
+        // A command printing hosts in OpenSSH's config form.
+        let printing = |hosts: &[(&str, &str)]| {
+            if cfg!(windows) {
+                let lines: Vec<String> = hosts
+                    .iter()
+                    .map(|(name, address)| format!("echo Host {name}& echo   HostName {address}"))
+                    .collect();
+                format!("({})", lines.join("& "))
+            } else {
+                let lines: String = hosts
+                    .iter()
+                    .map(|(name, address)| format!("Host {name}\\n  HostName {address}\\n"))
+                    .collect();
+                format!("printf '{lines}'")
+            }
+        };
+        let group_of = |cx: &mut VisualTestContext, name: &str| {
+            vault.read_with(cx, |vault, _| {
+                vault.vault.group_of(name).map(str::to_string)
+            })
+        };
+
+        click(cx, "new-source");
+        typed(cx, |form| form.group.clone(), "Fleet");
+        typed(
+            cx,
+            |form| form.command.clone(),
+            &printing(&[("fleet-web", "10.0.7.1")]),
+        );
+        click(cx, "fill-source");
+        assert_eq!(group_of(cx, "fleet-web").as_deref(), Some("Fleet"));
+        assert!(vault.read_with(cx, |vault, _| vault.source_form.is_none()));
+
+        // The pencil opens its command; a new one fills it anew.
+        click(cx, "source-group-Fleet");
+        let two = printing(&[("fleet-web", "10.0.7.1"), ("fleet-db", "10.0.7.2")]);
+        typed(cx, |form| form.command.clone(), &two);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(group_of(cx, "fleet-db").as_deref(), Some("Fleet"));
+        click(cx, "refresh-group-Fleet");
+        assert_eq!(group_of(cx, "fleet-db").as_deref(), Some("Fleet"));
+
+        // A command that fails says why, and the group stays as it was.
+        click(cx, "source-group-Fleet");
+        typed(cx, |form| form.command.clone(), "exit 3");
+        click(cx, "fill-source");
+        let problem = vault.read_with(cx, |vault, _| {
+            vault
+                .source_form
+                .as_ref()
+                .and_then(|form| form.problem.clone())
+        });
+        assert_eq!(problem.as_deref(), Some("It ended with status 3"));
+        assert_eq!(group_of(cx, "fleet-web").as_deref(), Some("Fleet"));
+        click(cx, "cancel-source");
     }
 
     #[gpui::test]

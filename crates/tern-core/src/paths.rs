@@ -45,6 +45,11 @@ pub fn tabs() -> PathBuf {
     data_dir().join("tabs.json")
 }
 
+/// The commands that fill groups here, which never sync.
+pub fn sources() -> PathBuf {
+    data_dir().join("sources.json")
+}
+
 /// Key pairs Tern generated or imported.
 pub fn keys() -> PathBuf {
     data_dir().join("keys")
