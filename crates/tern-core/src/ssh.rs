@@ -132,6 +132,9 @@ pub struct Connection {
     pub keep_alive: bool,
     /// Let the server use this computer's SSH agent.
     pub agent_forwarding: bool,
+    /// Input that doesn't come from the pane's own keyboard waits for a
+    /// yes, or doesn't reach it ([`Host::guarded`](crate::Host::guarded)).
+    pub guarded: bool,
     /// Environment variables the shell starts with.
     pub env: Vec<(String, String)>,
     /// Typed into the shell once it starts, at every login.
@@ -178,6 +181,7 @@ impl Connection {
             proxy: None,
             keep_alive: true,
             agent_forwarding: false,
+            guarded: false,
             env: Vec::new(),
             on_login: None,
             once: None,

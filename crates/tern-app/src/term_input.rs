@@ -157,11 +157,12 @@ pub fn encode_mouse(
     Some(bytes)
 }
 
-/// Whether pasting `text` should be confirmed first: it has more than one
-/// line, and without bracketed paste the shell would run each line as it
-/// arrives.
-pub fn paste_needs_confirming(text: &str, bracketed: bool) -> bool {
-    !bracketed && text.trim_end_matches(['\r', '\n']).contains(['\r', '\n'])
+/// Whether pasting `text` waits for a yes: always into a guarded host, and,
+/// unless `confirm` is switched off, when it has more than one line and
+/// without bracketed paste the shell would run each line as it arrives.
+pub fn hold_paste(text: &str, bracketed: bool, guarded: bool, confirm: bool) -> bool {
+    let lines = text.trim_end_matches(['\r', '\n']).contains(['\r', '\n']);
+    guarded || (confirm && !bracketed && lines)
 }
 
 /// What a turn of the wheel sends a full-screen program that doesn't take
@@ -301,15 +302,20 @@ mod tests {
 
     #[test]
     fn asks_before_pasting_lines_a_shell_would_run() {
-        use super::paste_needs_confirming;
+        use super::hold_paste;
 
-        assert!(paste_needs_confirming("rm -rf build\nmake\n", false));
-        assert!(paste_needs_confirming("a\r\nb", false));
+        let held = |text: &str, bracketed: bool| hold_paste(text, bracketed, false, true);
+        assert!(held("rm -rf build\nmake\n", false));
+        assert!(held("a\r\nb", false));
         // One line, with or without its newline, goes straight in.
-        assert!(!paste_needs_confirming("make\n", false));
-        assert!(!paste_needs_confirming("make", false));
+        assert!(!held("make\n", false));
+        assert!(!held("make", false));
         // A shell with bracketed paste waits for Enter anyway.
-        assert!(!paste_needs_confirming("a\nb", true));
+        assert!(!held("a\nb", true));
+        // Unless the setting is off.
+        assert!(!hold_paste("a\nb", false, false, false));
+        // A guarded host asks for everything, setting or not.
+        assert!(hold_paste("make", true, true, false));
     }
 
     #[test]

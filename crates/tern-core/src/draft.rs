@@ -22,6 +22,7 @@ pub struct HostDraft {
     pub tags: Vec<String>,
     pub keep_alive: bool,
     pub agent_forwarding: bool,
+    pub guarded: bool,
     pub on_login: String,
     /// `NAME=value` pairs, as [`crate::env::parse`] reads them.
     pub env: String,
@@ -67,6 +68,7 @@ impl HostDraft {
             tags: Vec::new(),
             keep_alive: true,
             agent_forwarding: false,
+            guarded: false,
             on_login: String::new(),
             env: String::new(),
             notes: String::new(),
@@ -88,6 +90,7 @@ impl HostDraft {
             tags: host.tags.clone(),
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
+            guarded: host.guarded,
             on_login: host.on_login.clone().unwrap_or_default(),
             env: crate::env::format(&host.env),
             notes: host.notes.clone(),
@@ -221,6 +224,7 @@ impl HostDraft {
             proxy,
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
+            guarded: self.guarded,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
             env,
             notes: self.notes.trim_end().to_string(),
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_complete_draft_becomes_a_host() {
-        let vault = Vault::sample();
+        let mut vault = Vault::sample();
         let mut draft = HostDraft::new("Production");
         draft.name = " db-new ".into();
         draft.address = "10.0.0.9".into();
@@ -299,6 +303,7 @@ mod tests {
         draft.user = "root".into();
         draft.tags = vec!["SQL".into(), " ".into(), "sql".into(), "eu".into()];
         draft.on_login = "  ".into();
+        draft.guarded = true;
         let host = draft.check(&vault, None).unwrap();
         assert_eq!(
             (host.name.as_str(), host.port, host.user.as_str()),
@@ -306,6 +311,9 @@ mod tests {
         );
         assert_eq!(host.tags, ["SQL", "eu"]);
         assert_eq!(host.on_login, None);
+        // Its sessions are guarded too.
+        vault.save(None, host.clone(), "Production");
+        assert!(vault.connection(&host).unwrap().guarded);
     }
 
     #[test]
@@ -336,6 +344,14 @@ mod tests {
             .check(&vault, Some("prod-db-01"))
             .unwrap();
         assert_eq!(&host, db);
+        let guarded = Host {
+            guarded: true,
+            ..db.clone()
+        };
+        let host = HostDraft::edit(&guarded, "Production")
+            .check(&vault, Some("prod-db-01"))
+            .unwrap();
+        assert_eq!(host, guarded);
     }
 
     #[test]

@@ -23,6 +23,7 @@ What's built and what comes next: [ROADMAP.md](ROADMAP.md).
 ```sh
 cargo run -p tern-app                      # the app
 cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at start
+cargo run -p tern-app -- --connect prod-db-01                 # or one to a saved host
 cargo run -p tern-app -- --local                              # open a local terminal at start
 cargo run -p tern-app -- --edit prod-db-01                    # open the host editor (a new host without a name)
 cargo run -p tern-app -- --settings sync                      # open Settings at a page

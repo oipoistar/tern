@@ -345,6 +345,7 @@ impl Vault {
             proxy: self.first_hop_host(host).proxy.clone(),
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
+            guarded: host.guarded,
             env: host
                 .env
                 .iter()

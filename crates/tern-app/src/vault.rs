@@ -3396,11 +3396,13 @@ mod tests {
         });
         assert_eq!(problems, [Field::Proxy]);
         type_into(cx, Field::Proxy, "socks5://proxy.lan:1080");
+        click(cx, "guard-switch");
         click(cx, "save-host");
         assert!(!editor_open(cx));
         vault.read_with(cx, |vault, _| {
             let host = vault.vault.find("db-new").expect("the new host is saved");
             assert_eq!((host.port, host.user.as_str()), (2200, "root"));
+            assert!(host.guarded);
             assert_eq!(host.env.get("TZ").map(String::as_str), Some("UTC"));
             assert_eq!(host.env.len(), 2);
             let proxy = host.proxy.as_ref().expect("the proxy is saved");

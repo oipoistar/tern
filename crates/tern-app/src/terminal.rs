@@ -43,9 +43,7 @@ use tern_core::ssh::{
 };
 
 use crate::settings;
-use crate::term_input::{
-    MouseReport, encode_key, encode_mouse, paste_needs_confirming, wheel_keys,
-};
+use crate::term_input::{MouseReport, encode_key, encode_mouse, hold_paste, wheel_keys};
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::icon;
 
@@ -91,6 +89,15 @@ pub enum Phase {
     },
     Live,
     Ended(SharedString),
+}
+
+/// Input waiting for a yes before it reaches the shell.
+enum Held {
+    /// A paste whose lines the shell would run as they arrive, or any paste
+    /// into a guarded host.
+    Paste(String),
+    /// A snippet, or a command run from elsewhere, for a guarded host.
+    Run(Vec<u8>),
 }
 
 pub enum TerminalEvent {
@@ -161,8 +168,10 @@ pub struct TerminalView {
     pressed: Option<MouseButton>,
     /// The cell the program last heard the pointer was in.
     reported_cell: Option<(usize, usize)>,
-    /// Lines waiting to be pasted until the user says so.
-    pending_paste: Option<String>,
+    /// Input waiting for the user to say so.
+    held: Option<Held>,
+    /// A guarded pane takes Broadcast too: the user let it in.
+    pub let_in: bool,
     /// The right-click menu, open where it was asked for.
     menu: Option<Point<Pixels>>,
     /// Output arrived since the pane was last on screen.
@@ -326,6 +335,29 @@ impl TerminalView {
         *self.preview.borrow_mut() = lines;
     }
 
+    /// Whether input that doesn't come from this pane's keyboard waits for
+    /// a yes, or doesn't reach it.
+    pub fn guarded(&self) -> bool {
+        self.connection.guarded
+    }
+
+    /// Whether Broadcast reaches this pane: a guarded host's only once let
+    /// in.
+    pub fn takes_broadcast(&self) -> bool {
+        !self.guarded() || self.let_in
+    }
+
+    /// Types a snippet, or a command run from elsewhere; a guarded host's
+    /// pane holds it until the user says so.
+    pub fn type_command(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if self.guarded() {
+            self.held = Some(Held::Run(bytes));
+            cx.notify();
+        } else {
+            self.type_text(bytes, cx);
+        }
+    }
+
     /// Types `bytes` into the shell, as if from the keyboard. Ignored
     /// until the session is live.
     pub fn type_text(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
@@ -376,7 +408,8 @@ impl TerminalView {
             link: None,
             pressed: None,
             reported_cell: None,
-            pending_paste: None,
+            held: None,
+            let_in: false,
             menu: None,
             unseen: false,
             rang: false,
@@ -535,9 +568,11 @@ impl TerminalView {
                 }
                 self.had_shell = true;
                 // Queued now, it reaches the shell as soon as it starts.
-                let commands = [self.connection.on_login.clone(), self.once.take()];
-                for command in commands.into_iter().flatten() {
+                if let Some(command) = &self.connection.on_login {
                     self.send(format!("{command}\r").into_bytes());
+                }
+                if let Some(command) = self.once.take() {
+                    self.type_command(format!("{command}\r").into_bytes(), cx);
                 }
             }
             Event::Output(bytes) => {
@@ -763,15 +798,11 @@ impl TerminalView {
             cx.notify();
             return;
         }
-        // A paste waiting to be confirmed: Enter pastes, Escape doesn't.
-        if self.pending_paste.is_some() {
+        // Input waiting for a yes: Enter gives it, Escape doesn't.
+        if self.held.is_some() {
             match keystroke.key.as_str() {
-                "enter" => {
-                    if let Some(text) = self.pending_paste.take() {
-                        self.paste_text(text, cx);
-                    }
-                }
-                "escape" => self.pending_paste = None,
+                "enter" => self.release(cx),
+                "escape" => self.held = None,
                 _ => {}
             }
             cx.stop_propagation();
@@ -873,13 +904,22 @@ impl TerminalView {
         };
         // Broadcast, it also reaches shells that may not take it bracketed.
         let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE) && !self.broadcasting;
-        if settings::current(cx).terminal.confirm_paste && paste_needs_confirming(&text, bracketed)
-        {
-            self.pending_paste = Some(text);
+        let confirm = settings::current(cx).terminal.confirm_paste;
+        if hold_paste(&text, bracketed, self.guarded(), confirm) {
+            self.held = Some(Held::Paste(text));
             cx.notify();
             return;
         }
         self.paste_text(text, cx);
+    }
+
+    /// Gives the shell what was held for a yes.
+    fn release(&mut self, cx: &mut Context<Self>) {
+        match self.held.take() {
+            Some(Held::Paste(text)) => self.paste_text(text, cx),
+            Some(Held::Run(bytes)) => self.type_text(bytes, cx),
+            None => {}
+        }
     }
 
     fn paste_text(&mut self, text: String, cx: &mut Context<Self>) {
@@ -1678,6 +1718,7 @@ impl TerminalView {
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
+                .debug_selector(move || id.into())
                 .h(px(38.))
                 .px(px(16.))
                 .flex()
@@ -1697,16 +1738,26 @@ impl TerminalView {
             self.connection.target.user, self.connection.target.host, self.connection.target.port
         );
 
-        if let Some(text) = &self.pending_paste {
+        if let Some(held) = &self.held {
             let into: SharedString = if self.connection.local {
                 "this computer".into()
             } else {
                 self.label()
             };
-            let lines: Vec<&str> = text.trim_end_matches(['\r', '\n']).lines().collect();
+            let (text, action) = match held {
+                Held::Paste(text) => (text.clone(), "Paste"),
+                Held::Run(bytes) => (String::from_utf8_lossy(bytes).into_owned(), "Run"),
+            };
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let lines: Vec<&str> = text.trim_end_matches('\n').lines().collect();
             let shown = lines.len().min(6);
+            let title = match held {
+                Held::Paste(_) if lines.len() == 1 => format!("Paste 1 line into {into}?"),
+                Held::Paste(_) => format!("Paste {} lines into {into}?", lines.len()),
+                Held::Run(_) => format!("Run on {into}?"),
+            };
             return Some(card(
-                format!("Paste {} lines into {}?", lines.len(), into).into(),
+                title.into(),
                 Some(
                     div()
                         .flex()
@@ -1733,17 +1784,15 @@ impl TerminalView {
                             div()
                                 .flex()
                                 .gap(px(8.))
-                                .child(button("paste-confirm", "Paste", true).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        if let Some(text) = this.pending_paste.take() {
-                                            this.paste_text(text, cx);
-                                        }
+                                .child(button("paste-confirm", action, true).on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.release(cx);
                                         cx.notify();
-                                    }),
-                                ))
+                                    },
+                                )))
                                 .child(button("paste-cancel", "Cancel", false).on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.pending_paste = None;
+                                        this.held = None;
                                         cx.notify();
                                     }),
                                 )),

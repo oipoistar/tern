@@ -74,6 +74,10 @@ pub struct Host {
     /// Let the server use this computer's SSH agent, as `ssh -A` does.
     #[serde(default, skip_serializing_if = "is_off")]
     pub agent_forwarding: bool,
+    /// Guarded against stray input: pastes and snippets wait for a yes,
+    /// and Broadcast leaves its sessions out.
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub guarded: bool,
     /// Typed into the shell once it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
@@ -142,6 +146,7 @@ impl Host {
             proxy: None,
             keep_alive: true,
             agent_forwarding: false,
+            guarded: false,
             on_login: None,
             env: Env::new(),
             forwards: Vec::new(),

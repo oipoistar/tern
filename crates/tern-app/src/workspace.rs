@@ -192,16 +192,29 @@ impl Workspace {
             }
             workspace.remember_tabs_in(file, cx);
         }
-        // `tern --connect "ssh -p 2222 user@host"` opens a session at startup.
+        // `tern --connect "ssh -p 2222 user@host"`, or a saved host's name,
+        // opens a session at startup.
         let mut args = std::env::args()
             .skip_while(|arg| arg != "--connect")
             .skip(1);
         if let Some(command) = args.next() {
-            match parse_command(&command) {
-                Ok((target, identity)) => {
-                    workspace.open_session(Connection::typed(target, identity), window, cx)
+            let saved = workspace
+                .vault
+                .read(cx)
+                .host_entries()
+                .iter()
+                .any(|(name, _)| *name == command);
+            if saved {
+                workspace
+                    .vault
+                    .update(cx, |vault, cx| vault.open_host(&command, window, cx));
+            } else {
+                match parse_command(&command) {
+                    Ok((target, identity)) => {
+                        workspace.open_session(Connection::typed(target, identity), window, cx)
+                    }
+                    Err(error) => eprintln!("--connect: {error}"),
                 }
-                Err(error) => eprintln!("--connect: {error}"),
             }
         }
         // `tern --local` opens a local terminal at startup.
@@ -930,7 +943,9 @@ impl Workspace {
             return;
         }
         for pane in tab.panes.iter().filter(|pane| *pane != from) {
-            pane.update(cx, |terminal, cx| give(terminal, cx));
+            if pane.read(cx).takes_broadcast() {
+                pane.update(cx, |terminal, cx| give(terminal, cx));
+            }
         }
     }
 
@@ -1000,8 +1015,24 @@ impl Workspace {
             tab.broadcast = !tab.broadcast;
             let on = tab.broadcast;
             for pane in &tab.panes {
-                pane.update(cx, |pane, _| pane.broadcasting = on);
+                pane.update(cx, |pane, _| {
+                    pane.broadcasting = on;
+                    // Letting a guarded pane in lasts while Broadcast does.
+                    pane.let_in &= on;
+                });
             }
+            cx.notify();
+        }
+    }
+
+    /// Lets a guarded pane of the active tab take Broadcast, or leaves it
+    /// out again.
+    fn toggle_let_in(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if let Some(index) = self.active {
+            self.tabs[index].panes[pane].update(cx, |pane, cx| {
+                pane.let_in = !pane.let_in;
+                cx.notify();
+            });
             cx.notify();
         }
     }
@@ -1206,7 +1237,8 @@ impl Workspace {
     }
 
     /// Types `snippet` into tab `index`'s focused pane, or into all its
-    /// panes while it broadcasts.
+    /// panes that take Broadcast while it broadcasts; a guarded host's pane
+    /// asks first.
     fn type_snippet(
         &mut self,
         index: usize,
@@ -1215,14 +1247,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let tab = &self.tabs[index];
-        let panes = if tab.broadcast {
-            tab.panes.clone()
+        let focused = tab.focused();
+        let panes: Vec<Entity<TerminalView>> = if tab.broadcast {
+            tab.panes
+                .iter()
+                .filter(|pane| *pane == focused || pane.read(cx).takes_broadcast())
+                .cloned()
+                .collect()
         } else {
-            vec![tab.focused().clone()]
+            vec![focused.clone()]
         };
         for pane in panes {
             pane.update(cx, |terminal, cx| {
-                terminal.type_text(snippet.keystrokes(), cx)
+                terminal.type_command(snippet.keystrokes(), cx)
             });
         }
         if self.active == Some(index) {
@@ -1460,17 +1497,29 @@ impl Workspace {
         }
     }
 
-    /// A pane: an ink ring while focused (every pane while broadcasting),
+    /// A pane: an ink ring while focused (every pane Broadcast reaches
+    /// while broadcasting), a double hairline inside it for a guarded host,
     /// and with others beside it a header with its host, Maximize and
-    /// Close.
+    /// Close, and while broadcasting a guarded host's way in.
     fn pane(&self, tab: &Tab, index: usize, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let terminal = &tab.panes[index];
-        let ringed = tab.broadcast || (tab.focused == index && tab.panes.len() > 1);
+        let (guarded, let_in) = {
+            let pane = terminal.read(cx);
+            (pane.guarded(), pane.let_in)
+        };
+        let reached = tab.broadcast && (!guarded || let_in);
+        let ringed = reached || (tab.focused == index && tab.panes.len() > 1);
         let id = format!("pane-{index}");
-        let (maximize, close) = (
+        let (maximize, close, way_in) = (
             format!("pane-maximize-{index}"),
             format!("pane-close-{index}"),
+            format!("pane-let-in-{index}"),
         );
+        let hairline = |d: Div, radius: f32| {
+            d.flex_1().min_h_0().flex().flex_col().when(guarded, |d| {
+                d.rounded(px(radius)).border_1().border_color(theme.text)
+            })
+        };
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
@@ -1486,52 +1535,91 @@ impl Workspace {
             } else {
                 transparent_black()
             })
-            .when(tab.panes.len() > 1, |d| {
-                let maximized = tab.maximized.is_some();
-                d.child(
-                    div()
-                        .h(px(32.))
-                        .pl(px(12.))
-                        .pr(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .text_size(px(12.))
-                        .child(phase_glyph(&terminal.read(cx).phase, theme))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(terminal.read(cx).label()),
-                        )
-                        .child(
-                            pane_button(
-                                maximize,
-                                if maximized {
-                                    IconName::Minimize2
-                                } else {
-                                    IconName::Maximize2
-                                },
-                                theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| this.toggle_maximized(index, window, cx),
-                            )),
-                        )
-                        .child(
-                            pane_button(close, IconName::Close, theme).on_click(cx.listener(
-                                move |this, _, window, cx| this.close_pane(index, window, cx),
-                            )),
-                        ),
-                )
-            })
             .child(
-                div().flex_1().min_h_0().child(
-                    terminal
-                        .clone()
-                        .cached(StyleRefinement::default().size_full()),
-                ),
+                hairline(div(), 17.)
+                    .when(guarded, |d| d.m(px(2.)).p(px(2.)))
+                    .child(
+                        hairline(div(), 14.)
+                            .when(tab.panes.len() > 1, |d| {
+                                let maximized = tab.maximized.is_some();
+                                d.child(
+                                    div()
+                                        .h(px(32.))
+                                        .pl(px(12.))
+                                        .pr(px(4.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .text_size(px(12.))
+                                        .child(phase_glyph(&terminal.read(cx).phase, theme))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(terminal.read(cx).label()),
+                                        )
+                                        .when(tab.broadcast && guarded, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(SharedString::from(way_in.clone()))
+                                                    .debug_selector(move || way_in)
+                                                    .size(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(8.))
+                                                    .cursor_pointer()
+                                                    .when(let_in, |d| d.bg(theme.text))
+                                                    .child(icon(
+                                                        IconName::RadioTower,
+                                                        13.,
+                                                        if let_in {
+                                                            theme.card
+                                                        } else {
+                                                            theme.text2
+                                                        },
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.toggle_let_in(index, cx)
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            pane_button(
+                                                maximize,
+                                                if maximized {
+                                                    IconName::Minimize2
+                                                } else {
+                                                    IconName::Maximize2
+                                                },
+                                                theme,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.toggle_maximized(index, window, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            pane_button(close, IconName::Close, theme).on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.close_pane(index, window, cx)
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div().flex_1().min_h_0().child(
+                                    terminal
+                                        .clone()
+                                        .cached(StyleRefinement::default().size_full()),
+                                ),
+                            ),
+                    ),
             )
     }
 
@@ -2151,6 +2239,74 @@ mod tests {
                 b"make\rmake install".to_vec()
             ]
         );
+    }
+
+    #[gpui::test]
+    fn guarded_hosts_ask_first_and_broadcast_leaves_them_out(cx: &mut TestAppContext) {
+        use gpui_kit::ClipboardItem;
+        use tern_core::ssh::Target;
+
+        let (workspace, cx) = open_workspace(cx);
+        let target = |host: &str| Target {
+            host: host.into(),
+            port: 22,
+            user: "deploy".into(),
+        };
+        let guarded = Connection {
+            guarded: true,
+            once: Some("make deploy".into()),
+            ..Connection::typed(target("db-01"), None)
+        };
+        let plain = Connection::typed(target("web-01"), None);
+        workspace.update(cx, |workspace, cx| {
+            workspace.vault.update(cx, |_, cx| {
+                cx.emit(VaultEvent::OpenTogether(vec![plain, guarded]))
+            })
+        });
+        cx.run_until_parked();
+        let panes = workspace.read_with(cx, |workspace, _| workspace.tabs[1].panes.clone());
+        let sent = |cx: &mut VisualTestContext| -> Vec<Vec<u8>> {
+            panes
+                .iter()
+                .map(|pane| pane.read_with(cx, |pane, _| pane.sent.take()))
+                .collect()
+        };
+        let nothing = || [Vec::<u8>::new(), Vec::new()];
+
+        // A command run from elsewhere waits for a yes.
+        assert_eq!(sent(cx), nothing());
+        click(cx, "paste-confirm");
+        assert_eq!(sent(cx), [Vec::new(), b"make deploy\r".to_vec()]);
+
+        // Broadcast leaves it out until it's let in.
+        cx.update(|window, cx| panes[0].update(cx, |pane, cx| pane.focus(window, cx)));
+        click(cx, "broadcast");
+        cx.simulate_input("ls");
+        assert_eq!(sent(cx), [b"ls".to_vec(), Vec::new()]);
+        click(cx, "pane-let-in-1");
+        cx.update(|window, cx| panes[0].update(cx, |pane, cx| pane.focus(window, cx)));
+        cx.simulate_input("pwd");
+        assert_eq!(sent(cx), [b"pwd".to_vec(), b"pwd".to_vec()]);
+        // A snippet still asks there; Cancel drops it.
+        click(cx, "snippet-0");
+        assert_eq!(sent(cx), [b"df -h\r".to_vec(), Vec::new()]);
+        click(cx, "paste-cancel");
+        assert_eq!(sent(cx), nothing());
+        // Letting it in lasts while Broadcast does.
+        click(cx, "broadcast");
+        panes[1].read_with(cx, |pane, _| assert!(!pane.let_in));
+
+        // Even one pasted line asks.
+        cx.update(|window, cx| panes[1].update(cx, |pane, cx| pane.focus(window, cx)));
+        cx.write_to_clipboard(ClipboardItem::new_string("uptime".into()));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-shift-v"
+        });
+        assert_eq!(sent(cx), nothing());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
     }
 
     #[gpui::test]

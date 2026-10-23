@@ -208,6 +208,13 @@ claude.ai account). Each item below names the artboard it comes from.
       to the server first, and its passphrase is asked in the pane
       (three tries) only once the server says it would take the key, as
       OpenSSH does; a jump host's asks the same way
+- [x] Guarded hosts: Guard against stray input in the host editor; the
+      host's panes get a double hairline inside the ring, Broadcast
+      leaves them out unless a pane's header lets it in (for as long as
+      Broadcast lasts), and pastes (even one line), snippets and
+      commands from Run on hosts wait in the pane for Paste or Run
+      (Enter) and Cancel (Escape). tern --connect also takes a saved
+      host's name
 
 ## Known gaps in what's built
 

@@ -60,7 +60,11 @@ pub fn vault() -> Vault {
         name: name.into(),
         hosts: hosts
             .iter()
-            .map(|(name, address)| Host::new(name, "deploy", address, 22))
+            .map(|(name, address)| Host {
+                // The database is the host to be careful with.
+                guarded: *name == "prod-db-01",
+                ..Host::new(name, "deploy", address, 22)
+            })
             .collect(),
     };
     Vault {
