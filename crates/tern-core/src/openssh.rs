@@ -21,12 +21,12 @@ pub const GROUP: &str = "OpenSSH";
 const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// Settings that collect every value instead of keeping the first.
-const ADDITIVE: [&str; 5] = [
+/// (`SetEnv` isn't one: OpenSSH sends the first line that applies.)
+const ADDITIVE: [&str; 4] = [
     "identityfile",
     "localforward",
     "remoteforward",
     "dynamicforward",
-    "setenv",
 ];
 
 /// A `Host` block (or a skipped `Match` one): its patterns and settings,
@@ -385,13 +385,19 @@ fn to_hosts(blocks: &[Block], dir: &Path, user: &str) -> Vec<Host> {
                 }
             }
         }
-        for arguments in settings.get("setenv").into_iter().flatten() {
-            for pair in arguments.iter() {
-                if let Some((name, value)) = pair.split_once('=')
-                    && let Ok(parsed) = crate::env::parse(&format!("{name}=\"{value}\""))
-                {
-                    host.env.extend(parsed);
-                }
+        let pairs = settings
+            .get("setenv")
+            .and_then(|values| values.first())
+            .copied()
+            .unwrap_or_default();
+        for (name, value) in pairs.iter().filter_map(|pair| pair.split_once('=')) {
+            // Of a name given twice, OpenSSH sends the first value. The
+            // value goes to `env::parse` in quotes, where `\` escapes.
+            let quoted = value.replace('\\', "\\\\").replace('"', "\\\"");
+            if !host.env.contains_key(name)
+                && let Ok(parsed) = crate::env::parse(&format!("{name}=\"{quoted}\""))
+            {
+                host.env.extend(parsed);
             }
         }
         let proxy_command = settings
@@ -493,7 +499,7 @@ pub fn config_block(vault: &Vault, host: &Host) -> String {
     let mut lines = vec![
         format!("Host {alias}"),
         format!("    HostName {}", host.address),
-        format!("    User {user}"),
+        format!("    User {}", config_quote(&user)),
     ];
     if host.port != 22 {
         lines.push(format!("    Port {}", host.port));
@@ -501,7 +507,7 @@ pub fn config_block(vault: &Vault, host: &Host) -> String {
     if let Auth::Key(path) = &auth {
         lines.push(format!(
             "    IdentityFile {}",
-            quote(&path.display().to_string())
+            config_quote(&path.display().to_string())
         ));
     }
     let jumps = jump_list(vault, host);
@@ -530,7 +536,12 @@ pub fn config_block(vault: &Vault, host: &Host) -> String {
         ));
     }
     if !host.env.is_empty() {
-        lines.push(format!("    SetEnv {}", crate::env::format(&host.env)));
+        let pairs: Vec<String> = host
+            .env
+            .iter()
+            .map(|(name, value)| format!("{name}={}", config_quote(value)))
+            .collect();
+        lines.push(format!("    SetEnv {}", pairs.join(" ")));
     }
     lines.join("\n") + "\n"
 }
@@ -581,6 +592,34 @@ fn quote(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// `text` as one argument of a config line, which OpenSSH (and [`words`])
+/// reads back as it is: in double quotes when it's empty or has spaces,
+/// quotes or a `\` that would be read as an escape, with `"` and those `\`
+/// escaped. Other backslashes stay single, as in `C:\Users\me\.ssh\id`.
+fn config_quote(text: &str) -> String {
+    let mut plain = !text.is_empty() && !text.starts_with('#');
+    let mut quoted = String::from("\"");
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                plain = false;
+                quoted.push_str("\\\"");
+            }
+            '\\' if matches!(chars.peek(), None | Some('\'' | '"' | '\\' | ' ')) => {
+                plain = false;
+                quoted.push_str("\\\\");
+            }
+            c => {
+                plain &= !c.is_whitespace() && c != '\'';
+                quoted.push(c);
+            }
+        }
+    }
+    quoted.push('"');
+    if plain { text.to_string() } else { quoted }
 }
 
 /// The proxy an `nc`/`ncat` `ProxyCommand` goes through: `-X 5` (or none)
@@ -766,6 +805,56 @@ Host "unclosed
         assert_eq!(split("one #two three").as_deref(), Some("one"));
         assert_eq!(split(r##"a#b "#c""##).as_deref(), Some("a#b|#c"));
         assert_eq!(split("'open"), None);
+    }
+
+    #[test]
+    fn sets_the_environment_openssh_would() {
+        let config = r#"
+Host tools
+    SetEnv TOOLS=C:\tools "WIN=C:\\Program Files" LANG=C LANG=fr
+    SetEnv LATER=1
+Host *
+    SetEnv LANG=de EXTRA=1
+"#;
+        let hosts = importable(&Vault::default(), config, Path::new("."), "me");
+        // The first SetEnv line that applies, and a name's first value.
+        let env = &find(&hosts, "tools").env;
+        assert_eq!(env.len(), 3, "{env:?}");
+        assert_eq!(env["TOOLS"], r"C:\tools");
+        assert_eq!(env["WIN"], r"C:\Program Files");
+        assert_eq!(env["LANG"], "C");
+    }
+
+    #[test]
+    fn writes_values_openssh_reads_back_as_they_are() {
+        let mut vault = Vault::default();
+        let mut host = Host::new("tools", "John Smith", "tools.lan", 22);
+        host.auth = Auth::Key(PathBuf::from(r"C:\Users\O'Brien\.ssh\id key"));
+        for (name, value) in [
+            ("TOOLS", r"C:\tools"),
+            ("SHARE", r"\\server\share"),
+            ("SAY", r#"say "hi""#),
+            ("IT", "it's"),
+            ("EMPTY", ""),
+            ("WORDS", "two words"),
+            ("END", r"ends\"),
+        ] {
+            host.env.insert(name.into(), value.into());
+        }
+        vault.save(None, host.clone(), "Mine");
+        let block = config_block(&vault, &host);
+        assert!(block.contains(r" TOOLS=C:\tools "), "{block}");
+
+        let read = importable(&Vault::default(), &block, Path::new("."), "someone");
+        let again = find(&read, "tools");
+        assert_eq!(again.user, "John Smith");
+        assert_eq!(again.env, host.env);
+        assert!(
+            matches!(&again.auth, Auth::Key(path)
+                if path.to_string_lossy().ends_with(r"\O'Brien\.ssh\id key")),
+            "{:?}",
+            again.auth
+        );
     }
 
     #[test]
