@@ -207,6 +207,13 @@ claude.ai account). Each item below names the artboard it comes from.
 - Forwarding rules run without a terminal can't ask for anything: they
   sign in with a key, the agent or a saved password, and a server that
   asks a question (a one-time code) fails them.
+- A jump host that signs in with a password asks for it only through the
+  server's own questions (keyboard-interactive); one that has those turned
+  off needs the password saved.
+- Sync files carry no format version. An older Tern syncing with this one
+  drops the host fields it doesn't know (identity, proxy, environment,
+  notes, MAC address) and syncs the stripped hosts back, so every device
+  needs the same build until hosts carry unknown fields through.
 
 ## Next, in order
 
