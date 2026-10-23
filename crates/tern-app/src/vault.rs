@@ -2795,11 +2795,15 @@ mod tests {
 
         click(cx, "nav-port-forwarding");
         click(cx, "run-dead-0");
+        // Running, unless already refused: Linux refuses at once, Windows
+        // after a second or so.
         vault.read_with(cx, |vault, _| {
             assert!(
-                vault
-                    .running_alone()
-                    .contains(&("dead".to_string(), rule.id()))
+                vault.running_alone().contains(&key)
+                    || matches!(
+                        vault.forward_states.get(&key),
+                        Some(ForwardState::Failed(_))
+                    )
             )
         });
         let deadline = Instant::now() + Duration::from_secs(10);

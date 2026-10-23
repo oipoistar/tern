@@ -57,4 +57,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        # Every suite runs, so one run shows every failure.
+        run: cargo test --workspace --no-fail-fast
