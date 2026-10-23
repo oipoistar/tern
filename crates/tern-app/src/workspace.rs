@@ -80,8 +80,6 @@ struct Tab {
     broadcast: bool,
     /// The Files panel, made when first opened, on the pane focused then.
     files: Option<Entity<FilesPanel>>,
-    /// The pane whose host the Files panel shows.
-    files_for: Option<Entity<TerminalView>>,
     files_open: bool,
 }
 
@@ -364,7 +362,6 @@ impl Workspace {
             maximized: None,
             broadcast: false,
             files: None,
-            files_for: None,
             files_open: false,
         });
     }
@@ -874,7 +871,6 @@ impl Workspace {
             maximized: None,
             broadcast: false,
             files: None,
-            files_for: None,
             files_open: false,
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
@@ -1024,20 +1020,25 @@ impl Workspace {
         }
     }
 
-    /// Opens the Files panel of tab `index` on its focused pane's host,
-    /// starting SFTP there unless the panel already shows that pane.
+    /// Opens the Files panel of tab `index` on its focused pane's host:
+    /// the one already there if it shows that pane, with SFTP opened again
+    /// if the pane reconnected since, or else a new one.
     fn show_files(&mut self, index: usize, cx: &mut Context<Self>) {
         let tab = &mut self.tabs[index];
         let focused = tab.focused().clone();
-        if tab.files_for.as_ref() != Some(&focused) {
-            let (opening, host) = {
-                let pane = focused.read(cx);
-                (pane.open_sftp(), pane.label())
-            };
-            tab.files = Some(
-                cx.new(|cx| FilesPanel::new(opening, FilesPanel::default_local_dir(), host, cx)),
-            );
-            tab.files_for = Some(focused);
+        match tab
+            .files
+            .clone()
+            .filter(|files| files.read(cx).is_for(&focused))
+        {
+            Some(files) => {
+                files.update(cx, |files, cx| files.reopen_if_reconnected(cx));
+            }
+            None => {
+                tab.files = Some(
+                    cx.new(|cx| FilesPanel::new(&focused, FilesPanel::default_local_dir(), cx)),
+                )
+            }
         }
         tab.files_open = true;
         cx.notify();
@@ -1086,6 +1087,18 @@ impl Workspace {
         tab.maximized = None;
         if tab.focused >= pane && tab.focused > 0 {
             tab.focused -= 1;
+        }
+        // Its Files panel goes with it; one that was shown opens on the
+        // pane that takes the keyboard.
+        if tab
+            .files
+            .as_ref()
+            .is_some_and(|files| files.read(cx).is_for(&closing))
+        {
+            tab.files = None;
+            if tab.files_open {
+                self.show_files(index, cx);
+            }
         }
         self.activate(Some(index), window, cx);
     }
@@ -2200,12 +2213,58 @@ mod tests {
                 files: true,
             },
         );
-        workspace.read_with(cx, |workspace, _| {
+        workspace.read_with(cx, |workspace, cx| {
             let tab = &workspace.tabs[1];
             assert_eq!(tab.focused, 1);
             assert!(tab.files_open);
-            assert_eq!(tab.files_for.as_ref(), Some(&tab.panes[1]));
+            assert!(tab.files.as_ref().unwrap().read(cx).is_for(&tab.panes[1]));
         });
+    }
+
+    #[gpui::test]
+    fn files_opens_again_on_the_tabs_current_connection(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let tab = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let tab = &workspace.tabs[0];
+                (tab.panes.clone(), tab.files.clone().unwrap())
+            })
+        };
+        let on = |cx: &mut VisualTestContext| {
+            let (panes, files) = tab(cx);
+            files.read_with(cx, |files, cx| {
+                let pane = panes.iter().position(|pane| files.is_for(pane)).unwrap();
+                (pane, files.session(), panes[pane].read(cx).session())
+            })
+        };
+        click(cx, "toggle-files");
+        let (panes, files) = tab(cx);
+        assert_eq!(on(cx), (0, 0, 0));
+
+        // The pane reconnected while Files was hidden: shown again, the
+        // same panel opens SFTP on the new connection.
+        click(cx, "toggle-files");
+        panes[0].update(cx, |pane, cx| pane.reconnect_offline(cx));
+        click(cx, "toggle-files");
+        assert_eq!(tab(cx).1, files);
+        assert_eq!(on(cx), (0, 1, 1));
+
+        // While it's shown, Refresh does.
+        panes[0].update(cx, |pane, cx| pane.reconnect_offline(cx));
+        click(cx, "files-refresh");
+        assert_eq!(on(cx), (0, 2, 2));
+
+        // Files on a second pane; closing that pane ends its session, and
+        // Files opens on the pane left.
+        click(cx, "toggle-files");
+        click(cx, "layout-2");
+        click(cx, "toggle-files");
+        assert_eq!(on(cx).0, 1);
+        let closing = tab(cx).0[1].downgrade();
+        click(cx, "pane-close-1");
+        assert!(closing.upgrade().is_none());
+        assert_eq!(on(cx).0, 0);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.tabs[0].files_open));
     }
 
     #[gpui::test]

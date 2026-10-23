@@ -124,6 +124,8 @@ pub struct TerminalView {
     trust: Option<Trusted>,
     pub phase: Phase,
     input: Option<SessionInput>,
+    /// Sessions started here, reconnects included: the latest's number.
+    sessions: u64,
     _events: Option<Task<()>>,
     term: Term<Listener>,
     parser: Processor,
@@ -279,6 +281,20 @@ impl TerminalView {
         view
     }
 
+    /// Stands in for a reconnect, for tests: the next session, live, with
+    /// nothing behind it either.
+    #[cfg(test)]
+    pub fn reconnect_offline(&mut self, cx: &mut Context<Self>) {
+        self.sessions += 1;
+        self.on_session_event(Event::Connected, cx);
+    }
+
+    /// The session `open_sftp` opens on, by number: a reconnect starts the
+    /// next, so SFTP opened on an earlier one is known to be gone.
+    pub fn session(&self) -> u64 {
+        self.sessions
+    }
+
     /// An SFTP session on this pane's connection; asked while connecting,
     /// it opens once the shell does.
     pub fn open_sftp(&self) -> Pin<Box<dyn Future<Output = Result<Sftp, String>>>> {
@@ -338,6 +354,7 @@ impl TerminalView {
             trust: None,
             phase: Phase::Connecting,
             input: None,
+            sessions: 0,
             _events: None,
             term: Term::new(config, &GridSize(size), Listener(term_events.clone())),
             parser: Processor::new(),
@@ -481,6 +498,7 @@ impl TerminalView {
         };
         let (input, mut events) = session.into_parts();
         self.input = Some(input);
+        self.sessions += 1;
         self.phase = Phase::Connecting;
         self._events = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {

@@ -4,7 +4,9 @@
 //! progress bar and a check when done. Clicking a file copies it to the
 //! other side's folder; files dropped on the panel upload to the host's
 //! folder. Hovering a row offers rename, permissions (on the host) and
-//! delete, which a line under the path bar takes or confirms.
+//! delete, which a line under the path bar takes or confirms. Once its
+//! pane has reconnected, Refresh or showing the panel again opens SFTP on
+//! the new connection.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,6 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::sftp::{self, Entry, Progress, Sftp};
 
+use crate::terminal::TerminalView;
 use crate::theme::{self, MONO, Theme};
 use crate::ui::icon;
 
@@ -58,6 +61,10 @@ struct Transfer {
 }
 
 pub struct FilesPanel {
+    /// The session pane whose host this shows, and which of its sessions
+    /// SFTP was opened on.
+    pane: WeakEntity<TerminalView>,
+    session: u64,
     sftp: Option<Sftp>,
     /// The session's host, naming its side.
     host: SharedString,
@@ -75,34 +82,15 @@ pub struct FilesPanel {
 }
 
 impl FilesPanel {
-    /// A panel for the SFTP session on `host` that `opening` will give,
-    /// starting in its home folder there and in `local_dir` here.
-    pub fn new(
-        opening: impl Future<Output = Result<Sftp, String>> + 'static,
-        local_dir: PathBuf,
-        host: SharedString,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let task = cx.spawn(async move |this, cx| {
-            let opened = match opening.await {
-                Ok(sftp) => sftp.home().await.map(|home| (sftp, home)),
-                Err(problem) => Err(problem),
-            };
-            let _ = this.update(cx, |this, cx| {
-                match opened {
-                    Ok((sftp, home)) => {
-                        this.sftp = Some(sftp);
-                        this.go_remote(home, cx);
-                    }
-                    Err(problem) => this.problem = Some(problem.into()),
-                }
-                cx.notify();
-            });
-        });
+    /// A panel for `pane`'s host, starting in its home folder there and in
+    /// `local_dir` here.
+    pub fn new(pane: &Entity<TerminalView>, local_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let local = sftp::list_local(&local_dir).unwrap_or_default();
-        Self {
+        let mut panel = Self {
+            pane: pane.downgrade(),
+            session: 0,
             sftp: None,
-            host,
+            host: pane.read(cx).label(),
             problem: None,
             side: Side::Remote,
             remote_dir: "/".into(),
@@ -111,15 +99,79 @@ impl FilesPanel {
             local,
             transfers: Vec::new(),
             form: None,
-            _opening: task,
+            _opening: Task::ready(()),
             _ticker: None,
+        };
+        panel.open_sftp(pane, None, cx);
+        panel
+    }
+
+    /// Whether this shows `pane`'s host.
+    pub fn is_for(&self, pane: &Entity<TerminalView>) -> bool {
+        self.pane == *pane
+    }
+
+    /// Opens SFTP on `pane`'s current session, in `dir` there, or else in
+    /// the home folder.
+    fn open_sftp(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        dir: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (opening, session) = {
+            let pane = pane.read(cx);
+            (pane.open_sftp(), pane.session())
+        };
+        self.session = session;
+        self.problem = None;
+        self._opening = cx.spawn(async move |this, cx| {
+            let opened = match opening.await {
+                Ok(sftp) => match dir {
+                    Some(dir) => Ok((sftp, dir)),
+                    None => sftp.home().await.map(|home| (sftp, home)),
+                },
+                Err(problem) => Err(problem),
+            };
+            let _ = this.update(cx, |this, cx| {
+                match opened {
+                    Ok((sftp, dir)) => {
+                        this.sftp = Some(sftp);
+                        this.go_remote(dir, cx);
+                    }
+                    Err(problem) => this.problem = Some(problem.into()),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Opens SFTP again if the pane has started a session since (it
+    /// reconnected), back in the folder shown; says whether it did.
+    pub fn reopen_if_reconnected(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pane) = self.pane.upgrade() else {
+            return false;
+        };
+        if pane.read(cx).session() == self.session {
+            return false;
         }
+        // The folder is only worth going back to if SFTP had opened.
+        let dir = self.sftp.take().map(|_| self.remote_dir.clone());
+        self.open_sftp(&pane, dir, cx);
+        cx.notify();
+        true
     }
 
     /// What the host's side lists, by name.
     #[cfg(test)]
     pub fn remote_names(&self) -> Vec<String> {
         self.remote.iter().map(|entry| entry.name.clone()).collect()
+    }
+
+    /// Which of its pane's sessions SFTP was opened on.
+    #[cfg(test)]
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     /// The folder this computer's side starts in: Downloads, or home.
@@ -274,9 +326,15 @@ impl FilesPanel {
         cx.notify();
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Lists the side shown again; the host's opens SFTP again first if
+    /// the pane reconnected.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         match self.side {
-            Side::Remote => self.go_remote(self.remote_dir.clone(), cx),
+            Side::Remote => {
+                if !self.reopen_if_reconnected(cx) {
+                    self.go_remote(self.remote_dir.clone(), cx)
+                }
+            }
             Side::Local => self.go_local(self.local_dir.clone(), cx),
         }
     }
@@ -832,9 +890,10 @@ impl Render for FilesPanel {
 #[cfg(test)]
 mod tests {
     // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
 
     use super::FilesPanel;
+    use crate::terminal::TerminalView;
 
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
         cx.run_until_parked();
@@ -856,19 +915,12 @@ mod tests {
         cx.update(gpui_kit::init);
         let start = dir.clone();
         let (panel, cx) = cx.add_window_view(move |_, cx| {
-            FilesPanel::new(
-                async { Err("the host doesn't offer SFTP".to_string()) },
-                start,
-                "web-01".into(),
-                cx,
-            )
+            let pane = cx.new(TerminalView::offline);
+            FilesPanel::new(&pane, start, cx)
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                panel.problem.as_deref(),
-                Some("the host doesn't offer SFTP")
-            );
+            assert_eq!(panel.problem.as_deref(), Some("Not connected"));
         });
 
         // This computer's side: folders first; a folder opens, Up returns.

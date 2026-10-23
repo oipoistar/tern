@@ -159,25 +159,18 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         shell(&view, cx, "echo tern-$((40+2))", "tern-42");
         println!("ok    the trust card, then a shell");
 
-        let panel = cx.new(|cx| {
-            FilesPanel::new(
-                view.read(cx).open_sftp(),
-                scratch.clone(),
-                "lab@key".into(),
-                cx,
-            )
-        });
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !panel.read_with(cx, |panel, _| {
-            panel.remote_names().contains(&".bashrc".to_string())
-        }) {
-            assert!(
-                Instant::now() < deadline,
-                "Files never listed the home folder"
-            );
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let panel = cx.new(|cx| FilesPanel::new(&view, scratch.clone(), cx));
+        let lists = |name: &str, cx: &mut VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !panel.read_with(cx, |panel, _| {
+                panel.remote_names().iter().any(|n| n == name)
+            }) {
+                assert!(Instant::now() < deadline, "Files never listed {name}");
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        lists(".bashrc", cx);
         println!("ok    Files lists the host's home folder over SFTP");
 
         docker(&["restart", "-t", "1", "tern-lab-key-1"]);
@@ -185,6 +178,19 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         wait(&view, cx, "back", |view| matches!(view.phase, Phase::Live));
         shell(&view, cx, "echo back-$((1+1))", "back-2");
         println!("ok    reconnects by itself after the server restarts");
+
+        // Files' SFTP went with the old connection; Refresh opens it on
+        // the new one, then lists what's there now.
+        let fresh = format!("made-after-restart-{}", std::process::id());
+        shell(
+            &view,
+            cx,
+            &format!("touch {fresh} && echo made-$((2+3))"),
+            "made-5",
+        );
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        lists(&fresh, cx);
+        println!("ok    Refresh opens Files again on the new connection");
     }
 
     // A password-only server: the password card.
