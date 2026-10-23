@@ -14,6 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
+use tern_core::containers::Container;
 use tern_core::forward::ForwardState;
 use tern_core::probe::Vitals;
 use tern_core::restore::{OpenTabs, Opened};
@@ -223,10 +224,18 @@ struct Filling {
     _subscriptions: Vec<Subscription>,
 }
 
+/// The list of the focused host's running containers, while open.
+struct ContainersMenu {
+    pane: Entity<TerminalView>,
+    listed: Vec<Container>,
+    _listing: Option<Task<()>>,
+}
+
 pub struct Workspace {
     vault: Entity<VaultContent>,
     filling: Option<Filling>,
     palette: Option<Palette>,
+    containers: Option<ContainersMenu>,
     tabs: Vec<Tab>,
     /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
@@ -397,6 +406,7 @@ impl Workspace {
             vault,
             filling: None,
             palette: None,
+            containers: None,
             tabs: Vec::new(),
             active: None,
             live,
@@ -1106,6 +1116,178 @@ impl Workspace {
         }
     }
 
+    /// Opens the list of the focused host's running containers, listed
+    /// again as it opens.
+    fn open_containers(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let pane = self.tabs[index].focused().clone();
+        let listed = pane.read(cx).containers().unwrap_or_default().to_vec();
+        let listing = pane.read(cx).list_containers().map(|listing| {
+            cx.spawn(async move |this, cx| {
+                if let Ok(listed) = listing.await {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(menu) = &mut this.containers {
+                            menu.listed = listed;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+        });
+        self.containers = Some(ContainersMenu {
+            pane,
+            listed,
+            _listing: listing,
+        });
+        cx.notify();
+    }
+
+    /// Opens a pane with a shell inside `container` beside the pane its
+    /// list was opened from, or in a tab of its own when that tab is full.
+    fn open_container(
+        &mut self,
+        container: Container,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.containers.take() else {
+            return;
+        };
+        let mut connection = menu.pane.read(cx).connection().clone();
+        // The host's own rules and one-off command stay with its pane.
+        connection.forwards.clear();
+        connection.once = None;
+        connection.container = Some(container);
+        let new_terminal = self.new_terminal;
+        let terminal = cx.new(|cx| new_terminal(connection, cx));
+        match self
+            .tabs
+            .iter()
+            .position(|tab| tab.panes.contains(&menu.pane))
+        {
+            Some(index) if self.tabs[index].panes.len() < MAX_PANES => {
+                let broadcasting = self.tabs[index].broadcast;
+                terminal.update(cx, |terminal, _| terminal.broadcasting = broadcasting);
+                self.watch(&terminal, cx);
+                let tab = &mut self.tabs[index];
+                tab.panes.push(terminal);
+                tab.focused = tab.panes.len() - 1;
+                tab.maximized = None;
+                self.activate(Some(index), window, cx);
+            }
+            _ => self.add_session(terminal, window, cx),
+        }
+    }
+
+    /// The Containers button, for a host with Docker or Podman, and its
+    /// list while open: each running container by name and image.
+    fn containers_button(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let open = self.containers.is_some();
+        let listed = self
+            .containers
+            .as_ref()
+            .map(|menu| menu.listed.clone())
+            .unwrap_or_default();
+        let hover = theme.card2;
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("containers")
+                    .debug_selector(|| "containers".into())
+                    .h(px(40.))
+                    .px(px(14.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(13.))
+                    .border_1()
+                    .border_color(if open { theme.text } else { theme.line })
+                    .bg(if open { theme.text } else { theme.card })
+                    .text_color(if open { theme.card } else { theme.text })
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .child(icon(
+                        IconName::Container,
+                        15.,
+                        if open { theme.card } else { theme.text },
+                    ))
+                    .child("Containers")
+                    // Opens only: a click outside the list (this one too)
+                    // closes it first.
+                    .on_click(cx.listener(|this, _, _, cx| this.open_containers(cx))),
+            )
+            .when(open, |d| {
+                d.child(deferred(
+                    anchored().snap_to_window_with_margin(px(8.)).child(
+                        div()
+                            .id("containers-menu")
+                            .occlude()
+                            .mt(px(6.))
+                            .min_w(px(260.))
+                            .p(px(6.))
+                            .flex()
+                            .flex_col()
+                            .rounded(px(14.))
+                            .bg(theme.card)
+                            .border_1()
+                            .border_color(theme.line)
+                            .shadow(theme.shadow())
+                            .text_color(theme.text)
+                            .text_size(px(13.))
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.containers = None;
+                                cx.notify();
+                            }))
+                            .when(listed.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .h(px(36.))
+                                        .px(px(10.))
+                                        .flex()
+                                        .items_center()
+                                        .text_color(theme.text3)
+                                        .child("None running"),
+                                )
+                            })
+                            .children(listed.into_iter().enumerate().map(|(index, container)| {
+                                let id = format!("container-{index}");
+                                let image = container.image.clone();
+                                let name = container.name.clone();
+                                div()
+                                    .id(SharedString::from(id.clone()))
+                                    .debug_selector(move || id)
+                                    .h(px(36.))
+                                    .px(px(10.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .rounded(px(10.))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover))
+                                    .child(div().flex_1().truncate().child(name))
+                                    .child(
+                                        div()
+                                            .max_w(px(180.))
+                                            .truncate()
+                                            .font_family(MONO)
+                                            .text_size(px(12.))
+                                            .text_color(theme.text3)
+                                            .child(image),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_container(container.clone(), window, cx)
+                                    }))
+                            })),
+                    ),
+                ))
+            })
+    }
+
     /// Shows or hides the Files panel; shown, it's on the focused pane's
     /// host.
     fn toggle_files(&mut self, cx: &mut Context<Self>) {
@@ -1532,6 +1714,9 @@ impl Workspace {
                             })
                     })),
             )
+            .when(focused.containers().is_some(), |d| {
+                d.child(self.containers_button(theme, cx))
+            })
             .when(!local, |d| {
                 d.child(
                     div()
@@ -2450,6 +2635,37 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn opens_a_shell_inside_a_container_on_the_host(cx: &mut TestAppContext) {
+        use tern_core::containers::Container;
+
+        let (workspace, cx) = open_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        // A host without Docker or Podman has no Containers.
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("containers").is_none());
+        let web = Container {
+            tool: "docker".into(),
+            id: "3f2a9c1b".into(),
+            name: "web".into(),
+            image: "nginx:1.27".into(),
+        };
+        pane.update(cx, |pane, cx| {
+            pane.set_containers(Some(vec![web.clone()]));
+            cx.notify();
+        });
+        click(cx, "containers");
+        click(cx, "container-0");
+        workspace.read_with(cx, |workspace, cx| {
+            let tab = &workspace.tabs[0];
+            assert_eq!((tab.panes.len(), tab.focused), (2, 1));
+            let inside = tab.panes[1].read(cx);
+            assert_eq!(inside.connection().container.as_ref(), Some(&web));
+            assert_eq!(inside.label(), "web");
+            assert!(workspace.containers.is_none());
+        });
     }
 
     #[gpui::test]

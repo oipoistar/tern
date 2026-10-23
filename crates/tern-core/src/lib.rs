@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod certs;
+pub mod containers;
 pub mod draft;
 pub mod edits;
 pub mod env;

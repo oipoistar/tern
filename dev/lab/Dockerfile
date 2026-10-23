@@ -10,6 +10,9 @@ RUN apt-get update \
  # servers share one.
  && rm -f /etc/ssh/ssh_host_*
 COPY entrypoint.sh /entrypoint.sh
-# A checkout on Windows may have given the script CRLF line endings.
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+# A docker that lists one container, for Tern's container checks.
+COPY docker-stand-in.sh /usr/local/bin/docker
+# A checkout on Windows may have given the scripts CRLF line endings.
+RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/docker \
+ && chmod +x /entrypoint.sh /usr/local/bin/docker
 ENTRYPOINT ["/entrypoint.sh"]

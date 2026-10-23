@@ -34,6 +34,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::containers::{self, Container};
 use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
 use tern_core::probe::{self, Listening, Vitals};
@@ -162,6 +163,9 @@ pub struct TerminalView {
     forwarded: BTreeMap<u16, (Forward, Option<ForwardState>)>,
     /// The host's recent load, memory and disk use.
     vitals: Vitals,
+    /// The host's running containers, listed as the session went live,
+    /// when it has Docker or Podman.
+    containers: Option<Vec<Container>>,
     _probing: Option<Task<()>>,
     /// Port forwarding asked of the session, for tests.
     #[cfg(test)]
@@ -286,7 +290,10 @@ impl TerminalView {
     /// host's lowest slot no open pane holds, given back when the pane goes.
     /// The same slot after a restart finds the same shell.
     fn claim_shell(&self, cx: &mut Context<Self>) -> Option<String> {
-        if !self.connection.keep_shell || self.connection.local {
+        if !self.connection.keep_shell
+            || self.connection.local
+            || self.connection.container.is_some()
+        {
             return None;
         }
         let key = self.connection.host_id.clone().unwrap_or_else(|| {
@@ -404,6 +411,49 @@ impl TerminalView {
     /// The host's recent vitals.
     pub fn vitals(&self) -> &Vitals {
         &self.vitals
+    }
+
+    /// Lists the host's running containers beside the terminal; a host
+    /// without Docker or Podman (or not letting the user use them) has
+    /// none to show.
+    fn find_containers(&mut self, cx: &mut Context<Self>) {
+        let Some(listing) = self.list_containers() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let listed = listing.await.ok();
+            let _ = this.update(cx, |this, cx| {
+                this.containers = listed;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The host's running containers, when it has Docker or Podman: as
+    /// listed when the session went live.
+    pub fn containers(&self) -> Option<&[Container]> {
+        self.containers.as_deref()
+    }
+
+    /// Lists the host's running containers again.
+    pub fn list_containers(
+        &self,
+    ) -> Option<impl Future<Output = Result<Vec<Container>, String>> + 'static> {
+        let ran = self.input.as_ref()?.exec(containers::LIST.into());
+        Some(async move {
+            let ran = ran.await?;
+            match ran.status {
+                Some(0) => Ok(containers::parse(&ran.out)),
+                _ => Err(ran.err.lines().next().unwrap_or("").to_string()),
+            }
+        })
+    }
+
+    /// Sets the host's containers, as a listing would, for tests.
+    #[cfg(test)]
+    pub fn set_containers(&mut self, containers: Option<Vec<Container>>) {
+        self.containers = containers;
     }
 
     /// Forwards a port the host opened to the same port here, or stops
@@ -592,6 +642,7 @@ impl TerminalView {
             ports: Vec::new(),
             forwarded: BTreeMap::new(),
             vitals: Vitals::default(),
+            containers: None,
             _probing: None,
             #[cfg(test)]
             forwards_asked: Vec::new(),
@@ -638,11 +689,15 @@ impl TerminalView {
         self.focus.focus(window, cx);
     }
 
-    /// Tab label: the remote title if the shell set one, else `user@host`.
+    /// Tab label: the remote title if the shell set one, else `user@host`
+    /// (a container's name, inside one).
     pub fn title(&self) -> SharedString {
         self.title.clone().unwrap_or_else(|| {
             if self.connection.local {
                 return shell_name().into();
+            }
+            if let Some(container) = &self.connection.container {
+                return container.name.clone().into();
             }
             let target = &self.connection.target;
             format!("{}@{}", target.user, target.host).into()
@@ -665,6 +720,9 @@ impl TerminalView {
 
     /// The saved host's name, or `user@host` for a typed destination.
     pub fn label(&self) -> SharedString {
+        if let Some(container) = &self.connection.container {
+            return container.name.clone().into();
+        }
         match &self.connection.host {
             Some(host) => host.clone().into(),
             None if self.connection.local => "This computer".into(),
@@ -735,7 +793,10 @@ impl TerminalView {
                 self.trust.clone(),
                 |jump| jump.secret.as_deref().and_then(|secret| store.load(secret)),
             );
-            request.command = self.shell.as_deref().map(shells::attach);
+            request.command = match &self.connection.container {
+                Some(container) => Some(containers::shell(container)),
+                None => self.shell.as_deref().map(shells::attach),
+            };
             Session::open(request)
         };
         let (input, mut events) = session.into_parts();
@@ -760,8 +821,10 @@ impl TerminalView {
             Event::Connected => {
                 let reattached = self.had_shell && self.shell.is_some();
                 self.phase = Phase::Live;
-                if !self.connection.local {
+                // A container's pane leaves the host to the host's.
+                if !self.connection.local && self.connection.container.is_none() {
                     self.probe(cx);
+                    self.find_containers(cx);
                 }
                 self.live_since = Some(Instant::now());
                 self.reconnect = None;

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_kit::{AppContext as _, Entity};
+use tern_core::containers::Container;
 use tern_core::forward::ForwardState;
 use tern_core::ssh::{Connection, Target};
 use tern_core::{Auth, Host, Vault};
@@ -283,6 +284,33 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         shell(&view, cx, "kill %1; echo stopped-$((6+6))", "stopped-12");
         wait(&view, cx, "the port gone", |view| offered(view).is_none());
         println!("ok    a port the session opens is forwarded here in a click");
+
+        // The host's containers, listed beside the terminal (the lab's
+        // stand-in docker has one).
+        wait(&view, cx, "the containers listed", |view| {
+            view.containers()
+                .is_some_and(|listed| listed.iter().any(|c| c.name == "lab-app"))
+        });
+        println!("ok    the host's containers are listed");
+    }
+
+    // A shell inside a container on the host: the stand-in runs it on the
+    // server itself, marked.
+    {
+        let lab_app = Container {
+            tool: "docker".into(),
+            id: "c0ffee00".into(),
+            name: "lab-app".into(),
+            image: "debian:bookworm-slim".into(),
+        };
+        let connection = Connection {
+            container: Some(lab_app),
+            ..here(2202, Some(key()))
+        };
+        let (view, cx) = pane(cx, connection);
+        trust_until_live(&view, cx);
+        shell(&view, cx, "echo in-$TERN_CONTAINER", "in-lab-app");
+        println!("ok    a shell inside one of the host's containers");
     }
 
     // A kept shell: the server ends the connection, the pane reconnects by

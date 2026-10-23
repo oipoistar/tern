@@ -13,6 +13,7 @@ gpui_kit::assets::icon_assets!(
         Cloud,
         CodeXml,
         Columns2,
+        Container,
         Cpu,
         Download,
         FilePen,

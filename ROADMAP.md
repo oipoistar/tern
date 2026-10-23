@@ -240,6 +240,12 @@ claude.ai account). Each item below names the artboard it comes from.
       (against its CPUs), memory and disk in use as small traces in the
       toolbar, each with its icon and latest value (shares rounded up,
       as df does); a vital the host doesn't report isn't shown
+- [x] Containers on the host: once a session is live, its host's
+      running containers are listed beside the terminal (Docker, else
+      Podman); a host that has them gets a Containers button whose list
+      (listed again as it opens) gives each by name and image, and picks
+      open a pane beside it with a shell inside the container (bash, else
+      sh), in a tab of its own when the tab is full
 
 ## Known gaps in what's built
 

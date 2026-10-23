@@ -141,6 +141,8 @@ pub struct Connection {
     /// The shell runs in tmux or screen on the host, where it outlives the
     /// connection ([`shells`](crate::shells)).
     pub keep_shell: bool,
+    /// A shell inside this container on the host instead of the host's own.
+    pub container: Option<crate::containers::Container>,
     /// Environment variables the shell starts with.
     pub env: Vec<(String, String)>,
     /// Typed into the shell once it starts, at every login.
@@ -189,6 +191,7 @@ impl Connection {
             agent_forwarding: false,
             guarded: false,
             keep_shell: false,
+            container: None,
             env: Vec::new(),
             on_login: None,
             once: None,

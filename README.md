@@ -84,7 +84,8 @@ each way of signing in (a password, keys, a password then a one-time code, a
 key then a code, user and host certificates), servers with only today's or
 with older algorithms, a bastion → hop2 → deep chain into networks this
 computer can't reach, SOCKS5 (Dante) and HTTP (Tinyproxy) proxies, and a web
-server to forward to. `entrypoint.sh` says what each offers. The lab's
+server to forward to; every server has tmux and a stand-in `docker` with one
+container. `entrypoint.sh` says what each offers. The lab's
 tests are ignored unless asked for, and need `docker` on the `PATH`:
 
 ```sh
