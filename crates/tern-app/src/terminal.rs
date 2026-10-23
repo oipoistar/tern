@@ -34,6 +34,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tern_core::cast::{Cast, Recorder, Shown};
 use tern_core::containers::{self, Container};
 use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
@@ -66,6 +67,21 @@ const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1
 
 /// How often a live session reads the host's `/proc`.
 const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// How often a recording being played moves on.
+const REPLAY_TICK: Duration = Duration::from_millis(33);
+
+/// A recording played back in a pane.
+struct Replay {
+    cast: Cast,
+    /// How far in, in seconds, and the next event the terminal hasn't had.
+    at: f64,
+    next: usize,
+    /// While playing: when `at` last moved on.
+    playing: Option<Instant>,
+    /// Where the track was painted, for clicks on it.
+    track: Rc<Cell<Bounds<Pixels>>>,
+    _ticker: Option<Task<()>>,
+}
 
 /// The last lines of a session, shared with the vault's side panel.
 pub type Preview = Rc<RefCell<Vec<String>>>;
@@ -166,6 +182,12 @@ pub struct TerminalView {
     /// The host's running containers, listed as the session went live,
     /// when it has Docker or Podman.
     containers: Option<Vec<Container>>,
+    /// The recording being written of what this pane shows.
+    recording: Option<Recorder>,
+    /// This pane plays back a recording instead of a session: the
+    /// recording, unless it couldn't be read.
+    played: bool,
+    replay: Option<Replay>,
     _probing: Option<Task<()>>,
     /// Port forwarding asked of the session, for tests.
     #[cfg(test)]
@@ -413,6 +435,325 @@ impl TerminalView {
         &self.vitals
     }
 
+    /// A pane playing back `recording` named `title`, or saying why it
+    /// can't.
+    pub fn replay(recording: Result<Cast, String>, title: String, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::idle(Connection::local(), cx);
+        view.title = Some(title.into());
+        view.played = true;
+        match recording {
+            Ok(cast) => {
+                view.phase = Phase::Live;
+                view.replay = Some(Replay {
+                    cast,
+                    at: 0.,
+                    next: 0,
+                    playing: None,
+                    track: Rc::default(),
+                    _ticker: None,
+                });
+                view.restart_replay(cx);
+                view.play(cx);
+            }
+            Err(why) => view.phase = Phase::Ended(why.into()),
+        }
+        view
+    }
+
+    /// Whether this pane plays back a recording.
+    pub fn replaying(&self) -> bool {
+        self.played
+    }
+
+    /// How far into its recording the pane is, and whether it plays.
+    #[cfg(test)]
+    pub fn replay_at(&self) -> Option<(f64, bool)> {
+        self.replay
+            .as_ref()
+            .map(|replay| (replay.at, replay.playing.is_some()))
+    }
+
+    /// A clean terminal the recording's size, for playing from the start.
+    fn restart_replay(&mut self, cx: &mut Context<Self>) {
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+        let size = TermSize {
+            cols: replay.cast.cols,
+            rows: replay.cast.rows,
+        };
+        self.size = size;
+        self.term = Term::new(
+            term_config(&settings::current(cx).terminal),
+            &GridSize(size),
+            Listener(self.term_events.clone()),
+        );
+        self.parser = Processor::new();
+        replay.at = 0.;
+        replay.next = 0;
+    }
+
+    /// Shows the recording as it was `at` seconds in: on from where it is,
+    /// or again from the start to go back.
+    fn seek(&mut self, at: f64, cx: &mut Context<Self>) {
+        let back = self.replay.as_ref().is_some_and(|replay| at < replay.at);
+        if back {
+            self.restart_replay(cx);
+        }
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+        let at = at.clamp(0., replay.cast.duration());
+        replay.at = at;
+        while let Some((when, shown)) = replay.cast.events.get(replay.next) {
+            if *when > at {
+                break;
+            }
+            match shown {
+                Shown::Output(text) => self.parser.advance(&mut self.term, text.as_bytes()),
+                Shown::Resize(cols, rows) => {
+                    self.size = TermSize {
+                        cols: *cols,
+                        rows: *rows,
+                    };
+                    self.term.resize(GridSize(self.size));
+                }
+            }
+            replay.next += 1;
+        }
+        // Nothing answers a recording's questions, and its title stays.
+        self.term_events.borrow_mut().clear();
+        cx.notify();
+    }
+
+    /// Plays on from where the recording is, or from the start once it's
+    /// over.
+    fn play(&mut self, cx: &mut Context<Self>) {
+        let over = self
+            .replay
+            .as_ref()
+            .is_some_and(|replay| replay.at >= replay.cast.duration());
+        if over {
+            self.restart_replay(cx);
+        }
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+        replay.playing = Some(Instant::now());
+        replay._ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REPLAY_TICK).await;
+                if !matches!(this.update(cx, |this, cx| this.tick(cx)), Ok(true)) {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn pause(&mut self, cx: &mut Context<Self>) {
+        if let Some(replay) = &mut self.replay {
+            replay.playing = None;
+            replay._ticker = None;
+        }
+        cx.notify();
+    }
+
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|replay| replay.playing.is_some())
+        {
+            self.pause(cx);
+        } else {
+            self.play(cx);
+        }
+    }
+
+    /// Moves a playing recording on by the time since the last tick; says
+    /// whether it still plays.
+    fn tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(replay) = &mut self.replay else {
+            return false;
+        };
+        let Some(since) = replay.playing else {
+            return false;
+        };
+        let now = Instant::now();
+        let at = replay.at + now.duration_since(since).as_secs_f64();
+        replay.playing = Some(now);
+        self.seek(at, cx);
+        let Some(replay) = &mut self.replay else {
+            return false;
+        };
+        if replay.at >= replay.cast.duration() {
+            replay.playing = None;
+            return false;
+        }
+        true
+    }
+
+    /// Moves a recording to where on its track `position` is.
+    fn seek_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(replay) = &self.replay else {
+            return;
+        };
+        let track = replay.track.get();
+        if track.size.width <= px(0.) {
+            return;
+        }
+        let fraction = ((position.x - track.origin.x) / track.size.width).clamp(0., 1.);
+        // The track's very end is the recording's end.
+        let fraction = if fraction > 0.99 { 1. } else { fraction };
+        let at = f64::from(fraction) * replay.cast.duration();
+        self.seek(at, cx);
+    }
+
+    /// Under a recording: play or pause, its track (a click moves there),
+    /// and the time in and its length.
+    fn replay_bar(&self, replay: &Replay, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let length = replay.cast.duration();
+        let fraction = if length > 0. {
+            (replay.at / length).clamp(0., 1.) as f32
+        } else {
+            1.
+        };
+        let clock = |seconds: f64| {
+            let seconds = seconds as u64;
+            format!("{}:{:02}", seconds / 60, seconds % 60)
+        };
+        let track = replay.track.clone();
+        div()
+            .absolute()
+            .bottom(px(10.))
+            .left(px(10.))
+            .right(px(10.))
+            .occlude()
+            .h(px(42.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .rounded(px(14.))
+            .bg(theme.card)
+            .border_1()
+            .border_color(theme.line)
+            .shadow(theme.shadow_sm())
+            .child(
+                div()
+                    .id("replay-play")
+                    .debug_selector(|| "replay-play".into())
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.card2))
+                    .child(icon(
+                        if replay.playing.is_some() {
+                            IconName::Pause
+                        } else {
+                            IconName::Play
+                        },
+                        14.,
+                        theme.text,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+            )
+            .child(
+                div()
+                    .id("replay-track")
+                    .debug_selector(|| "replay-track".into())
+                    .relative()
+                    .flex_1()
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        canvas(move |bounds, _, _| track.set(bounds), |_, _, _, _| {})
+                            .absolute()
+                            .size_full(),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(theme.track)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(theme.text)
+                                    .w(relative(fraction)),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.seek_to(event.position, cx)
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .text_color(theme.text2)
+                    .child(format!("{} / {}", clock(replay.at), clock(length))),
+            )
+            .into_any_element()
+    }
+
+    /// Starts writing what this pane shows to `path`, as a recording.
+    pub(crate) fn record_to(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let label = self.label();
+        if let Ok(recorder) = Recorder::start(path, self.size.cols, self.size.rows, &label) {
+            self.recording = Some(recorder);
+        }
+        cx.notify();
+    }
+
+    /// Asks where, then records what this pane shows there.
+    fn ask_to_record(&mut self, cx: &mut Context<Self>) {
+        let name: String = self
+            .label()
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let dir = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let asked = cx.prompt_for_new_path(&dir, Some(&format!("{name}.cast")));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = asked.await {
+                let _ = this.update(cx, |this, cx| this.record_to(&path, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Whether this pane is being recorded.
+    pub fn recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// Ends the recording, with all of it in its file.
+    pub fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        if let Some(recorder) = self.recording.take() {
+            let _ = recorder.finish();
+        }
+        cx.notify();
+    }
+
     /// Lists the host's running containers beside the terminal; a host
     /// without Docker or Podman (or not letting the user use them) has
     /// none to show.
@@ -643,6 +984,9 @@ impl TerminalView {
             forwarded: BTreeMap::new(),
             vitals: Vitals::default(),
             containers: None,
+            recording: None,
+            played: false,
+            replay: None,
             _probing: None,
             #[cfg(test)]
             forwards_asked: Vec::new(),
@@ -720,6 +1064,9 @@ impl TerminalView {
 
     /// The saved host's name, or `user@host` for a typed destination.
     pub fn label(&self) -> SharedString {
+        if self.played {
+            return self.title();
+        }
         if let Some(container) = &self.connection.container {
             return container.name.clone().into();
         }
@@ -856,6 +1203,11 @@ impl TerminalView {
             }
             Event::Output(bytes) => {
                 self.unseen = true;
+                if let Some(recorder) = &mut self.recording
+                    && recorder.output(&bytes).is_err()
+                {
+                    self.recording = None;
+                }
                 self.parser.advance(&mut self.term, &bytes);
                 self.answer_terminal_events(cx);
                 self.update_preview();
@@ -1043,10 +1395,16 @@ impl TerminalView {
     }
 
     fn resize(&mut self, size: TermSize, cx: &mut Context<Self>) {
-        if size == self.size {
+        // A recording plays at the size it was made.
+        if size == self.size || self.played {
             return;
         }
         self.size = size;
+        if let Some(recorder) = &mut self.recording
+            && recorder.resize(size.cols, size.rows).is_err()
+        {
+            self.recording = None;
+        }
         self.term.resize(GridSize(size));
         if let Some(input) = &self.input {
             input.resize(size);
@@ -1065,6 +1423,18 @@ impl TerminalView {
         let keystroke = &event.keystroke;
         // The window's own shortcuts, like switching tabs, go up to it.
         if crate::workspace::shortcut(keystroke).is_some() {
+            return;
+        }
+        // A recording: Space plays or pauses, the arrows move five seconds.
+        if self.played {
+            let at = self.replay.as_ref().map_or(0., |replay| replay.at);
+            match keystroke.key.as_str() {
+                "space" => self.toggle_play(cx),
+                "left" => self.seek(at - 5., cx),
+                "right" => self.seek(at + 5., cx),
+                _ => {}
+            }
+            cx.stop_propagation();
             return;
         }
         // Keys typed in the find bar pass through here too: only closing
@@ -1556,7 +1926,24 @@ impl TerminalView {
                                 close(this, cx);
                                 this.save_output(cx);
                             },
-                        ))),
+                        )))
+                        .when(!self.played, |d| {
+                            let label = if self.recording.is_some() {
+                                "Stop recording"
+                            } else {
+                                "Record…"
+                            };
+                            d.child(item("menu-record", label, true).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    close(this, cx);
+                                    if this.recording.is_some() {
+                                        this.stop_recording(cx);
+                                    } else {
+                                        this.ask_to_record(cx);
+                                    }
+                                },
+                            )))
+                        }),
                 ),
         )
         .with_priority(1)
@@ -2345,6 +2732,11 @@ impl Render for TerminalView {
                 self.find
                     .as_ref()
                     .map(|find| self.find_bar(find, &theme, cx)),
+            )
+            .children(
+                self.replay
+                    .as_ref()
+                    .map(|replay| self.replay_bar(replay, &theme, cx)),
             )
             .children(self.overlay(&theme, cx))
             .children(self.menu.map(|at| self.context_menu(at, &theme, cx)))

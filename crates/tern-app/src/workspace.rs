@@ -187,6 +187,7 @@ enum Command {
     /// Type the snippet into the focused pane.
     Snippet(usize),
     NewLocal,
+    PlayRecording,
     Settings,
     /// Show a vault screen, by `--show` name.
     Screen(&'static str),
@@ -294,6 +295,11 @@ impl Workspace {
                     Err(error) => eprintln!("--connect: {error}"),
                 }
             }
+        }
+        // `tern --play recording.cast` plays a recording at startup.
+        let mut args = std::env::args().skip_while(|arg| arg != "--play").skip(1);
+        if let Some(path) = args.next() {
+            workspace.play_recording(std::path::Path::new(&path), window, cx);
         }
         // `tern --local` opens a local terminal at startup.
         if std::env::args().any(|arg| arg == "--local") {
@@ -629,6 +635,7 @@ impl Workspace {
                 "New local terminal",
                 Command::NewLocal,
             ),
+            action(IconName::Play, "Play a recording", Command::PlayRecording),
             action(IconName::SlidersHorizontal, "Settings", Command::Settings),
             if theme::current(cx).dark {
                 action(IconName::Sun, "Light appearance", Command::Theme)
@@ -715,6 +722,7 @@ impl Workspace {
             Command::Tab(index) => self.activate(index, window, cx),
             Command::Snippet(index) => self.run_snippet(index, window, cx),
             Command::NewLocal => self.open_local(window, cx),
+            Command::PlayRecording => self.choose_recording(window, cx),
             Command::Settings => self.open_settings(Page::Terminal, window, cx),
             Command::Screen(name) => {
                 self.activate(None, window, cx);
@@ -1114,6 +1122,50 @@ impl Workspace {
             });
             cx.notify();
         }
+    }
+
+    /// Asks for a recording, then plays it.
+    fn choose_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Play".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = chosen.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    for path in paths {
+                        this.play_recording(&path, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Plays the recording in `path` in a tab of its own; one that can't
+    /// be read says why there.
+    fn play_recording(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let read = std::fs::read_to_string(path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| tern_core::cast::read(&text));
+        let title = read
+            .as_ref()
+            .ok()
+            .and_then(|cast| cast.title.clone())
+            .or_else(|| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let terminal = cx.new(|cx| TerminalView::replay(read, title, cx));
+        self.add_session(terminal, window, cx);
     }
 
     /// Opens the list of the focused host's running containers, listed
@@ -1638,10 +1690,30 @@ impl Workspace {
             (4, IconName::LayoutGrid),
         ];
         let open = tab.panes.len();
+        let recorded = tab.focused().clone();
         div()
             .flex()
             .items_center()
             .gap(px(12.))
+            // Being recorded: the mark, which stops it.
+            .when(focused.recording(), |d| {
+                d.child(
+                    div()
+                        .id("stop-recording")
+                        .debug_selector(|| "stop-recording".into())
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(theme.card2))
+                        .child(icon(IconName::CircleDot, 16., theme.text))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            recorded.update(cx, |pane, cx| pane.stop_recording(cx))
+                        })),
+                )
+            })
             .child(
                 div()
                     .text_size(px(15.))
@@ -1657,7 +1729,9 @@ impl Workspace {
                     .font_family(MONO)
                     .text_size(px(12.))
                     .text_color(theme.text2)
-                    .child(if local {
+                    .child(if focused.replaying() {
+                        String::new()
+                    } else if local {
                         tern_core::local::default_shell()
                     } else {
                         format!("{}@{}:{}", target.user, target.host, target.port)
@@ -1680,40 +1754,45 @@ impl Workspace {
             })
             .children(vitals(focused.vitals(), theme))
             .child(self.opened_ports(tab, theme, cx))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(4.))
-                    .p(px(4.))
-                    .rounded(px(14.))
-                    .bg(theme.card2)
-                    .children(layouts.into_iter().map(|(count, glyph)| {
-                        let id = format!("layout-{count}");
-                        let (on, usable) = (count == open, count >= open);
-                        let fg = if on {
-                            theme.text
-                        } else if usable {
-                            theme.text2
-                        } else {
-                            theme.text3.opacity(0.4)
-                        };
-                        div()
-                            .id(SharedString::from(id.clone()))
-                            .debug_selector(move || id)
-                            .size(px(32.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(10.))
-                            .when(on, |d| d.bg(theme.card).shadow(theme.shadow_sm()))
-                            .child(icon(glyph, 16., fg))
-                            .when(usable && !on, |d| {
-                                d.cursor_pointer().on_click(cx.listener(
-                                    move |this, _, window, cx| this.set_panes(count, window, cx),
-                                ))
-                            })
-                    })),
-            )
+            // A recording has no panes to lay out or broadcast to.
+            .when(!focused.replaying(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .gap(px(4.))
+                        .p(px(4.))
+                        .rounded(px(14.))
+                        .bg(theme.card2)
+                        .children(layouts.into_iter().map(|(count, glyph)| {
+                            let id = format!("layout-{count}");
+                            let (on, usable) = (count == open, count >= open);
+                            let fg = if on {
+                                theme.text
+                            } else if usable {
+                                theme.text2
+                            } else {
+                                theme.text3.opacity(0.4)
+                            };
+                            div()
+                                .id(SharedString::from(id.clone()))
+                                .debug_selector(move || id)
+                                .size(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(10.))
+                                .when(on, |d| d.bg(theme.card).shadow(theme.shadow_sm()))
+                                .child(icon(glyph, 16., fg))
+                                .when(usable && !on, |d| {
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.set_panes(count, window, cx)
+                                        },
+                                    ))
+                                })
+                        })),
+                )
+            })
             .when(focused.containers().is_some(), |d| {
                 d.child(self.containers_button(theme, cx))
             })
@@ -1760,47 +1839,49 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_files(cx))),
                 )
             })
-            .child(
-                div()
-                    .id("broadcast")
-                    .debug_selector(|| "broadcast".into())
-                    .h(px(40.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(13.))
-                    .border_1()
-                    .border_color(if tab.broadcast {
-                        theme.text
-                    } else {
-                        theme.line
-                    })
-                    .bg(if tab.broadcast {
-                        theme.text
-                    } else {
-                        theme.card
-                    })
-                    .text_color(if tab.broadcast {
-                        theme.card
-                    } else {
-                        theme.text
-                    })
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .cursor_pointer()
-                    .child(icon(
-                        IconName::RadioTower,
-                        15.,
-                        if tab.broadcast {
+            .when(!focused.replaying(), |d| {
+                d.child(
+                    div()
+                        .id("broadcast")
+                        .debug_selector(|| "broadcast".into())
+                        .h(px(40.))
+                        .px(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .rounded(px(13.))
+                        .border_1()
+                        .border_color(if tab.broadcast {
+                            theme.text
+                        } else {
+                            theme.line
+                        })
+                        .bg(if tab.broadcast {
+                            theme.text
+                        } else {
+                            theme.card
+                        })
+                        .text_color(if tab.broadcast {
                             theme.card
                         } else {
                             theme.text
-                        },
-                    ))
-                    .child("Broadcast")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_broadcast(cx))),
-            )
+                        })
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .child(icon(
+                            IconName::RadioTower,
+                            15.,
+                            if tab.broadcast {
+                                theme.card
+                            } else {
+                                theme.text
+                            },
+                        ))
+                        .child("Broadcast")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_broadcast(cx))),
+                )
+            })
     }
 
     /// The panes, laid out by how many there are, or the maximized one.
@@ -2341,6 +2422,17 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .on_key_down(cx.listener(Self::key_down))
+            // A recording dropped on the window plays.
+            .on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
+                for path in dropped.paths() {
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "cast")
+                    {
+                        this.play_recording(path, window, cx);
+                    }
+                }
+            }))
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
@@ -2635,6 +2727,74 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn records_a_session_and_plays_it_back(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+        use tern_core::ssh::Event;
+
+        let dir = std::env::temp_dir().join(format!("tern-ui-cast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("web.cast");
+        let (workspace, cx) = open_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        pane.update(cx, |pane, cx| {
+            pane.record_to(&path, cx);
+            pane.on_session_event(Event::Output(b"hello\r\n".to_vec()), cx);
+            pane.on_session_event(Event::Output(b"world".to_vec()), cx);
+        });
+        // The mark stops it.
+        click(cx, "stop-recording");
+        assert!(!pane.read_with(cx, |pane, _| pane.recording()));
+        let cast = tern_core::cast::read(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cast.events.len(), 2);
+
+        // Played back in a tab of its own; the track moves it.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.play_recording(&path, window, cx)
+            })
+        });
+        let replay = workspace.read_with(cx, |workspace, _| workspace.tabs[1].focused().clone());
+        assert!(replay.read_with(cx, |replay, _| replay.replaying()));
+        cx.run_until_parked();
+        let track = cx.debug_bounds("replay-track").expect("the track");
+        let shown =
+            |cx: &mut VisualTestContext| replay.read_with(cx, |replay, _| replay.output_text());
+        cx.simulate_click(
+            point(track.right() - px(1.), track.center().y),
+            Modifiers::none(),
+        );
+        assert!(shown(cx).contains("hello\nworld"), "{}", shown(cx));
+        cx.simulate_click(
+            point(track.left() + px(1.), track.center().y),
+            Modifiers::none(),
+        );
+        assert!(!shown(cx).contains("hello"));
+        // Space plays and pauses.
+        cx.update(|window, cx| replay.update(cx, |replay, cx| replay.focus(window, cx)));
+        let playing = |cx: &mut VisualTestContext| {
+            replay.read_with(cx, |replay, _| {
+                replay.replay_at().map(|(_, playing)| playing)
+            })
+        };
+        let before = playing(cx);
+        cx.simulate_keystrokes("space");
+        assert_ne!(playing(cx), before);
+
+        // One that can't be read says why in its tab.
+        std::fs::write(dir.join("notes.cast"), "not a recording").unwrap();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.play_recording(&dir.join("notes.cast"), window, cx)
+            })
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            let pane = workspace.tabs[2].focused().read(cx);
+            assert!(matches!(&pane.phase, crate::terminal::Phase::Ended(why) if why == "It isn't a recording"));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]

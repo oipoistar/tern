@@ -2,6 +2,7 @@
 //! and sync will land in this crate so any front end can reuse them.
 
 pub mod agent;
+pub mod cast;
 pub mod certs;
 pub mod containers;
 pub mod draft;

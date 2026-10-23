@@ -256,6 +256,14 @@ claude.ai account). Each item below names the artboard it comes from.
       ones go unless another host goes through them, and output with no
       hosts changes nothing. The commands stay in sources.json in the
       data folder and never sync
+- [x] Record and replay sessions: Record… in the terminal's menu asks
+      where, then writes what the pane shows (never what's typed) as an
+      asciicast v2 file, across reconnects too, until Stop recording or
+      the ink record mark in the toolbar; Play a recording in the palette,
+      a .cast file dropped on the window or tern --play opens it in a tab
+      of its own, at its recorded size, under a bar with play or pause,
+      an ink track to click and the time (Space plays or pauses, the
+      arrows move five seconds). A file that can't be read says why there
 
 ## Known gaps in what's built
 
