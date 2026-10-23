@@ -232,6 +232,7 @@ impl Vault {
             .map(|via| Jump {
                 target: via.ssh_target(),
                 auth: via.auth.clone(),
+                host_id: Some(via.id.clone()),
             })
             .collect();
         Ok(Connection {

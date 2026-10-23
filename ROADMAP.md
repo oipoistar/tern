@@ -118,6 +118,12 @@ claude.ai account). Each item below names the artboard it comes from.
       HostName, User, Port, IdentityFile, ProxyJump chains and the older
       ProxyCommand ssh -W, nc proxies, Local/Remote/DynamicForward,
       SetEnv, ForwardAgent and ServerAliveInterval
+- [x] Keyboard-interactive sign-in: after keys and the password, the
+      server's own questions; a password question is answered from the
+      password Tern has, anything else (a one-time code) is asked in the
+      pane one question at a time, pasting allowed; jump hosts are asked
+      too, and may now sign in with a password (their saved one, or
+      asked)
 
 ## Known gaps in what's built
 

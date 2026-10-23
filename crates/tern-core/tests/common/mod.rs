@@ -39,6 +39,10 @@ pub struct TestServer {
     user_ca: Option<PublicKey>,
     /// Variables the client asked for, said in the shell's first output.
     env: Vec<(String, String)>,
+    /// Signs in only by questions: the password, then this code.
+    otp: Option<String>,
+    /// How far through the questions this connection is.
+    asked: u8,
 }
 
 impl Clone for TestServer {
@@ -52,6 +56,8 @@ impl Clone for TestServer {
             agent_offered: false,
             user_ca: self.user_ca.clone(),
             env: Vec::new(),
+            otp: self.otp.clone(),
+            asked: 0,
         }
     }
 }
@@ -67,6 +73,10 @@ impl russh::server::Handler for TestServer {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        // Asking questions instead, the way two-factor servers do.
+        if self.otp.is_some() {
+            return Ok(reject());
+        }
         Ok(if user == USER && password == PASSWORD {
             Auth::Accept
         } else {
@@ -79,6 +89,48 @@ impl russh::server::Handler for TestServer {
             Auth::Accept
         } else {
             reject()
+        })
+    }
+
+    /// With an `otp`: "Password:", then "Verification code:".
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        _: &str,
+        response: Option<russh::server::Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
+        let Some(otp) = self.otp.clone() else {
+            return Ok(reject());
+        };
+        let answers: Vec<String> = response
+            .map(|answers| {
+                answers
+                    .map(|answer| String::from_utf8_lossy(&answer).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(match (self.asked, answers.as_slice()) {
+            (0, _) => {
+                self.asked = 1;
+                Auth::Partial {
+                    name: "".into(),
+                    instructions: "".into(),
+                    prompts: vec![("Password: ".into(), false)].into(),
+                }
+            }
+            (1, [password]) if password == PASSWORD => {
+                self.asked = 2;
+                Auth::Partial {
+                    name: "".into(),
+                    instructions: "Use the code from your phone.".into(),
+                    prompts: vec![("Verification code: ".into(), true)].into(),
+                }
+            }
+            (2, [code]) if user == USER && *code == otp => Auth::Accept,
+            _ => {
+                self.asked = 0;
+                reject()
+            }
         })
     }
 
@@ -342,6 +394,9 @@ pub struct Setup {
     pub certificate: Option<Certificate>,
     /// Sign-in with user certificates this authority signed.
     pub user_ca: Option<PublicKey>,
+    /// Sign-in by questions only (no plain passwords): the password, then
+    /// this one-time code.
+    pub otp: Option<String>,
 }
 
 /// Like [`start_server`], doing what `setup` adds.
@@ -351,8 +406,16 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
         probe_agent,
         certificate,
         user_ca,
+        otp,
     } = setup;
+    let methods = if otp.is_some() {
+        use russh::MethodKind;
+        russh::MethodSet::from(&[MethodKind::PublicKey, MethodKind::KeyboardInteractive][..])
+    } else {
+        russh::MethodSet::server_supported()
+    };
     let config = Arc::new(russh::server::Config {
+        methods,
         keys: vec![host_key],
         certificates: certificate.into_iter().collect(),
         auth_rejection_time: Duration::from_millis(10),
@@ -371,6 +434,8 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
             agent_offered: false,
             user_ca,
             env: Vec::new(),
+            otp,
+            asked: 0,
         }
         .run_on_socket(config, &listener)
         .await;

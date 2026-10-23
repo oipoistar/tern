@@ -38,7 +38,9 @@ use tern_core::history::{self, Visit};
 use tern_core::reconnect;
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
-use tern_core::ssh::{ConnectError, Connection, Event, HostKey, Session, SessionInput, TermSize};
+use tern_core::ssh::{
+    ConnectError, Connection, Event, HostKey, Prompts, Session, SessionInput, TermSize,
+};
 
 use crate::settings;
 use crate::term_input::{MouseReport, encode_key, encode_mouse, wheel_keys};
@@ -75,6 +77,13 @@ pub enum Phase {
     Password {
         typed: String,
         rejected: bool,
+    },
+    /// The server asks questions while signing in, like a one-time code;
+    /// collecting the answers one at a time.
+    Questions {
+        prompts: Prompts,
+        answers: Vec<String>,
+        typed: String,
     },
     Live,
     Ended(SharedString),
@@ -142,6 +151,9 @@ pub struct TerminalView {
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
+    /// The last answers given to the server's questions, likewise.
+    #[cfg(test)]
+    pub answered: Vec<String>,
 }
 
 /// Find in scrollback: the field, and the search for what's typed in it.
@@ -328,6 +340,8 @@ impl TerminalView {
             reported_cell: None,
             #[cfg(test)]
             sent: RefCell::default(),
+            #[cfg(test)]
+            answered: Vec::new(),
         }
     }
 
@@ -414,9 +428,18 @@ impl TerminalView {
         if !matches!(self.phase, Phase::Trust { .. } | Phase::Password { .. }) {
             self.started = history::now();
         }
-        let request =
-            self.connection
-                .request(self.size, self.password.as_deref(), self.trust.clone());
+        // Jump hosts sign in with their own saved passwords.
+        let store = crate::sync::secrets(cx);
+        let request = self.connection.request(
+            self.size,
+            self.password.as_deref(),
+            self.trust.clone(),
+            |jump| {
+                jump.host_id
+                    .as_deref()
+                    .and_then(|id| store.load(&tern_core::secrets::host_password(id)))
+            },
+        );
         let (input, mut events) = Session::open(request).into_parts();
         self.input = Some(input);
         self.phase = Phase::Connecting;
@@ -463,6 +486,13 @@ impl TerminalView {
                 self.parser.advance(&mut self.term, &bytes);
                 self.answer_terminal_events(cx);
                 self.update_preview();
+            }
+            Event::Prompts(prompts) => {
+                self.phase = Phase::Questions {
+                    prompts,
+                    answers: Vec::new(),
+                    typed: String::new(),
+                }
             }
             Event::Forwarding { forward, state } => {
                 if let Some(host) = self.connection.host.clone() {
@@ -666,7 +696,15 @@ impl TerminalView {
                     return;
                 }
             }
-            // Typed characters arrive through `replace_text_in_range`.
+            // Typed characters arrive through `replace_text_in_range`; a
+            // pasted password or code takes its first line.
+            Phase::Password { typed, .. } | Phase::Questions { typed, .. }
+                if is_paste(keystroke) =>
+            {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    typed.push_str(text.lines().next().unwrap_or_default().trim_end());
+                }
+            }
             Phase::Password { typed, .. } => match keystroke.key.as_str() {
                 "enter" => {
                     self.password = Some(std::mem::take(typed));
@@ -676,6 +714,36 @@ impl TerminalView {
                     typed.pop();
                 }
                 "escape" => self.end("Cancelled".into(), cx),
+                _ => return,
+            },
+            Phase::Questions {
+                prompts,
+                answers,
+                typed,
+            } => match keystroke.key.as_str() {
+                "enter" => {
+                    answers.push(std::mem::take(typed));
+                    if answers.len() >= prompts.questions.len() {
+                        let answers = std::mem::take(answers);
+                        #[cfg(test)]
+                        {
+                            self.answered = answers.clone();
+                        }
+                        if let Some(input) = &self.input {
+                            input.answer(answers);
+                        }
+                        self.phase = Phase::Connecting;
+                    }
+                }
+                "backspace" => {
+                    typed.pop();
+                }
+                "escape" => {
+                    // Closing the session ends the sign-in.
+                    self.input = None;
+                    self._events = None;
+                    self.end("Cancelled".into(), cx);
+                }
                 _ => return,
             },
             Phase::Trust { .. } => match keystroke.key.as_str() {
@@ -699,7 +767,7 @@ impl TerminalView {
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         match &mut self.phase {
             Phase::Live => self.send_typed(text.as_bytes().to_vec(), cx),
-            Phase::Password { typed, .. } => typed.push_str(text),
+            Phase::Password { typed, .. } | Phase::Questions { typed, .. } => typed.push_str(text),
             _ => return,
         }
         cx.notify();
@@ -1441,6 +1509,55 @@ impl TerminalView {
                         .into_any_element(),
                 ),
             ),
+            Phase::Questions {
+                prompts,
+                answers,
+                typed,
+            } => {
+                let (question, echo) = prompts
+                    .questions
+                    .get(answers.len())
+                    .cloned()
+                    .unwrap_or_default();
+                let question = question.trim_end_matches(':').trim().to_string();
+                card(
+                    format!("{question} for {}", prompts.from).into(),
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            // The server's own words, when it has any.
+                            .when(!prompts.instructions.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme.text2)
+                                        .child(prompts.instructions.clone()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("question")
+                                    .debug_selector(|| "question".into())
+                                    .w(px(360.))
+                                    .h(px(40.))
+                                    .px(px(12.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(10.))
+                                    .bg(theme.card2)
+                                    .font_family(MONO)
+                                    .child(if echo {
+                                        typed.clone()
+                                    } else {
+                                        "•".repeat(typed.chars().count())
+                                    }),
+                            )
+                            .into_any_element(),
+                    ),
+                )
+            }
             Phase::Ended(message) => card(
                 message.clone(),
                 Some(
@@ -2267,6 +2384,43 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.reconnect.is_none());
             assert!(matches!(&view.phase, Phase::Ended(message) if message == "Connection lost"));
+        });
+    }
+
+    #[gpui::test]
+    fn asks_the_servers_questions_one_at_a_time(cx: &mut TestAppContext) {
+        use gpui_kit::ClipboardItem;
+        use tern_core::ssh::Prompts;
+
+        use super::Phase;
+
+        let (view, cx) = pane_with(cx, "");
+        view.update(cx, |view, cx| {
+            view.phase = super::Phase::Connecting;
+            view.on_session_event(
+                Event::Prompts(Prompts {
+                    from: "me@example".into(),
+                    instructions: String::new(),
+                    questions: vec![("Verification code:".into(), true), ("PIN:".into(), false)],
+                }),
+                cx,
+            )
+        });
+        focus(&view, cx);
+        // A pasted code takes its first line.
+        cx.write_to_clipboard(ClipboardItem::new_string("123456\nmore".into()));
+        cx.simulate_keystrokes(&shortcut("v"));
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(matches!(&view.phase, Phase::Questions { answers, .. } if answers.len() == 1))
+        });
+        cx.simulate_input("42");
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.answered, ["123456", "42"]);
+            assert!(matches!(view.phase, Phase::Connecting));
+            // Nothing of it went to a shell.
+            assert!(view.sent.borrow().is_empty());
         });
     }
 

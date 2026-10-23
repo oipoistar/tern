@@ -123,7 +123,9 @@ async fn session_lifecycle() {
         None,
     ));
     match next(&mut session).await {
-        Event::Failed(ConnectError::AuthFailed { tried }) => assert_eq!(tried, ["password"]),
+        Event::Failed(ConnectError::AuthFailed { tried }) => {
+            assert_eq!(tried, ["password", "keyboard-interactive"])
+        }
         other => panic!("expected authentication to fail, got {other:?}"),
     }
 

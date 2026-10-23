@@ -4,6 +4,7 @@
 //! channels, so any executor (GPUI's included) can drive a session without
 //! knowing about Tokio.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -90,6 +91,8 @@ pub struct ConnectRequest {
 pub struct Jump {
     pub target: Target,
     pub auth: Auth,
+    /// The saved host's id, which its saved password is kept under.
+    pub host_id: Option<String>,
 }
 
 /// Everything needed to open a session: from a saved host
@@ -136,12 +139,14 @@ impl Connection {
     }
 
     /// The request that opens this connection. `password` is one the user
-    /// typed for the target; jump hosts never get a password.
+    /// typed for the target; it never goes to a jump host, which gets only
+    /// its own saved password, from `jump_password`.
     pub fn request(
         &self,
         size: TermSize,
         password: Option<&str>,
         trust: Option<HostKey>,
+        jump_password: impl Fn(&Jump) -> Option<String>,
     ) -> ConnectRequest {
         ConnectRequest {
             target: self.target.clone(),
@@ -149,7 +154,15 @@ impl Connection {
             jumps: self
                 .jumps
                 .iter()
-                .map(|jump| (jump.target.clone(), credentials_for(&jump.auth, None)))
+                .map(|jump| {
+                    let saved = (jump.auth == Auth::Password)
+                        .then(|| jump_password(jump))
+                        .flatten();
+                    (
+                        jump.target.clone(),
+                        credentials_for(&jump.auth, saved.as_deref()),
+                    )
+                })
                 .collect(),
             proxy: self.proxy.clone(),
             size,
@@ -251,7 +264,25 @@ pub enum Event {
         forward: Forward,
         state: ForwardState,
     },
+    /// The server asks questions while signing in, like a one-time code;
+    /// answer with [`SessionInput::answer`].
+    Prompts(Prompts),
 }
+
+/// Questions a server asks while signing in (SSH's keyboard-interactive
+/// method), other than for the password Tern already has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompts {
+    /// Who asks: `user@host`.
+    pub from: String,
+    /// What the server says about them, often nothing.
+    pub instructions: String,
+    /// Each question, and whether its answer may show as it's typed.
+    pub questions: Vec<(String, bool)>,
+}
+
+/// How many rounds of questions a sign-in may take before Tern gives up.
+const MAX_PROMPT_ROUNDS: usize = 8;
 
 enum Input {
     Data(Vec<u8>),
@@ -260,7 +291,43 @@ enum Input {
     Forward(Forward, bool),
     /// Open an SFTP session on the connection.
     OpenSftp(oneshot::Sender<Result<Sftp, String>>),
+    /// Answers to [`Event::Prompts`], in order.
+    Answers(Vec<String>),
     Close,
+}
+
+/// Input for a session, with what arrived while sign-in waited for answers
+/// kept for afterwards.
+struct Inbox {
+    input: mpsc::UnboundedReceiver<Input>,
+    held: VecDeque<Input>,
+}
+
+impl Inbox {
+    async fn recv(&mut self) -> Option<Input> {
+        match self.held.pop_front() {
+            Some(held) => Some(held),
+            None => self.input.recv().await,
+        }
+    }
+
+    /// The answers to questions just asked; `None` if the session closed
+    /// instead.
+    async fn answers(&mut self) -> Option<Vec<String>> {
+        loop {
+            match self.input.recv().await? {
+                Input::Answers(answers) => return Some(answers),
+                Input::Close => return None,
+                other => self.held.push_back(other),
+            }
+        }
+    }
+}
+
+/// Lets sign-in ask the user what the server asks.
+struct Asker<'a> {
+    inbox: &'a mut Inbox,
+    events: &'a mpsc::UnboundedSender<Event>,
 }
 
 /// A running (or starting) session. Dropping it closes the connection.
@@ -291,6 +358,11 @@ impl SessionInput {
 
     pub fn close(&self) {
         let _ = self.0.send(Input::Close);
+    }
+
+    /// Answers the questions of an [`Event::Prompts`], in order.
+    pub fn answer(&self, answers: Vec<String>) {
+        let _ = self.0.send(Input::Answers(answers));
     }
 
     /// An SFTP session on this session's connection, once it's signed in.
@@ -352,6 +424,11 @@ impl Session {
         self.input.close();
     }
 
+    /// Answers the questions of an [`Event::Prompts`], in order.
+    pub fn answer(&self, answers: Vec<String>) {
+        self.input.answer(answers);
+    }
+
     /// Splits the session so input and events can live in different places.
     pub fn into_parts(self) -> (SessionInput, SessionEvents) {
         (self.input, SessionEvents(self.events))
@@ -383,9 +460,13 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 async fn run(
     request: ConnectRequest,
-    mut input: mpsc::UnboundedReceiver<Input>,
+    input: mpsc::UnboundedReceiver<Input>,
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<(), ConnectError> {
+    let mut inbox = Inbox {
+        input,
+        held: VecDeque::new(),
+    };
     let ConnectRequest {
         target,
         credentials,
@@ -417,7 +498,11 @@ async fn run(
             false,
         )
         .await?;
-        authenticate(&mut jump_handle, &jump.user, jump_credentials)
+        let mut asker = Asker {
+            inbox: &mut inbox,
+            events,
+        };
+        authenticate(&mut jump_handle, jump, jump_credentials, &mut asker, true)
             .await
             .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
         let next = jumps.get(at + 1).map_or(&target, |(next, _)| next);
@@ -446,7 +531,11 @@ async fn run(
     )
     .await?;
 
-    authenticate(&mut handle, &target.user, &credentials).await?;
+    let mut asker = Asker {
+        inbox: &mut inbox,
+        events,
+    };
+    authenticate(&mut handle, &target, &credentials, &mut asker, false).await?;
     let _ = events.send(Event::Connected);
     let handle = Arc::new(handle);
     let mut forwarder = Forwarder::new(handle.clone(), remote, events.clone());
@@ -487,7 +576,7 @@ async fn run(
                 }
                 Some(_) => {}
             },
-            command = input.recv() => match command {
+            command = inbox.recv() => match command {
                 Some(Input::Data(bytes)) => {
                     if writer.data(&bytes[..]).await.is_err() {
                         lost = true;
@@ -504,6 +593,8 @@ async fn run(
                         let _ = reply.send(sftp::open(&handle).await);
                     });
                 }
+                // Signed in already: late answers have no question.
+                Some(Input::Answers(_)) => {}
                 Some(Input::Close) | None => {
                     let _ = writer.close().await;
                     break;
@@ -858,11 +949,17 @@ pub(crate) fn describe(error: &std::io::Error) -> String {
     }
 }
 
+/// Signs in with `credentials`, then the server's questions. A jump host
+/// (`jump`) is asked a password question in the pane; the target's comes
+/// from its password card instead.
 async fn authenticate(
     handle: &mut client::Handle<Verifier>,
-    user: &str,
+    target: &Target,
     credentials: &[Credential],
+    asker: &mut Asker<'_>,
+    jump: bool,
 ) -> Result<(), ConnectError> {
+    let user = target.user.as_str();
     let mut tried = Vec::new();
     for credential in credentials {
         let outcome = match credential {
@@ -889,7 +986,86 @@ async fn authenticate(
             return Ok(());
         }
     }
+    // Then the server's own questions, as OpenSSH's keyboard-interactive
+    // does: two-factor codes, or a password where plain password sign-in
+    // is off.
+    let password = credentials.iter().find_map(|credential| match credential {
+        Credential::Password(password) => Some(password.as_str()),
+        _ => None,
+    });
+    tried.push("keyboard-interactive".to_string());
+    if let Ok(true) = interactive(handle, target, password, asker, jump).await {
+        return Ok(());
+    }
     Err(ConnectError::AuthFailed { tried })
+}
+
+/// Answers the server's questions: a password question from `password`,
+/// the rest by asking the user. Without a password to give, a password
+/// question fails the attempt, so the session asks for one the usual way,
+/// unless `ask_password` says to ask it like the others.
+async fn interactive(
+    handle: &mut client::Handle<Verifier>,
+    target: &Target,
+    password: Option<&str>,
+    asker: &mut Asker<'_>,
+    ask_password: bool,
+) -> Result<bool> {
+    use client::KeyboardInteractiveAuthResponse as Reply;
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(target.user.as_str(), None)
+        .await?;
+    for _ in 0..MAX_PROMPT_ROUNDS {
+        let (instructions, prompts) = match reply {
+            Reply::Success => return Ok(true),
+            Reply::Failure { .. } => return Ok(false),
+            Reply::InfoRequest {
+                instructions,
+                prompts,
+                ..
+            } => (instructions, prompts),
+        };
+        let asks_password = |prompt: &client::Prompt| {
+            !prompt.echo && prompt.prompt.to_lowercase().contains("password")
+        };
+        let mut answers: Vec<Option<String>> = prompts
+            .iter()
+            .map(|prompt| {
+                asks_password(prompt)
+                    .then(|| password.map(String::from))
+                    .flatten()
+            })
+            .collect();
+        if prompts.iter().any(asks_password) && password.is_none() && !ask_password {
+            return Ok(false);
+        }
+        let questions: Vec<(String, bool)> = prompts
+            .iter()
+            .zip(&answers)
+            .filter(|(_, answer)| answer.is_none())
+            .map(|(prompt, _)| (prompt.prompt.trim().to_string(), prompt.echo))
+            .collect();
+        if !questions.is_empty() {
+            let _ = asker.events.send(Event::Prompts(Prompts {
+                from: format!("{}@{}", target.user, target.host),
+                instructions: instructions.trim().to_string(),
+                questions,
+            }));
+            let Some(given) = asker.inbox.answers().await else {
+                return Ok(false);
+            };
+            let mut given = given.into_iter();
+            for answer in answers.iter_mut().filter(|answer| answer.is_none()) {
+                *answer = Some(given.next().unwrap_or_default());
+            }
+        }
+        reply = handle
+            .authenticate_keyboard_interactive_respond(
+                answers.into_iter().map(Option::unwrap_or_default).collect(),
+            )
+            .await?;
+    }
+    Ok(false)
 }
 
 async fn with_key_file(
@@ -1156,6 +1332,7 @@ mod tests {
         connection.auth = Auth::Password;
         connection.jumps = ["gateway", "bastion"]
             .map(|host| Jump {
+                host_id: None,
                 target: Target {
                     host: host.into(),
                     ..target.clone()
@@ -1163,7 +1340,8 @@ mod tests {
                 auth: Auth::Agent,
             })
             .to_vec();
-        let request = connection.request(TermSize { cols: 80, rows: 24 }, Some("pw"), None);
+        let size = TermSize { cols: 80, rows: 24 };
+        let request = connection.request(size, Some("pw"), None, |_| None);
         assert!(matches!(request.credentials[..], [Credential::Password(_)]));
         let hops: Vec<&str> = request
             .jumps
@@ -1176,6 +1354,24 @@ mod tests {
                 .iter()
                 .all(|credential| !matches!(credential, Credential::Password(_)))
         }));
+
+        // A jump host that signs in with a password gets its own saved one.
+        connection.jumps[1].auth = Auth::Password;
+        connection.jumps[1].host_id = Some("bastion-id".into());
+        let saved = |jump: &Jump| {
+            (jump.host_id.as_deref() == Some("bastion-id")).then(|| "jump-pw".to_string())
+        };
+        let request = connection.request(size, Some("pw"), None, saved);
+        assert!(matches!(
+            &request.jumps[1].1[..],
+            [Credential::Password(password)] if password == "jump-pw"
+        ));
+        assert!(
+            request.jumps[0]
+                .1
+                .iter()
+                .all(|credential| !matches!(credential, Credential::Password(_)))
+        );
     }
 
     #[test]

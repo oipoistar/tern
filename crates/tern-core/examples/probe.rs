@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
             connection.jumps.push(Jump {
                 target,
                 auth: key.map_or(Auth::Agent, Auth::Key),
+                host_id: None,
             });
         }
     }
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut trust = None;
     loop {
-        let mut session = Session::open(connection.request(size, None, trust.clone()));
+        let mut session = Session::open(connection.request(size, None, trust.clone(), |_| None));
         match session.next_event().await {
             Some(Event::Connected) => {
                 eprintln!(

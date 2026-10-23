@@ -144,10 +144,6 @@ impl HostDraft {
                 {
                     problem(Field::Jump, "That host goes through this one")
                 }
-                Some(via) if via.auth == Auth::Password => problem(
-                    Field::Jump,
-                    "That host signs in with a password, which a jump host can't use yet",
-                ),
                 Some(via) => {
                     if let Err(error) = vault.jumps(via) {
                         problem(Field::Jump, &error);
@@ -314,9 +310,11 @@ mod tests {
         vault.save(Some("bastion"), bastion, "Production");
         draft.jump = Some("bastion".into());
 
+        // A jump host may sign in with a password: its saved one, or one
+        // asked for in the pane.
         let mut bastion = vault.find("bastion").unwrap().clone();
         bastion.auth = Auth::Password;
         vault.save(Some("bastion"), bastion, "Production");
-        assert!(jump_problem(&draft, &vault).unwrap().contains("password"));
+        assert_eq!(jump_problem(&draft, &vault), None);
     }
 }
