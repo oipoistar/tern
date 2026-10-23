@@ -27,6 +27,7 @@ pub mod schemes;
 pub mod secrets;
 pub mod settings;
 pub mod sftp;
+pub mod shells;
 pub mod snippet;
 pub mod ssh;
 pub mod sync;

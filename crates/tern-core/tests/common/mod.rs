@@ -484,6 +484,7 @@ pub fn request(
         agent_forwarding: false,
         env: Vec::new(),
         shell: true,
+        command: None,
     }
 }
 

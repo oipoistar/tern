@@ -215,6 +215,13 @@ claude.ai account). Each item below names the artboard it comes from.
       commands from Run on hosts wait in the pane for Paste or Run
       (Enter) and Cancel (Escape). tern --connect also takes a saved
       host's name
+- [x] Kept shells: Keep shells running in the host editor runs the
+      host's shells in tmux (screen without it, a plain shell without
+      either) under a name for each pane slot, so a dropped connection
+      or Tern quitting doesn't end them; the pane reconnects to the same
+      shell without typing its login command again, a later pane to the
+      host finds a shell left running, and closing a pane by hand ends
+      its shell on the host
 
 ## Known gaps in what's built
 

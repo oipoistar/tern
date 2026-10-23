@@ -1088,8 +1088,10 @@ impl Workspace {
         self.activate(Some(index), window, cx);
     }
 
-    /// Records a live pane in History as closed by hand.
+    /// Records a live pane in History as closed by hand, and ends the
+    /// shell it kept on the host.
     fn record_closed(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        terminal.update(cx, |terminal, _| terminal.end_kept_shell());
         let terminal = terminal.read(cx);
         if terminal.is_live() && !terminal.connection().local {
             let visit = terminal.visit("Closed");

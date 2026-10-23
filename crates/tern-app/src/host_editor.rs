@@ -102,6 +102,7 @@ pub struct HostEditor {
     keep_alive: bool,
     agent_forwarding: bool,
     guarded: bool,
+    keep_shell: bool,
     menu: Option<Menu>,
     test: Test,
     problems: Vec<Problem>,
@@ -221,6 +222,7 @@ impl HostEditor {
             keep_alive: draft.keep_alive,
             agent_forwarding: draft.agent_forwarding,
             guarded: draft.guarded,
+            keep_shell: draft.keep_shell,
             menu: None,
             test: Test::Idle,
             problems: Vec::new(),
@@ -258,6 +260,7 @@ impl HostEditor {
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
             guarded: self.guarded,
+            keep_shell: self.keep_shell,
             on_login: text(&self.on_login),
             env: text(&self.env),
             notes: self.notes.read(cx).value().to_string(),
@@ -1110,6 +1113,28 @@ impl HostEditor {
                             .debug_selector(|| "guard-switch".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.guarded = !this.guarded;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_h(px(36.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Keep shells running"),
+                    )
+                    .child(
+                        switch("keep-shell-switch", self.keep_shell, t)
+                            .debug_selector(|| "keep-shell-switch".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.keep_shell = !this.keep_shell;
                                 cx.notify();
                             })),
                     ),

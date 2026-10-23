@@ -4,7 +4,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openssh-server openssh-client libpam-google-authenticator oathtool \
-      dante-server tinyproxy python3 curl netcat-openbsd procps iproute2 \
+      dante-server tinyproxy python3 curl netcat-openbsd procps iproute2 tmux \
  && rm -rf /var/lib/apt/lists/* \
  # Each container makes its own host keys when it first starts, so no two
  # servers share one.

@@ -13,6 +13,7 @@
 //! while Shift is held, which keeps it for selecting.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::{Range, RangeInclusive};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -38,6 +39,7 @@ use tern_core::history::{self, Visit};
 use tern_core::reconnect;
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
+use tern_core::shells;
 use tern_core::ssh::{
     ConnectError, Connection, Event, Prompts, Session, SessionInput, TermSize, Trusted,
 };
@@ -100,6 +102,12 @@ enum Held {
     Run(Vec<u8>),
 }
 
+/// The slots of kept shells that open panes hold, by host.
+#[derive(Default)]
+struct KeptShells(HashMap<String, BTreeSet<u32>>);
+
+impl Global for KeptShells {}
+
 pub enum TerminalEvent {
     /// A connection attempt ended (closed, failed or given up), for
     /// History.
@@ -133,6 +141,9 @@ pub struct TerminalView {
     input: Option<SessionInput>,
     /// Sessions started here, reconnects included: the latest's number.
     sessions: u64,
+    /// The name of the shell kept running on the host for this pane, when
+    /// the host keeps them.
+    shell: Option<String>,
     _events: Option<Task<()>>,
     term: Term<Listener>,
     parser: Processor,
@@ -244,8 +255,47 @@ impl TerminalView {
     pub fn new(connection: Connection, cx: &mut Context<Self>) -> Self {
         let mut view = Self::idle(connection, cx);
         view.password = view.saved_password(cx);
+        view.shell = view.claim_shell(cx);
         view.connect(cx);
         view
+    }
+
+    /// The name of this pane's kept shell, when its host keeps them: the
+    /// host's lowest slot no open pane holds, given back when the pane goes.
+    /// The same slot after a restart finds the same shell.
+    fn claim_shell(&self, cx: &mut Context<Self>) -> Option<String> {
+        if !self.connection.keep_shell || self.connection.local {
+            return None;
+        }
+        let key = self.connection.host_id.clone().unwrap_or_else(|| {
+            let target = &self.connection.target;
+            format!("{}@{}:{}", target.user, target.host, target.port)
+        });
+        let held = cx
+            .default_global::<KeptShells>()
+            .0
+            .entry(key.clone())
+            .or_default();
+        let slot = (1..)
+            .find(|slot| !held.contains(slot))
+            .expect("a free slot");
+        held.insert(slot);
+        let name = shells::name(&key, slot);
+        cx.on_release(move |_, cx| {
+            if let Some(held) = cx.default_global::<KeptShells>().0.get_mut(&key) {
+                held.remove(&slot);
+            }
+        })
+        .detach();
+        Some(name)
+    }
+
+    /// Ends the shell kept on the host for good, as the pane is closed by
+    /// hand.
+    pub fn end_kept_shell(&mut self) {
+        if let (Some(name), Some(input)) = (&self.shell, &self.input) {
+            input.close_after(shells::end(name));
+        }
     }
 
     /// The password saved for this connection's host, if it signs in with
@@ -387,6 +437,7 @@ impl TerminalView {
             phase: Phase::Connecting,
             input: None,
             sessions: 0,
+            shell: None,
             _events: None,
             term: Term::new(config, &GridSize(size), Listener(term_events.clone())),
             parser: Processor::new(),
@@ -521,12 +572,13 @@ impl TerminalView {
         } else {
             // Jump hosts sign in with their own saved passwords.
             let store = crate::sync::secrets(cx);
-            let request = self.connection.request(
+            let mut request = self.connection.request(
                 self.size,
                 self.password.as_deref(),
                 self.trust.clone(),
                 |jump| jump.secret.as_deref().and_then(|secret| store.load(secret)),
             );
+            request.command = self.shell.as_deref().map(shells::attach);
             Session::open(request)
         };
         let (input, mut events) = session.into_parts();
@@ -549,6 +601,7 @@ impl TerminalView {
     pub(crate) fn on_session_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Connected => {
+                let reattached = self.had_shell && self.shell.is_some();
                 self.phase = Phase::Live;
                 self.live_since = Some(Instant::now());
                 self.reconnect = None;
@@ -567,8 +620,11 @@ impl TerminalView {
                     );
                 }
                 self.had_shell = true;
-                // Queued now, it reaches the shell as soon as it starts.
-                if let Some(command) = &self.connection.on_login {
+                // Queued now, it reaches the shell as soon as it starts; a
+                // kept shell found again needs nothing typed into it.
+                if let Some(command) = &self.connection.on_login
+                    && !reattached
+                {
                     self.send(format!("{command}\r").into_bytes());
                 }
                 if let Some(command) = self.once.take() {
@@ -2458,6 +2514,63 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn panes_to_one_host_keep_shells_of_their_own(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        use tern_core::shells;
+
+        cx.update(gpui_kit::init);
+        let connection = Connection {
+            keep_shell: true,
+            host_id: Some("9f39b2acf25b2d3b".into()),
+            ..Connection::typed(
+                Target {
+                    host: "example".into(),
+                    port: 22,
+                    user: "me".into(),
+                },
+                None,
+            )
+        };
+        let pane = |cx: &mut TestAppContext| {
+            let connection = connection.clone();
+            cx.new(|cx| {
+                let mut view = TerminalView::idle(connection, cx);
+                view.shell = view.claim_shell(cx);
+                view
+            })
+        };
+        let shell = |pane: &Entity<TerminalView>, cx: &mut TestAppContext| {
+            pane.read_with(cx, |pane, _| pane.shell.clone())
+        };
+        let kept = |slot| Some(shells::name("9f39b2acf25b2d3b", slot));
+        let (first, second) = (pane(cx), pane(cx));
+        assert_eq!(shell(&first, cx), kept(1));
+        assert_eq!(shell(&second, cx), kept(2));
+        // A closed pane's slot goes to the next pane, which finds its shell.
+        drop(first);
+        // Released as the next update ends.
+        cx.update(|_| {});
+        assert_eq!(shell(&pane(cx), cx), kept(1));
+        // A host that doesn't keep shells gets none.
+        let plain = cx.new(|cx| {
+            let mut view = TerminalView::idle(
+                Connection::typed(
+                    Target {
+                        host: "example".into(),
+                        port: 22,
+                        user: "me".into(),
+                    },
+                    None,
+                ),
+                cx,
+            );
+            view.shell = view.claim_shell(cx);
+            view
+        });
+        assert_eq!(shell(&plain, cx), None);
     }
 
     /// The middle of a cell's left or right half, in the window.

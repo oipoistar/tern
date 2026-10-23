@@ -93,6 +93,7 @@ fn request(target: Target, credentials: Vec<Credential>) -> ConnectRequest {
         agent_forwarding: false,
         env: Vec::new(),
         shell: true,
+        command: None,
     }
 }
 

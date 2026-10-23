@@ -78,6 +78,10 @@ pub struct Host {
     /// and Broadcast leaves its sessions out.
     #[serde(default, skip_serializing_if = "is_off")]
     pub guarded: bool,
+    /// The shell runs in tmux (or screen) on the host, so it outlives a
+    /// dropped connection, and Tern reattaches to it.
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub keep_shell: bool,
     /// Typed into the shell once it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
@@ -147,6 +151,7 @@ impl Host {
             keep_alive: true,
             agent_forwarding: false,
             guarded: false,
+            keep_shell: false,
             on_login: None,
             env: Env::new(),
             forwards: Vec::new(),

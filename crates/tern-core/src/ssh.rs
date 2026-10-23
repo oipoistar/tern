@@ -98,6 +98,9 @@ pub struct ConnectRequest {
     /// Open a shell. Without one, the session only carries its port
     /// forwarding rules.
     pub shell: bool,
+    /// Run this in the terminal instead of a login shell: a kept shell's
+    /// attach, or a container's shell.
+    pub command: Option<String>,
 }
 
 /// A host to go through, and how to sign in there.
@@ -135,6 +138,9 @@ pub struct Connection {
     /// Input that doesn't come from the pane's own keyboard waits for a
     /// yes, or doesn't reach it ([`Host::guarded`](crate::Host::guarded)).
     pub guarded: bool,
+    /// The shell runs in tmux or screen on the host, where it outlives the
+    /// connection ([`shells`](crate::shells)).
+    pub keep_shell: bool,
     /// Environment variables the shell starts with.
     pub env: Vec<(String, String)>,
     /// Typed into the shell once it starts, at every login.
@@ -182,6 +188,7 @@ impl Connection {
             keep_alive: true,
             agent_forwarding: false,
             guarded: false,
+            keep_shell: false,
             env: Vec::new(),
             on_login: None,
             once: None,
@@ -224,6 +231,7 @@ impl Connection {
             agent_forwarding: self.agent_forwarding,
             env: self.env.clone(),
             shell: true,
+            command: None,
         }
     }
 }
@@ -342,6 +350,12 @@ const MAX_PROMPT_ROUNDS: usize = 8;
 
 /// How long a shell's exit status may take to follow the end of its output.
 const EXIT_STATUS_WAIT: Duration = Duration::from_secs(2);
+/// How long a command run beside the terminal may take.
+const EXEC_WAIT: Duration = Duration::from_secs(20);
+/// How long closing waits for its last command.
+const CLOSE_AFTER_WAIT: Duration = Duration::from_secs(3);
+/// What a command run beside the terminal may print, at most.
+const EXEC_OUTPUT: usize = 4 << 20;
 
 /// Whether a hidden question asks for the account's password, rather than
 /// a one-time code or a new password (an expired one asks for both).
@@ -381,7 +395,20 @@ pub(crate) enum Input {
     OpenSftp(oneshot::Sender<Result<Sftp, String>>),
     /// Answers to [`Event::Prompts`], in order.
     Answers(Vec<String>),
+    /// Run a command on the connection, beside the terminal.
+    Exec(String, oneshot::Sender<Result<Ran, String>>),
+    /// Run a command on the connection, then close it.
+    CloseAfter(String),
     Close,
+}
+
+/// What a command run on the connection printed, and how it ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ran {
+    /// Its exit status, when the server said.
+    pub status: Option<u32>,
+    pub out: String,
+    pub err: String,
 }
 
 /// Input for a session, with what arrived while sign-in waited for answers
@@ -448,9 +475,27 @@ impl SessionInput {
         let _ = self.0.send(Input::Close);
     }
 
+    /// Runs `command` on the connection, then closes it; how a shell kept
+    /// running on the host ends for good. It runs even if every input is
+    /// dropped right after.
+    pub fn close_after(&self, command: String) {
+        let _ = self.0.send(Input::CloseAfter(command));
+    }
+
     /// Answers the questions of an [`Event::Prompts`], in order.
     pub fn answer(&self, answers: Vec<String>) {
         let _ = self.0.send(Input::Answers(answers));
+    }
+
+    /// Runs `command` on the connection, beside the terminal and without
+    /// one, once it's signed in; what it printed, or why it couldn't run.
+    pub fn exec(&self, command: String) -> impl Future<Output = Result<Ran, String>> + 'static {
+        let (reply, ran) = oneshot::channel();
+        let _ = self.0.send(Input::Exec(command, reply));
+        async move {
+            ran.await
+                .unwrap_or_else(|_| Err("the session has ended".into()))
+        }
     }
 
     /// An SFTP session on this session's connection, once it's signed in.
@@ -582,6 +627,7 @@ async fn run(
         agent_forwarding,
         env,
         shell,
+        command,
     } = request;
 
     // Through jump hosts: sign in to each, then run the next one's SSH over
@@ -672,6 +718,16 @@ async fn run(
                             let _ = reply.send(sftp::open(&handle).await);
                         });
                     }
+                    Some(Input::Exec(command, reply)) => {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(exec(&handle, &command, EXEC_WAIT).await);
+                        });
+                    }
+                    Some(Input::CloseAfter(command)) => {
+                        let _ = exec(&handle, &command, CLOSE_AFTER_WAIT).await;
+                        break;
+                    }
                     Some(Input::Close) | None => break,
                     Some(_) => {}
                 },
@@ -698,7 +754,11 @@ async fn run(
         .request_pty(false, TERM, size.cols.into(), size.rows.into(), 0, 0, &[])
         .await
         .map_err(other)?;
-    channel.request_shell(true).await.map_err(other)?;
+    match &command {
+        Some(command) => channel.exec(true, command.as_bytes()).await,
+        None => channel.request_shell(true).await,
+    }
+    .map_err(other)?;
     let (mut reader, writer) = channel.split();
 
     // OpenSSH sends the shell's exit status after the end of its output, so
@@ -748,8 +808,19 @@ async fn run(
                         let _ = reply.send(sftp::open(&handle).await);
                     });
                 }
+                Some(Input::Exec(command, reply)) => {
+                    let handle = handle.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(exec(&handle, &command, EXEC_WAIT).await);
+                    });
+                }
                 // Signed in already: late answers have no question.
                 Some(Input::Answers(_)) => {}
+                Some(Input::CloseAfter(command)) => {
+                    let _ = exec(&handle, &command, CLOSE_AFTER_WAIT).await;
+                    let _ = writer.close().await;
+                    break;
+                }
                 Some(Input::Close) | None => {
                     let _ = writer.close().await;
                     break;
@@ -758,6 +829,46 @@ async fn run(
         }
     }
     finish(forwarder, &handle, &via, lost, exit_status, events).await
+}
+
+/// Runs `command` on its own channel of the connection, without a
+/// terminal, for at most `wait`: what it printed and its exit status.
+async fn exec<H: client::Handler>(
+    handle: &client::Handle<H>,
+    command: &str,
+    wait: Duration,
+) -> Result<Ran, String> {
+    let ran = async {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|error| error.to_string())?;
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        let (mut out, mut err, mut status) = (Vec::new(), Vec::new(), None);
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+            if out.len() + err.len() > EXEC_OUTPUT {
+                return Err("it printed too much".to_string());
+            }
+        }
+        Ok(Ran {
+            status,
+            out: String::from_utf8_lossy(&out).into_owned(),
+            err: String::from_utf8_lossy(&err).into_owned(),
+        })
+    };
+    tokio::time::timeout(wait, ran)
+        .await
+        .unwrap_or_else(|_| Err("it took too long".into()))
 }
 
 /// Ends a session: its rules stop, its connections close (the hop nearest

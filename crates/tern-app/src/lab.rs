@@ -193,6 +193,40 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         println!("ok    Refresh opens Files again on the new connection");
     }
 
+    // A kept shell: the server ends the connection, the pane reconnects by
+    // itself and finds the same shell, with what was set in it; ending it
+    // by hand ends it on the server too.
+    {
+        let connection = Connection {
+            keep_shell: true,
+            ..here(2202, Some(key()))
+        };
+        let (view, cx) = pane(cx, connection);
+        trust_until_live(&view, cx);
+        shell(&view, cx, "KEPT=$((40+2)); echo in-$TMUX_PANE", "in-%");
+        docker(&["exec", "tern-lab-key-1", "pkill", "-f", "sshd: lab"]);
+        wait(&view, cx, "lost", |view| !matches!(view.phase, Phase::Live));
+        wait(&view, cx, "back", |view| matches!(view.phase, Phase::Live));
+        shell(&view, cx, "echo kept-$KEPT", "kept-42");
+        println!("ok    a kept shell comes back with the connection");
+
+        view.update(cx, |view, _| view.end_kept_shell());
+        wait(&view, cx, "ended", |view| {
+            matches!(view.phase, Phase::Ended(_))
+        });
+        let left = docker(&[
+            "exec",
+            "-u",
+            "lab",
+            "tern-lab-key-1",
+            "sh",
+            "-c",
+            "tmux ls 2>&1 || true",
+        ]);
+        assert!(!left.contains("tern-"), "still kept: {left}");
+        println!("ok    closing it by hand ends the kept shell");
+    }
+
     // A password-only server: the password card.
     {
         let (view, cx) = pane(cx, here(2201, None));

@@ -151,8 +151,11 @@ pub(crate) fn run(
                 Input::OpenSftp(reply) => {
                     let _ = reply.send(Err("not on a local terminal".into()));
                 }
+                Input::Exec(_, reply) => {
+                    let _ = reply.send(Err("not on a local terminal".into()));
+                }
                 Input::Answers(_) => {}
-                Input::Close => break,
+                Input::CloseAfter(_) | Input::Close => break,
             }
         }
         // The pane closed or asked to: end the shell, if it's still there.

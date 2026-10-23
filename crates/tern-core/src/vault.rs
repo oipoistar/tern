@@ -346,6 +346,7 @@ impl Vault {
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
             guarded: host.guarded,
+            keep_shell: host.keep_shell,
             env: host
                 .env
                 .iter()

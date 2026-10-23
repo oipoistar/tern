@@ -23,6 +23,7 @@ pub struct HostDraft {
     pub keep_alive: bool,
     pub agent_forwarding: bool,
     pub guarded: bool,
+    pub keep_shell: bool,
     pub on_login: String,
     /// `NAME=value` pairs, as [`crate::env::parse`] reads them.
     pub env: String,
@@ -69,6 +70,7 @@ impl HostDraft {
             keep_alive: true,
             agent_forwarding: false,
             guarded: false,
+            keep_shell: false,
             on_login: String::new(),
             env: String::new(),
             notes: String::new(),
@@ -91,6 +93,7 @@ impl HostDraft {
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
             guarded: host.guarded,
+            keep_shell: host.keep_shell,
             on_login: host.on_login.clone().unwrap_or_default(),
             env: crate::env::format(&host.env),
             notes: host.notes.clone(),
@@ -225,6 +228,7 @@ impl HostDraft {
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
             guarded: self.guarded,
+            keep_shell: self.keep_shell,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
             env,
             notes: self.notes.trim_end().to_string(),
@@ -304,6 +308,7 @@ mod tests {
         draft.tags = vec!["SQL".into(), " ".into(), "sql".into(), "eu".into()];
         draft.on_login = "  ".into();
         draft.guarded = true;
+        draft.keep_shell = true;
         let host = draft.check(&vault, None).unwrap();
         assert_eq!(
             (host.name.as_str(), host.port, host.user.as_str()),
@@ -311,9 +316,10 @@ mod tests {
         );
         assert_eq!(host.tags, ["SQL", "eu"]);
         assert_eq!(host.on_login, None);
-        // Its sessions are guarded too.
+        // Its sessions are guarded, and keep their shells.
         vault.save(None, host.clone(), "Production");
-        assert!(vault.connection(&host).unwrap().guarded);
+        let connection = vault.connection(&host).unwrap();
+        assert!(connection.guarded && connection.keep_shell);
     }
 
     #[test]
