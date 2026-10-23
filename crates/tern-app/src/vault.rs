@@ -1223,6 +1223,16 @@ impl VaultContent {
         }
     }
 
+    /// Opens the saved hosts `names` side by side, four panes to a tab.
+    fn open_together(&mut self, names: &[String], cx: &mut Context<Self>) {
+        let connections: Vec<Connection> = names
+            .iter()
+            .filter_map(|name| self.vault.find(name))
+            .filter_map(|host| self.vault.connection(host).ok())
+            .collect();
+        cx.emit(VaultEvent::OpenTogether(connections));
+    }
+
     /// The Keychain screen: a Keys / Identities switch over the one shown.
     fn keychain_screen(&self, t: &Theme, cx: &Context<Self>) -> AnyElement {
         let parts = [
@@ -1518,6 +1528,32 @@ impl VaultContent {
                     if hosts.is_empty() {
                         return None;
                     }
+                    // The hosts shown, opened side by side in one go.
+                    let together: Vec<String> =
+                        hosts.iter().map(|host| host.name.clone()).collect();
+                    let open_all =
+                        (together.len() > 1).then(|| {
+                            let id = format!("open-group-{}", group.name);
+                            div()
+                                .id(SharedString::from(id.clone()))
+                                .debug_selector(move || id)
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .rounded(px(9.))
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.text2)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(theme.card2))
+                                .child(icon(IconName::LayoutGrid, 13., theme.text2))
+                                .child("Open all")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_together(&together, cx)
+                                }))
+                        });
                     let hosts = match self.layout {
                         Layout::Cards => div().flex().flex_wrap().gap(px(14.)).children(
                             hosts
@@ -1535,7 +1571,7 @@ impl VaultContent {
                             .flex()
                             .flex_col()
                             .gap(px(14.))
-                            .child(group_heading(group.name.clone(), theme))
+                            .child(group_heading(group.name.clone(), theme).children(open_all))
                             .child(hosts),
                     )
                 })
@@ -2395,6 +2431,35 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn opens_a_group_side_by_side(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        let together: Rc<RefCell<Vec<Connection>>> = Rc::default();
+        let seen = together.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                if let VaultEvent::OpenTogether(connections) = event {
+                    *seen.borrow_mut() = connections.clone();
+                }
+            })
+            .detach()
+        });
+        click(cx, "open-group-Production");
+        let hosts: Vec<String> = together
+            .borrow()
+            .iter()
+            .map(|connection| connection.host.clone().unwrap())
+            .collect();
+        let expected: Vec<String> = vault.read_with(cx, |vault, _| {
+            vault.vault.groups[0]
+                .hosts
+                .iter()
+                .map(|host| host.name.clone())
+                .collect()
+        });
+        assert_eq!(hosts, expected);
     }
 
     #[gpui::test]

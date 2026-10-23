@@ -159,6 +159,8 @@ claude.ai account). Each item below names the artboard it comes from.
       jump hosts too; editing an identity changes every host that uses
       it, it can't be deleted while one does, and identities sync with
       hosts. Vault file version 8
+- [x] Open all: a group's heading opens the hosts shown in it side by
+      side, four panes to a tab, ready for Broadcast
 
 ## Known gaps in what's built
 
