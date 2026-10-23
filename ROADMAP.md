@@ -183,6 +183,10 @@ claude.ai account). Each item below names the artboard it comes from.
       value before it's typed, in a row above the snippet bar (Enter
       moves on, the last Enter types it, Escape doesn't) and in the Run
       on hosts chooser
+- [x] Terminal menu: right-click (Shift+right-click in programs that
+      take the mouse) offers Copy, Paste, Select all, Find, Clear
+      scrollback and Save output, which writes the scrollback and screen
+      to a text file
 
 ## Known gaps in what's built
 

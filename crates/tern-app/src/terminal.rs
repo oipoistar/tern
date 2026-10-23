@@ -152,6 +152,8 @@ pub struct TerminalView {
     reported_cell: Option<(usize, usize)>,
     /// Lines waiting to be pasted until the user says so.
     pending_paste: Option<String>,
+    /// The right-click menu, open where it was asked for.
+    menu: Option<Point<Pixels>>,
     /// Output arrived since the pane was last on screen.
     pub unseen: bool,
     /// The bell rang since then.
@@ -347,6 +349,7 @@ impl TerminalView {
             pressed: None,
             reported_cell: None,
             pending_paste: None,
+            menu: None,
             unseen: false,
             rang: false,
             #[cfg(test)]
@@ -988,6 +991,13 @@ impl TerminalView {
             );
             return;
         }
+        // Right-click opens the menu (with Shift, even in programs that
+        // take the mouse).
+        if event.button == MouseButton::Right {
+            self.menu = Some(event.position);
+            cx.notify();
+            return;
+        }
         if event.button != MouseButton::Left {
             return;
         }
@@ -1059,6 +1069,144 @@ impl TerminalView {
         if dragged && settings::current(cx).terminal.copy_on_select {
             self.copy(cx);
         }
+    }
+
+    /// The right-click menu: Copy (with a selection), Paste, Select all,
+    /// Find, Clear scrollback, Save output.
+    fn context_menu(&self, at: Point<Pixels>, t: &Theme, cx: &Context<Self>) -> AnyElement {
+        let has_selection = self
+            .term
+            .selection_to_string()
+            .is_some_and(|text| !text.is_empty());
+        let item = |id: &'static str, label: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(32.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(9.))
+                .text_color(if enabled { t.text } else { t.text3 })
+                .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(t.card2)))
+                .child(label)
+        };
+        let close = |this: &mut Self, cx: &mut Context<Self>| {
+            this.menu = None;
+            cx.notify();
+        };
+        deferred(
+            anchored()
+                .position(at)
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .id("terminal-menu")
+                        .occlude()
+                        .w(px(200.))
+                        .p(px(6.))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(14.))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.line)
+                        .shadow(t.shadow())
+                        .text_size(px(13.))
+                        .on_mouse_down_out(cx.listener(move |this, _, _, cx| close(this, cx)))
+                        .child(
+                            item("menu-copy", "Copy", has_selection).when(has_selection, |d| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy(cx);
+                                    close(this, cx);
+                                }))
+                            }),
+                        )
+                        .child(
+                            item("menu-paste", "Paste", self.is_live()).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    close(this, cx);
+                                    if this.is_live() {
+                                        this.paste(cx);
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            item("menu-select-all", "Select all", true).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.select_all();
+                                    close(this, cx);
+                                },
+                            )),
+                        )
+                        .child(item("menu-find", "Find", true).on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                close(this, cx);
+                                this.open_find(window, cx);
+                            },
+                        )))
+                        .child(div().my(px(4.)).h(px(1.)).bg(t.line))
+                        .child(
+                            item("menu-clear", "Clear scrollback", true).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    // CSI 3 J: erase the lines above the screen.
+                                    this.parser.advance(&mut this.term, b"\x1b[3J");
+                                    this.term.scroll_display(Scroll::Bottom);
+                                    close(this, cx);
+                                },
+                            )),
+                        )
+                        .child(item("menu-save", "Save output", true).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                close(this, cx);
+                                this.save_output(cx);
+                            },
+                        ))),
+                ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    /// Everything in the scrollback and on screen, as text, without the
+    /// blank lines below the last output.
+    pub(crate) fn output_text(&self) -> String {
+        let top = GridPoint::new(self.term.topmost_line(), Column(0));
+        let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
+        let text = self.term.bounds_to_string(top, bottom);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        let end = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |last| last + 1);
+        let mut saved = lines[..end].join("\n");
+        saved.push('\n');
+        saved
+    }
+
+    /// Asks where, then writes the output there as text.
+    fn save_output(&mut self, cx: &mut Context<Self>) {
+        let text = self.output_text();
+        let name: String = self
+            .label()
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let dir = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let asked = cx.prompt_for_new_path(&dir, Some(&format!("{name}.txt")));
+        cx.spawn(async move |_, _| {
+            if let Ok(Ok(Some(path))) = asked.await {
+                let _ = std::fs::write(path, text);
+            }
+        })
+        .detach();
     }
 
     /// Lights the pane briefly, for the bell.
@@ -1796,6 +1944,7 @@ impl Render for TerminalView {
                     .map(|find| self.find_bar(find, &theme, cx)),
             )
             .children(self.overlay(&theme, cx))
+            .children(self.menu.map(|at| self.context_menu(at, &theme, cx)))
     }
 }
 
@@ -2585,6 +2734,59 @@ mod tests {
         });
         cx.simulate_keystrokes(&shortcut("v"));
         assert_eq!(sent(cx), "\x1b[200~make\rmake install\r\x1b[201~");
+    }
+
+    #[gpui::test]
+    fn the_right_click_menu_copies_clears_and_saves(cx: &mut TestAppContext) {
+        use alacritty_terminal::grid::Dimensions as _;
+
+        let output: String = (0..200).map(|n| format!("line {n}\r\n")).collect();
+        let (view, cx) = pane_with(cx, &output);
+        let menu = |cx: &mut VisualTestContext, item: &'static str| {
+            let at = cell(&view, cx, 2, 2, false);
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Right,
+                position: at,
+                modifiers: Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.run_until_parked();
+            let bounds = cx
+                .debug_bounds(item)
+                .unwrap_or_else(|| panic!("the menu has no {item}"));
+            cx.simulate_click(bounds.center(), Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        menu(cx, "menu-select-all");
+        menu(cx, "menu-copy");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(copied.contains("line 0") && copied.contains("line 199"));
+
+        // Saved as text, scrollback and screen, without the blank end.
+        let dir = std::env::temp_dir().join(format!("tern-ui-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("output.txt");
+        menu(cx, "menu-save");
+        let chosen = path.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("line 0\n"), "{saved}");
+        assert!(saved.ends_with("line 199\n"), "{saved}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Clear scrollback leaves only the screen.
+        assert!(view.read_with(cx, |view, _| view.term.grid().history_size()) > 0);
+        menu(cx, "menu-clear");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.term.grid().history_size()),
+            0
+        );
     }
 
     #[gpui::test]
