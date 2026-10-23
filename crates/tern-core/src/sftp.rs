@@ -17,6 +17,10 @@ use crate::ssh::spawn;
 const CHUNK: usize = 32 * 1024;
 /// Folders on the host whose items are counted per listing, at most.
 const COUNT_AT_MOST: usize = 64;
+/// Where permission bits keep a file's type (`S_IFMT`).
+const TYPE: u32 = 0o170000;
+/// A folder's type there (`S_IFDIR`).
+const FOLDER: u32 = 0o040000;
 
 /// An SFTP session on a connection; clones share it.
 #[derive(Clone)]
@@ -120,7 +124,7 @@ impl Sftp {
                     let metadata = entry.metadata();
                     Entry {
                         name: entry.file_name(),
-                        dir: metadata.is_dir(),
+                        dir: is_folder(metadata.permissions),
                         size: metadata.len(),
                         items: None,
                         mode: metadata.permissions.map(|mode| mode & 0o7777),
@@ -313,7 +317,7 @@ async fn remove_remote(sftp: &SftpSession, path: String, dir: bool) -> Result<()
                 continue;
             }
             let child = join(&folder, &name);
-            if entry.metadata().is_dir() {
+            if is_folder(entry.metadata().permissions) {
                 pending.push((child, false));
             } else {
                 sftp.remove_file(child).await.map_err(failed)?;
@@ -321,6 +325,12 @@ async fn remove_remote(sftp: &SftpSession, path: String, dir: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Whether permission bits from the host are a folder's. The whole type is
+/// compared: a socket's and a block device's include a folder's bit.
+fn is_folder(mode: Option<u32>) -> bool {
+    mode.is_some_and(|mode| mode & TYPE == FOLDER)
 }
 
 /// The last part of an SFTP path.
@@ -526,6 +536,17 @@ mod tests {
         assert!(parse_mode("999").is_err());
         assert!(parse_mode("rwxrwxrwz").is_err());
         assert!(parse_mode("xw-r--r--").is_err());
+    }
+
+    #[test]
+    fn tells_folders_by_their_whole_type() {
+        assert!(is_folder(Some(0o040755)));
+        assert!(!is_folder(Some(0o140755)), "a socket");
+        assert!(!is_folder(Some(0o060660)), "a block device");
+        assert!(!is_folder(Some(0o100644)));
+        assert!(!is_folder(Some(0o120777)), "a link");
+        assert!(!is_folder(Some(0o755)), "no type at all");
+        assert!(!is_folder(None));
     }
 
     #[test]

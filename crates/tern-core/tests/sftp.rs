@@ -160,6 +160,17 @@ async fn copies_files_both_ways() {
     assert!(!served.join("new").exists());
     sftp.remove("/hello.txt", false).await.unwrap();
     assert!(!served.join("hello.txt").exists());
+    #[cfg(unix)]
+    {
+        // A socket's type includes a folder's bit, but it's no folder: a
+        // folder holding one deletes whole.
+        std::fs::create_dir(served.join("cm")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(served.join("cm").join("s")).unwrap();
+        let listed = sftp.list("/cm").await.unwrap();
+        assert!(!listed[0].dir, "{listed:?}");
+        sftp.remove("/cm", true).await.unwrap();
+        assert!(!served.join("cm").exists());
+    }
 
     // And on this computer.
     mkdir_local(&here.join("box")).unwrap();

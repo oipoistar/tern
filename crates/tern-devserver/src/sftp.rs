@@ -78,6 +78,28 @@ fn code(error: std::io::Error) -> StatusCode {
     }
 }
 
+/// What SFTP says about a file. On Unix that's its whole mode, type and
+/// all, as OpenSSH sends it; russh-sftp's conversion knows only folders and
+/// files, so a socket would pass for a file.
+fn attributes(metadata: &std::fs::Metadata) -> FileAttributes {
+    let converted = FileAttributes::from(metadata);
+    FileAttributes {
+        permissions: unix_mode(metadata).or(converted.permissions),
+        ..converted
+    }
+}
+
+#[cfg(unix)]
+fn unix_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(metadata.mode())
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
 impl russh_sftp::server::Handler for FsSftp {
     type Error = StatusCode;
 
@@ -101,7 +123,7 @@ impl russh_sftp::server::Handler for FsSftp {
         let metadata = std::fs::metadata(self.local(&path)).map_err(code)?;
         Ok(Attrs {
             id,
-            attrs: FileAttributes::from(&metadata),
+            attrs: attributes(&metadata),
         })
     }
 
@@ -113,7 +135,7 @@ impl russh_sftp::server::Handler for FsSftp {
         match self.open.get(&handle) {
             Some(Opened::File(file)) => Ok(Attrs {
                 id,
-                attrs: FileAttributes::from(&file.metadata().map_err(code)?),
+                attrs: attributes(&file.metadata().map_err(code)?),
             }),
             _ => Err(StatusCode::Failure),
         }
@@ -125,7 +147,7 @@ impl russh_sftp::server::Handler for FsSftp {
             let entry = entry.map_err(code)?;
             if let Ok(metadata) = entry.metadata() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                files.push(File::new(name, FileAttributes::from(&metadata)));
+                files.push(File::new(name, attributes(&metadata)));
             }
         }
         Ok(Handle {
