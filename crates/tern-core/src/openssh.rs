@@ -91,9 +91,9 @@ pub fn importable(vault: &Vault, text: &str, dir: &Path, user: &str) -> Vec<Host
 /// `hosts` minus those the vault, or one before them, already has at the
 /// same user, address and port. A name another host uses, in any case,
 /// becomes a free one: "web (OpenSSH)" for the `group` "OpenSSH", then
-/// "web (OpenSSH) 2" and so on. Jump hosts (named as in `hosts`, where
-/// no two hosts with jumps share a name) follow a rename, or lead to the
-/// host that was already there.
+/// "web (OpenSSH) 2" and so on. A jump to another of `hosts`, by a name
+/// no other of them has, follows its rename, or leads to the host that
+/// was already there.
 pub(crate) fn new_hosts(vault: &Vault, hosts: Vec<Host>, group: &str) -> Vec<Host> {
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut kept: Vec<Host> = Vec::new();
