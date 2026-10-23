@@ -69,6 +69,8 @@ pub enum VaultEvent {
         forward: Forward,
         on: bool,
     },
+    /// Open these side by side, as split panes.
+    OpenTogether(Vec<Connection>),
 }
 
 /// The screens the sidebar switches between.
@@ -220,6 +222,20 @@ impl VaultContent {
 
     /// Switches the screen beside the sidebar. Screens that show files
     /// read them again, for changes made meanwhile.
+    /// Shows the screen called `name` (`keychain`, `snippets`,
+    /// `forwarding`, `known-hosts`, `history`; anything else is Hosts).
+    pub fn show_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let section = match name {
+            "keychain" => Section::Keychain,
+            "snippets" => Section::Snippets,
+            "forwarding" => Section::Forwarding,
+            "known-hosts" => Section::KnownHosts,
+            "history" => Section::History,
+            _ => Section::Hosts,
+        };
+        self.show(section, window, cx);
+    }
+
     fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
         match section {
@@ -245,9 +261,13 @@ impl VaultContent {
                 }
             },
             Section::Snippets => {
+                let hosts: Vec<String> = self.vault.hosts().map(|host| host.name.clone()).collect();
+                if let Some(view) = &self.snippets {
+                    view.update(cx, |view, cx| view.set_hosts(hosts.clone(), cx));
+                }
                 if self.snippets.is_none() {
                     let saved = self.vault.snippets.clone();
-                    let view = cx.new(|cx| SnippetsView::new(saved, window, cx));
+                    let view = cx.new(|cx| SnippetsView::new(saved, hosts, window, cx));
                     self._screen_events.push(cx.subscribe_in(
                         &view,
                         window,
@@ -1054,6 +1074,22 @@ impl VaultContent {
                 }
             }
             SnippetEvent::Delete(name) => self.vault.delete_snippet(name),
+            // Each host's session types the snippet once its shell starts,
+            // after the host's own command.
+            SnippetEvent::Run { snippet, hosts } => {
+                let connections: Vec<Connection> = hosts
+                    .iter()
+                    .filter_map(|name| self.vault.find(name))
+                    .filter_map(|host| self.vault.connection(host).ok())
+                    .map(|mut connection| {
+                        connection.on_login =
+                            Some(snippet.after_login(connection.on_login.as_deref()));
+                        connection
+                    })
+                    .collect();
+                cx.emit(VaultEvent::OpenTogether(connections));
+                return;
+            }
         }
         self.persist(cx);
         let saved = self.vault.snippets.clone();
@@ -2089,6 +2125,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn runs_a_snippet_on_several_hosts(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        let together: Rc<RefCell<Vec<Connection>>> = Rc::default();
+        let seen = together.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&vault, move |_, event: &VaultEvent, _| {
+                if let VaultEvent::OpenTogether(connections) = event {
+                    *seen.borrow_mut() = connections.clone();
+                }
+            })
+            .detach()
+        });
+        click(cx, "nav-snippets");
+        let command = vault.read_with(cx, |vault, _| vault.vault.snippets[0].command.clone());
+
+        // Nothing chosen, nothing runs; then two hosts.
+        click(cx, "run-snippet-0");
+        click(cx, "run-snippet");
+        assert!(together.borrow().is_empty());
+        click(cx, "run-on-bastion");
+        click(cx, "run-on-prod-db-01");
+        click(cx, "run-on-prod-db-01");
+        click(cx, "run-on-prod-web-01");
+        click(cx, "run-snippet");
+        let connections = together.borrow().clone();
+        let hosts: Vec<String> = connections
+            .iter()
+            .map(|connection| connection.host.clone().unwrap())
+            .collect();
+        assert_eq!(hosts, ["bastion", "prod-web-01"]);
+        assert!(connections.iter().all(|connection| {
+            connection
+                .on_login
+                .as_deref()
+                .is_some_and(|typed| typed.ends_with(command.trim_end()))
+        }));
+        // The chooser closes once it runs.
+        assert!(cx.debug_bounds("run-snippet").is_none());
+    }
+
+    #[gpui::test]
     fn the_snippets_screen_adds_edits_and_deletes(cx: &mut TestAppContext) {
         let (vault, cx, _) = open_vault(cx);
         let type_into = |cx: &mut VisualTestContext, first: bool, text: &str| {
@@ -2273,7 +2350,7 @@ mod tests {
                     .borrow_mut()
                     .push((connection.host.clone().unwrap_or_default(), *files)),
                 VaultEvent::Forward { on, .. } => seen_switch.borrow_mut().push(*on),
-                VaultEvent::Connect(_) => {}
+                VaultEvent::Connect(_) | VaultEvent::OpenTogether(_) => {}
             })
             .detach()
         });

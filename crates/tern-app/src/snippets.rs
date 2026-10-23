@@ -18,6 +18,11 @@ pub enum SnippetEvent {
         snippet: Snippet,
     },
     Delete(String),
+    /// Run `snippet` on each of the saved `hosts`, side by side.
+    Run {
+        snippet: Snippet,
+        hosts: Vec<String>,
+    },
 }
 
 impl EventEmitter<SnippetEvent> for SnippetsView {}
@@ -31,9 +36,18 @@ struct Form {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Choosing hosts to run a snippet on.
+struct Run {
+    snippet: Snippet,
+    chosen: Vec<String>,
+}
+
 pub struct SnippetsView {
     /// The vault's snippets, as last saved.
     snippets: Vec<Snippet>,
+    /// The vault's hosts by name, to run snippets on.
+    hosts: Vec<String>,
+    run: Option<Run>,
     search: Entity<InputState>,
     query: SharedString,
     form: Option<Form>,
@@ -41,7 +55,12 @@ pub struct SnippetsView {
 }
 
 impl SnippetsView {
-    pub fn new(snippets: Vec<Snippet>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        snippets: Vec<Snippet>,
+        hosts: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe(&search, |this: &mut Self, search, event, cx| {
             if let InputEvent::Change = event {
@@ -51,6 +70,8 @@ impl SnippetsView {
         });
         Self {
             snippets,
+            hosts,
+            run: None,
             search,
             query: SharedString::default(),
             form: None,
@@ -63,6 +84,131 @@ impl SnippetsView {
         self.snippets = snippets;
         self.form = None;
         cx.notify();
+    }
+
+    /// Takes the vault's hosts after a change.
+    pub fn set_hosts(&mut self, hosts: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(run) = &mut self.run {
+            run.chosen.retain(|name| hosts.contains(name));
+        }
+        self.hosts = hosts;
+        cx.notify();
+    }
+
+    /// Hosts to run `snippet` on, picked from a list; Run opens them side
+    /// by side.
+    fn run_card(&self, run: &Run, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let count = run.chosen.len();
+        div()
+            .p(px(14.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .rounded(px(22.))
+            .bg(t.card)
+            .shadow(t.shadow())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(icon(IconName::Play, 15., t.text))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(run.snippet.name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .children(self.hosts.iter().map(|host| {
+                        let on = run.chosen.contains(host);
+                        let id = format!("run-on-{host}");
+                        let name = host.clone();
+                        div()
+                            .id(SharedString::from(id.clone()))
+                            .debug_selector(move || id)
+                            .h(px(32.))
+                            .px(px(12.))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(if on { t.text } else { t.line })
+                            .bg(if on { t.text } else { t.card })
+                            .text_color(if on { t.card } else { t.text })
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .child(host.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(run) = &mut this.run {
+                                    match run.chosen.iter().position(|have| *have == name) {
+                                        Some(at) => {
+                                            run.chosen.remove(at);
+                                        }
+                                        None => run.chosen.push(name.clone()),
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(
+                        ink_button("run-snippet", t)
+                            .debug_selector(|| "run-snippet".into())
+                            .h(px(38.))
+                            .px(px(16.))
+                            .rounded(px(12.))
+                            .text_size(px(13.))
+                            .when(count == 0, |d| d.opacity(0.4))
+                            .child(icon(IconName::Play, 14., t.card))
+                            .child(if count > 1 {
+                                format!("Run on {count}")
+                            } else {
+                                "Run".to_string()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(run) = this.run.take() else {
+                                    return;
+                                };
+                                if run.chosen.is_empty() {
+                                    this.run = Some(run);
+                                    return;
+                                }
+                                cx.emit(SnippetEvent::Run {
+                                    snippet: run.snippet,
+                                    hosts: run.chosen,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("cancel-run", t)
+                            .debug_selector(|| "cancel-run".into())
+                            .h(px(38.))
+                            .px(px(16.))
+                            .rounded(px(12.))
+                            .text_size(px(13.))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     /// The form's name field (`first`) or command field.
@@ -223,6 +369,8 @@ impl SnippetsView {
     ) -> impl IntoElement {
         let id = format!("snippet-row-{index}");
         let name = snippet.name.clone();
+        let to_run = snippet.clone();
+        let run_id = format!("run-snippet-{index}");
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
@@ -273,6 +421,30 @@ impl SnippetsView {
                             .child(snippet.command.clone()),
                     ),
             )
+            .child(
+                div()
+                    .id(SharedString::from(run_id.clone()))
+                    .debug_selector(move || run_id)
+                    .size(px(34.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(t.line)
+                    .hover(|d| d.bg(t.card2))
+                    .child(icon(IconName::Play, 14., t.text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.form = None;
+                        this.run = Some(Run {
+                            snippet: to_run.clone(),
+                            chosen: Vec::new(),
+                        });
+                        cx.notify();
+                    })),
+            )
             .child(icon(IconName::Pencil, 15., t.text3))
     }
 }
@@ -314,6 +486,9 @@ impl Render for SnippetsView {
             )
             .when_some(self.form.as_ref(), |d, form| {
                 d.child(self.form_card(form, t, cx))
+            })
+            .when_some(self.run.as_ref(), |d, run| {
+                d.child(self.run_card(run, t, cx))
             })
             .children(
                 self.snippets

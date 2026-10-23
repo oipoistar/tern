@@ -141,6 +141,11 @@ claude.ai account). Each item below names the artboard it comes from.
       One Dark, Tokyo Night, Monokai and GitHub Light); terminals, the
       vault's previews and key art repaint at once, and the choice syncs
       with the other settings
+- [x] Run a snippet on several hosts: a play button on each snippet
+      opens a list of hosts to pick; Run opens them side by side, four
+      panes to a tab, each typing the snippet once its shell starts
+      (after the host's own command). tern --show <screen> opens the
+      vault at a screen
 
 ## Known gaps in what's built
 

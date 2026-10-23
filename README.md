@@ -26,6 +26,7 @@ cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at
 cargo run -p tern-app -- --local                              # open a local terminal at start
 cargo run -p tern-app -- --edit prod-db-01                    # open the host editor (a new host without a name)
 cargo run -p tern-app -- --settings sync                      # open Settings at a page
+cargo run -p tern-app -- --show snippets                      # open the vault at a screen
 ```
 
 The quick-connect field in the vault accepts the same `ssh …` commands

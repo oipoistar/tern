@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         LayoutGrid,
         List,
         Lock,
+        Play,
         Maximize2,
         Minimize2,
         Pencil,

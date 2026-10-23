@@ -39,6 +39,20 @@ impl Snippet {
         text.into_bytes()
     }
 
+    /// The command as one line for a shell to run after login, lines
+    /// joined by returns; `after` (a host's own command) goes first.
+    pub fn after_login(&self, after: Option<&str>) -> String {
+        let typed = self
+            .command
+            .trim_end_matches(['\r', '\n'])
+            .replace("\r\n", "\n")
+            .replace('\n', "\r");
+        match after {
+            Some(first) if !first.trim().is_empty() => format!("{first}\r{typed}"),
+            _ => typed,
+        }
+    }
+
     /// Whether every whitespace-separated term of `query` appears
     /// (case-insensitively) in the name or command.
     pub fn matches(&self, query: &str) -> bool {
@@ -88,6 +102,14 @@ mod tests {
 
     fn snippet(name: &str, command: &str) -> Snippet {
         Snippet::new(name, command)
+    }
+
+    #[test]
+    fn runs_after_a_hosts_own_command() {
+        let disk = snippet("disk", "df -h\nuptime\n");
+        assert_eq!(disk.after_login(None), "df -h\ruptime");
+        assert_eq!(disk.after_login(Some("cd /srv")), "cd /srv\rdf -h\ruptime");
+        assert_eq!(disk.after_login(Some("  ")), "df -h\ruptime");
     }
 
     fn named(result: Result<Snippet, String>) -> Result<(String, String), String> {

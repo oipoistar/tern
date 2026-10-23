@@ -140,6 +140,16 @@ impl Workspace {
             };
             workspace.open_settings(page, window, cx);
         }
+        // `tern --show [keychain|snippets|forwarding|known-hosts|history]`
+        // opens the vault at that screen.
+        let mut args = std::env::args().skip_while(|arg| arg != "--show");
+        if args.next().is_some()
+            && let Some(screen) = args.next()
+        {
+            workspace
+                .vault
+                .update(cx, |vault, cx| vault.show_named(&screen, window, cx));
+        }
         workspace
     }
 
@@ -162,6 +172,9 @@ impl Workspace {
                     }
                     VaultEvent::Open { connection, files } => {
                         this.show_session(connection.clone(), *files, window, cx)
+                    }
+                    VaultEvent::OpenTogether(connections) => {
+                        this.open_together(connections.clone(), window, cx)
                     }
                     VaultEvent::Forward { host, forward, on } => {
                         for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
@@ -205,6 +218,38 @@ impl Workspace {
             _settings_events: None,
             _ticker: ticker,
             _subscriptions: vec![connect, appearance],
+        }
+    }
+
+    /// Opens `connections` side by side, four panes to a tab, and shows
+    /// the first of those tabs.
+    fn open_together(
+        &mut self,
+        connections: Vec<Connection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_terminal = self.new_terminal;
+        let first = self.tabs.len();
+        for group in connections.chunks(4) {
+            let panes: Vec<Entity<TerminalView>> = group
+                .iter()
+                .map(|connection| cx.new(|cx| new_terminal(connection.clone(), cx)))
+                .collect();
+            for pane in &panes {
+                self.watch(pane, cx);
+            }
+            self.tabs.push(Tab {
+                panes,
+                focused: 0,
+                maximized: None,
+                broadcast: false,
+                files: None,
+                files_open: false,
+            });
+        }
+        if self.tabs.len() > first {
+            self.activate(Some(first), window, cx);
         }
     }
 
@@ -1176,7 +1221,7 @@ mod tests {
     use super::Workspace;
     use crate::live::LiveSlots;
     use crate::terminal::TerminalView;
-    use crate::vault::VaultContent;
+    use crate::vault::{VaultContent, VaultEvent};
 
     /// Panes that don't connect.
     fn offline(connection: Connection, cx: &mut Context<TerminalView>) -> TerminalView {
@@ -1257,6 +1302,41 @@ mod tests {
         assert_eq!(active(cx), None);
         cx.simulate_keystrokes("ctrl-shift-tab");
         assert_eq!(active(cx), Some(2));
+    }
+
+    #[gpui::test]
+    fn opens_hosts_together_four_to_a_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        let connections: Vec<Connection> = (0..5)
+            .map(|n| {
+                Connection::typed(
+                    tern_core::ssh::Target {
+                        host: format!("node-{n}"),
+                        port: 22,
+                        user: "ops".into(),
+                    },
+                    None,
+                )
+            })
+            .collect();
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .vault
+                .update(cx, |_, cx| cx.emit(VaultEvent::OpenTogether(connections)))
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            // The first tab was already there.
+            let panes: Vec<usize> = workspace.tabs.iter().map(|tab| tab.panes.len()).collect();
+            assert_eq!(panes, [1, 4, 1]);
+            assert_eq!(workspace.active, Some(1));
+            let hosts: Vec<String> = workspace.tabs[1]
+                .panes
+                .iter()
+                .map(|pane| pane.read(cx).connection().target.host.clone())
+                .collect();
+            assert_eq!(hosts, ["node-0", "node-1", "node-2", "node-3"]);
+        });
     }
 
     #[gpui::test]
