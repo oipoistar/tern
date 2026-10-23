@@ -229,6 +229,13 @@ claude.ai account). Each item below names the artboard it comes from.
       if the host's file changed meanwhile, one line asks first
       (Replace or Cancel). The button stays inked while the file is
       being edited
+- [x] Ports the host opens: a live session to a Linux host reads its
+      /proc over SFTP every few seconds (nothing runs in the shell), and
+      the toolbar offers each port that started listening since the
+      pane's first session as an outlined :port; a click forwards it to
+      the same port here (inked; then a click opens it in the browser,
+      and its stop ends forwarding), a failure draws the danger outline,
+      and a port that closes goes with its forward
 
 ## Known gaps in what's built
 

@@ -18,6 +18,7 @@ pub mod links;
 pub mod local;
 pub mod openssh;
 pub mod paths;
+pub mod probe;
 pub mod proxy;
 pub mod putty;
 pub mod randomart;

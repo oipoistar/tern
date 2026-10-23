@@ -13,11 +13,11 @@
 //! while Shift is held, which keeps it for selecting.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Range, RangeInclusive};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -34,8 +34,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tern_core::forward::{Forward, ForwardState};
+use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
+use tern_core::probe::{self, Listening, Vitals};
 use tern_core::reconnect;
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
@@ -61,6 +62,9 @@ const PREVIEW_LINES: i32 = 9;
 /// whose old lines move into the scrollback.
 const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\
 \x1b[?1l\x1b>\x1b[?2004l\x1b[?25h\x1b[0m\x1b[r\x1b[2J\x1b[H";
+
+/// How often a live session reads the host's `/proc`.
+const PROBE_EVERY: Duration = Duration::from_secs(5);
 
 /// The last lines of a session, shared with the vault's side panel.
 pub type Preview = Rc<RefCell<Vec<String>>>;
@@ -100,6 +104,12 @@ enum Held {
     Paste(String),
     /// A snippet, or a command run from elsewhere, for a guarded host.
     Run(Vec<u8>),
+}
+
+/// The rule forwarding a port the host opened to the same port here.
+fn port_forward(open: &Listening) -> Option<Forward> {
+    let to = format!("{}:{}", open.host, open.port);
+    Forward::typed(ForwardKind::Local, &open.port.to_string(), &to).ok()
 }
 
 /// The slots of kept shells that open panes hold, by host.
@@ -144,6 +154,18 @@ pub struct TerminalView {
     /// The name of the shell kept running on the host for this pane, when
     /// the host keeps them.
     shell: Option<String>,
+    /// The ports listening on the host when the pane's first session began,
+    /// the ones opened since, and those forwarded here from the toolbar,
+    /// each with how it's doing (`None` while starting).
+    ports_before: Option<Vec<Listening>>,
+    ports: Vec<Listening>,
+    forwarded: BTreeMap<u16, (Forward, Option<ForwardState>)>,
+    /// The host's recent load, memory and disk use.
+    vitals: Vitals,
+    _probing: Option<Task<()>>,
+    /// Port forwarding asked of the session, for tests.
+    #[cfg(test)]
+    pub forwards_asked: Vec<(Forward, bool)>,
     _events: Option<Task<()>>,
     term: Term<Listener>,
     parser: Processor,
@@ -288,6 +310,129 @@ impl TerminalView {
         })
         .detach();
         Some(name)
+    }
+
+    /// Reads the host's `/proc` over SFTP every few seconds while the
+    /// session is live: the ports it listens on and its vitals. A host
+    /// without SFTP or `/proc` (not Linux) shows neither.
+    fn probe(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = &self.input else {
+            return;
+        };
+        let opening = input.open_sftp();
+        self._probing = Some(cx.spawn(async move |this, cx| {
+            let Ok(sftp) = opening.await else {
+                return;
+            };
+            let Ok(cpuinfo) = sftp.read_text("/proc/cpuinfo").await else {
+                return;
+            };
+            let cpus = probe::cpus(&cpuinfo).max(1);
+            loop {
+                let mut tables = sftp.read_text("/proc/net/tcp").await.unwrap_or_default();
+                // tcp6's header line isn't a listening port either.
+                tables += &sftp.read_text("/proc/net/tcp6").await.unwrap_or_default();
+                let read = |text: Result<String, String>, parse: fn(&str) -> Option<f32>| {
+                    text.ok().and_then(|text| parse(&text))
+                };
+                let load = read(sftp.read_text("/proc/loadavg").await, probe::load);
+                let memory = read(sftp.read_text("/proc/meminfo").await, probe::memory);
+                let disk = sftp.disk_use("/").await.ok().flatten();
+                let listening = probe::listening(&tables);
+                if this
+                    .update(cx, |this, cx| {
+                        this.probed(cpus, listening, load, memory, disk, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(PROBE_EVERY).await;
+            }
+        }));
+    }
+
+    /// Takes in one reading of the host's `/proc`.
+    pub(crate) fn probed(
+        &mut self,
+        cpus: usize,
+        listening: Vec<Listening>,
+        load: Option<f32>,
+        memory: Option<f32>,
+        disk: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.vitals.cpus = cpus;
+        self.vitals.push(load, memory, disk);
+        let before = self.ports_before.get_or_insert_with(|| listening.clone());
+        self.ports = probe::opened(before, &listening);
+        // A port that closed takes its forward with it.
+        let closed: Vec<u16> = self
+            .forwarded
+            .keys()
+            .copied()
+            .filter(|port| !self.ports.iter().any(|open| open.port == *port))
+            .collect();
+        for port in closed {
+            if let Some((forward, _)) = self.forwarded.remove(&port) {
+                self.ask_forward(forward, false);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stops reading the host's `/proc`; the session ended, and its
+    /// forwards with it.
+    fn end_probe(&mut self) {
+        self._probing = None;
+        self.forwarded.clear();
+    }
+
+    /// The ports the host opened since the pane's first session, each with
+    /// how it's forwarded here: not at all (`None`), starting
+    /// (`Some(None)`), or its state.
+    pub fn opened_ports(&self) -> Vec<(u16, Option<Option<ForwardState>>)> {
+        self.ports
+            .iter()
+            .map(|open| {
+                let forwarded = self.forwarded.get(&open.port);
+                (open.port, forwarded.map(|(_, state)| state.clone()))
+            })
+            .collect()
+    }
+
+    /// Forwards a port the host opened to the same port here, or stops
+    /// forwarding it; one that failed is tried again.
+    pub fn toggle_port(&mut self, port: u16, cx: &mut Context<Self>) {
+        let Some(forward) = self
+            .ports
+            .iter()
+            .find(|open| open.port == port)
+            .and_then(port_forward)
+        else {
+            return;
+        };
+        match self.forwarded.remove(&port) {
+            Some((asked, None | Some(ForwardState::Running))) => self.ask_forward(asked, false),
+            _ => {
+                self.ask_forward(forward.clone(), true);
+                self.forwarded.insert(port, (forward, None));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens a port forwarded here in the browser.
+    pub fn open_port(port: u16, cx: &mut App) {
+        cx.open_url(&format!("http://localhost:{port}/"));
+    }
+
+    fn ask_forward(&mut self, forward: Forward, on: bool) {
+        #[cfg(test)]
+        self.forwards_asked.push((forward.clone(), on));
+        if let Some(input) = &self.input {
+            input.forward(forward, on);
+        }
     }
 
     /// Ends the shell kept on the host for good, as the pane is closed by
@@ -438,6 +583,13 @@ impl TerminalView {
             input: None,
             sessions: 0,
             shell: None,
+            ports_before: None,
+            ports: Vec::new(),
+            forwarded: BTreeMap::new(),
+            vitals: Vitals::default(),
+            _probing: None,
+            #[cfg(test)]
+            forwards_asked: Vec::new(),
             _events: None,
             term: Term::new(config, &GridSize(size), Listener(term_events.clone())),
             parser: Processor::new(),
@@ -603,6 +755,9 @@ impl TerminalView {
             Event::Connected => {
                 let reattached = self.had_shell && self.shell.is_some();
                 self.phase = Phase::Live;
+                if !self.connection.local {
+                    self.probe(cx);
+                }
                 self.live_since = Some(Instant::now());
                 self.reconnect = None;
                 if self.had_shell {
@@ -645,7 +800,25 @@ impl TerminalView {
                 }
             }
             Event::Forwarding { forward, state } => {
-                if let Some(host) = self.connection.host.clone() {
+                let port = forward.listen_port;
+                let ours = self
+                    .forwarded
+                    .get(&port)
+                    .is_some_and(|(asked, _)| asked.id() == forward.id())
+                    || self
+                        .ports
+                        .iter()
+                        .filter_map(port_forward)
+                        .any(|ours| ours.id() == forward.id());
+                if ours {
+                    // One of the ports the host opened, forwarded from the
+                    // toolbar.
+                    if let Some(entry) = self.forwarded.get_mut(&port)
+                        && state != ForwardState::Stopped
+                    {
+                        entry.1 = Some(state);
+                    }
+                } else if let Some(host) = self.connection.host.clone() {
                     cx.emit(TerminalEvent::Forwarding {
                         host,
                         forward,
@@ -655,6 +828,7 @@ impl TerminalView {
             }
             Event::Closed { exit_status } => {
                 self.input = None;
+                self.end_probe();
                 let message = match exit_status {
                     Some(status) => format!("Exited with status {status}").into(),
                     None => "Connection closed".into(),
@@ -663,6 +837,7 @@ impl TerminalView {
             }
             Event::Lost => {
                 self.input = None;
+                self.end_probe();
                 cx.emit(TerminalEvent::Finished(self.visit("Connection lost")));
                 self.live_since = None;
                 self.retry(1, cx);

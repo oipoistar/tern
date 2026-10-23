@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_kit::{AppContext as _, Entity};
+use tern_core::forward::ForwardState;
 use tern_core::ssh::{Connection, Target};
 use tern_core::{Auth, Host, Vault};
 
@@ -249,6 +250,39 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         panel.update(cx, |panel, cx| panel.confirm(cx));
         until(cx, "the copy replaced it", |_| on_host() == "four");
         println!("ok    a host's file edited here goes back, asking after a change there");
+
+        // A port the session opens is offered, forwarded here in a click,
+        // and goes when it closes.
+        shell(
+            &view,
+            cx,
+            "python3 -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 & echo served-$((5+6))",
+            "served-11",
+        );
+        let offered = |view: &TerminalView| {
+            view.opened_ports()
+                .into_iter()
+                .find(|(port, _)| *port == 18765)
+        };
+        wait(&view, cx, "the port offered", |view| {
+            offered(view).is_some()
+        });
+        view.update(cx, |view, cx| view.toggle_port(18765, cx));
+        wait(&view, cx, "the port forwarded", |view| {
+            offered(view) == Some((18765, Some(Some(ForwardState::Running))))
+        });
+        let page = {
+            use std::io::{Read as _, Write as _};
+            let mut stream = std::net::TcpStream::connect("127.0.0.1:18765").expect("forwarded");
+            stream.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+            let mut page = String::new();
+            stream.read_to_string(&mut page).unwrap();
+            page
+        };
+        assert!(page.contains("Directory listing"), "{page}");
+        shell(&view, cx, "kill %1; echo stopped-$((6+6))", "stopped-12");
+        wait(&view, cx, "the port gone", |view| offered(view).is_none());
+        println!("ok    a port the session opens is forwarded here in a click");
     }
 
     // A kept shell: the server ends the connection, the pane reconnects by

@@ -285,6 +285,40 @@ impl Sftp {
         })
     }
 
+    /// The host's small file `path` as text, at most a mebibyte of it: for
+    /// files like `/proc`'s, whose size says nothing.
+    pub fn read_text(&self, path: &str) -> impl Future<Output = Result<String, String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move {
+            let mut file = sftp.open(path).await.map_err(|error| error.to_string())?;
+            let mut text = Vec::new();
+            (&mut file)
+                .take(1 << 20)
+                .read_to_end(&mut text)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(String::from_utf8_lossy(&text).into_owned())
+        })
+    }
+
+    /// The share of the file system holding `path` in use, 0 to 1, when
+    /// the server says (OpenSSH's statvfs extension).
+    pub fn disk_use(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Result<Option<f32>, String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move {
+            let info = sftp
+                .fs_info(path)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(info.and_then(|info| {
+                crate::probe::disk(info.blocks, info.blocks_free, info.blocks_avail)
+            }))
+        })
+    }
+
     /// The host's file `path` as it is now; its time is in seconds.
     pub fn stamp(&self, path: &str) -> impl Future<Output = Result<Stamp, String>> + 'static {
         let (sftp, path) = (self.0.clone(), path.to_string());

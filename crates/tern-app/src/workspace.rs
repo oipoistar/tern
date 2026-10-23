@@ -14,6 +14,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::HostStatus;
+use tern_core::forward::ForwardState;
 use tern_core::restore::{OpenTabs, Opened};
 use tern_core::snippet::Snippet;
 use tern_core::ssh::{Connection, parse_command};
@@ -1293,8 +1294,79 @@ impl Workspace {
             .update(cx, |vault, cx| vault.new_snippet(window, cx));
     }
 
-    /// Over the panes: the focused host with its latency trace, the layout
-    /// and Broadcast.
+    /// The ports the focused host opened during the session: outlined
+    /// until forwarded here, inked while forwarded (opening the browser,
+    /// with a stop), a danger outline when forwarding failed. It fills the
+    /// toolbar's middle.
+    fn opened_ports(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let pane = tab.focused().clone();
+        let ports = pane.read(cx).opened_ports();
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .overflow_hidden()
+            .children(ports.into_iter().map(|(port, forwarded)| {
+                let running = matches!(forwarded, Some(Some(ForwardState::Running)));
+                let failed = matches!(forwarded, Some(Some(ForwardState::Failed(_))));
+                let starting = matches!(forwarded, Some(None));
+                let (id, stop) = (format!("port-{port}"), format!("port-stop-{port}"));
+                let (to_toggle, to_stop) = (pane.clone(), pane.clone());
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id)
+                    .h(px(28.))
+                    .pl(px(10.))
+                    .pr(px(if running { 4. } else { 10. }))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.))
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(if failed {
+                        theme.danger
+                    } else if running || starting {
+                        theme.text
+                    } else {
+                        theme.line
+                    })
+                    .when(running, |d| d.bg(theme.text).text_color(theme.card))
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(format!(":{port}"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if running {
+                            TerminalView::open_port(port, cx);
+                        } else {
+                            to_toggle.update(cx, |pane, cx| pane.toggle_port(port, cx));
+                        }
+                    }))
+                    .when(running, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(stop.clone()))
+                                .debug_selector(move || stop)
+                                .size(px(20.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .child(icon(IconName::Close, 11., theme.card))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    to_stop.update(cx, |pane, cx| pane.toggle_port(port, cx));
+                                })),
+                        )
+                    })
+            }))
+    }
+
+    /// Over the panes: the focused host with its latency trace, the ports
+    /// it opened, the layout and Broadcast.
     fn toolbar(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let focused = tab.focused().read(cx);
         let local = focused.connection().local;
@@ -1356,7 +1428,7 @@ impl Workspace {
                 )
                 .child(div().font_family(MONO).text_size(px(12.)).child(latency))
             })
-            .child(div().flex_1())
+            .child(self.opened_ports(tab, theme, cx))
             .child(
                 div()
                     .flex()
@@ -2309,6 +2381,64 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn forwards_the_ports_a_host_opens_in_a_click(cx: &mut TestAppContext) {
+        use tern_core::forward::ForwardState;
+        use tern_core::probe::Listening;
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        let at = |port: u16| Listening {
+            port,
+            host: "localhost".into(),
+        };
+        let probed = |cx: &mut VisualTestContext, ports: Vec<Listening>| {
+            pane.update(cx, |pane, cx| {
+                pane.probed(2, ports, Some(0.5), Some(0.4), Some(0.7), cx)
+            });
+            cx.run_until_parked();
+        };
+        let asked = |cx: &mut VisualTestContext| {
+            pane.update(cx, |pane, _| std::mem::take(&mut pane.forwards_asked))
+        };
+
+        // What listened at first isn't offered; what opens later is.
+        probed(cx, vec![at(22)]);
+        probed(cx, vec![at(22), at(3000)]);
+        assert!(cx.debug_bounds("port-22").is_none());
+        click(cx, "port-3000");
+        let forward = match asked(cx).as_slice() {
+            [(forward, true)] => forward.clone(),
+            other => panic!("asked {other:?}"),
+        };
+        assert_eq!(
+            (
+                forward.listen_port,
+                forward.to_host.as_str(),
+                forward.to_port
+            ),
+            (3000, "localhost", 3000)
+        );
+
+        // Forwarded: the chip opens the page, its stop ends it.
+        pane.update(cx, |pane, cx| {
+            let state = ForwardState::Running;
+            pane.on_session_event(Event::Forwarding { forward, state }, cx)
+        });
+        click(cx, "port-3000");
+        assert_eq!(cx.opened_url().as_deref(), Some("http://localhost:3000/"));
+        click(cx, "port-stop-3000");
+        assert!(matches!(asked(cx).as_slice(), [(_, false)]));
+
+        // A port that closes goes, and its forward with it.
+        click(cx, "port-3000");
+        assert!(matches!(asked(cx).as_slice(), [(_, true)]));
+        probed(cx, vec![at(22)]);
+        assert!(cx.debug_bounds("port-3000").is_none());
+        assert!(matches!(asked(cx).as_slice(), [(_, false)]));
     }
 
     #[gpui::test]
