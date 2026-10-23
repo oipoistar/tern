@@ -15,7 +15,7 @@ use russh::keys::ssh_key::certificate::CertType;
 use russh::keys::{Certificate, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Msg, Server as _, Session as ServerSession};
 use russh::{Channel, ChannelId};
-use tern_core::ssh::{ConnectRequest, Credential, Event, Session, Target, TermSize};
+use tern_core::ssh::{ConnectRequest, Credential, Event, Session, Target, TermSize, Trusted};
 use tern_devserver::sftp::FsSftp;
 use tokio::net::TcpListener;
 
@@ -458,7 +458,13 @@ pub fn request(
         jumps: Vec::new(),
         proxy: None,
         size: TermSize { cols: 80, rows: 24 },
-        trust,
+        // The test server's key, for the server, which jump hosts here are
+        // too.
+        trust: trust.map(|key| Trusted {
+            host: "127.0.0.1".into(),
+            port,
+            key,
+        }),
         keep_alive: true,
         forwards: Vec::new(),
         agent_forwarding: false,

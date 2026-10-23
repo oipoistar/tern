@@ -13,7 +13,9 @@
 use std::time::Duration;
 
 use tern_core::Auth;
-use tern_core::ssh::{ConnectError, Connection, Event, Jump, Session, TermSize, parse_command};
+use tern_core::ssh::{
+    ConnectError, Connection, Event, Jump, Session, TermSize, Trusted, parse_command,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -88,12 +90,16 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(Event::Failed(ConnectError::UnknownHostKey {
                 host,
+                port,
                 key,
                 fingerprint,
-                ..
-            })) if trust_unknown && trust.is_none() => {
-                eprintln!("trusting host key {fingerprint} for {host}");
-                trust = Some(*key);
+            })) if trust_unknown => {
+                eprintln!("trusting host key {fingerprint} for {host}:{port}");
+                trust = Some(Trusted {
+                    host,
+                    port,
+                    key: *key,
+                });
             }
             Some(Event::Failed(error)) => anyhow::bail!("{error}"),
             other => anyhow::bail!("unexpected {other:?}"),

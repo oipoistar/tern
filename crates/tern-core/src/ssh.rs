@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,16 @@ use crate::sftp::{self, Sftp};
 
 /// A server's host key, as offered for the user to trust.
 pub type HostKey = PublicKey;
+
+/// A host key the user has just accepted, and the host they accepted it
+/// for: it vouches for that host only, even if another host on the way
+/// shows the same key (a cloned machine), as OpenSSH asks for each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trusted {
+    pub host: String,
+    pub port: u16,
+    pub key: HostKey,
+}
 
 /// Terminal type announced to the server.
 const TERM: &str = "xterm-256color";
@@ -73,9 +84,9 @@ pub struct ConnectRequest {
     /// Reach the first hop through this proxy.
     pub proxy: Option<Proxy>,
     pub size: TermSize,
-    /// A host key the user has just accepted, for the target or the jump
+    /// A host key the user has just accepted, for the target or a jump
     /// host. It's saved to Tern's known hosts once that host is verified.
-    pub trust: Option<PublicKey>,
+    pub trust: Option<Trusted>,
     /// Ping idle connections so routers and firewalls keep them open.
     pub keep_alive: bool,
     /// Port forwarding rules to start once signed in.
@@ -182,7 +193,7 @@ impl Connection {
         &self,
         size: TermSize,
         password: Option<&str>,
-        trust: Option<HostKey>,
+        trust: Option<Trusted>,
         jump_password: impl Fn(&Jump) -> Option<String>,
     ) -> ConnectRequest {
         ConnectRequest {
@@ -324,6 +335,9 @@ pub struct Prompts {
 
 /// How many rounds of questions a sign-in may take before Tern gives up.
 const MAX_PROMPT_ROUNDS: usize = 8;
+
+/// How long a shell's exit status may take to follow the end of its output.
+const EXIT_STATUS_WAIT: Duration = Duration::from_secs(2);
 
 /// Whether a hidden question asks for the account's password, rather than
 /// a one-time code or a new password (an expired one asks for both).
@@ -683,20 +697,36 @@ async fn run(
     channel.request_shell(true).await.map_err(other)?;
     let (mut reader, writer) = channel.split();
 
+    // OpenSSH sends the shell's exit status after the end of its output, so
+    // the end waits for it, or for the channel to close; a server that does
+    // neither gets a moment.
+    let mut ended: Option<Pin<Box<tokio::time::Sleep>>> = None;
     loop {
         tokio::select! {
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     let _ = events.send(Event::Output(data.to_vec()));
                 }
-                Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => break,
+                Some(ChannelMsg::ExitStatus { exit_status: status }) => {
+                    exit_status = Some(status);
+                    if ended.is_some() {
+                        break;
+                    }
+                }
+                Some(ChannelMsg::Eof) => {
+                    if exit_status.is_some() {
+                        break;
+                    }
+                    ended = Some(Box::pin(tokio::time::sleep(EXIT_STATUS_WAIT)));
+                }
+                Some(ChannelMsg::Close) => break,
                 None => {
-                    lost = true;
+                    lost = ended.is_none();
                     break;
                 }
                 Some(_) => {}
             },
+            _ = async { ended.as_mut().expect("armed").await }, if ended.is_some() => break,
             command = inbox.recv() => match command {
                 Some(Input::Data(bytes)) => {
                     if writer.data(&bytes[..]).await.is_err() {
@@ -761,7 +791,7 @@ async fn finish(
 async fn open(
     keep_alive: bool,
     target: &Target,
-    trust: Option<PublicKey>,
+    trust: Option<Trusted>,
     tunnel: Option<ChannelStream<client::Msg>>,
     proxy: Option<Proxy>,
     remote: RemoteTargets,
@@ -780,7 +810,10 @@ async fn open(
     let handler = Verifier {
         host: target.host.clone(),
         port: target.port,
-        trust,
+        // Only the host it was accepted for.
+        trust: trust
+            .filter(|trusted| trusted.host == target.host && trusted.port == target.port)
+            .map(|trusted| trusted.key),
         authorities,
         verdict: verdict.clone(),
         remote,
@@ -1282,9 +1315,9 @@ where
 /// usual key files that exist.
 pub fn default_credentials() -> Vec<Credential> {
     let mut credentials = vec![Credential::Agent];
-    if let Some(home) = std::env::home_dir() {
+    if let Some(dir) = crate::paths::ssh_dir() {
         for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-            let path = home.join(".ssh").join(name);
+            let path = dir.join(name);
             if path.exists() {
                 credentials.push(Credential::KeyFile {
                     path,

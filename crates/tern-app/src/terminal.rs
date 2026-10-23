@@ -39,7 +39,7 @@ use tern_core::reconnect;
 use tern_core::settings::{Bell, CursorStyle, TerminalSettings};
 use tern_core::sftp::Sftp;
 use tern_core::ssh::{
-    ConnectError, Connection, Event, HostKey, Prompts, Session, SessionInput, TermSize,
+    ConnectError, Connection, Event, Prompts, Session, SessionInput, TermSize, Trusted,
 };
 
 use crate::settings;
@@ -71,8 +71,10 @@ pub enum Phase {
     /// A server's key is unknown (the target's, or the jump host's);
     /// waiting for the user to trust it.
     Trust {
-        host: SharedString,
-        key: HostKey,
+        /// The host as the card names it.
+        shown: SharedString,
+        /// The host and its key, to trust for it alone.
+        host: Trusted,
         fingerprint: SharedString,
     },
     /// Key-based login failed; collecting a password.
@@ -119,7 +121,7 @@ pub struct TerminalView {
     /// What's typed here goes to the tab's other panes too.
     pub broadcasting: bool,
     password: Option<String>,
-    trust: Option<HostKey>,
+    trust: Option<Trusted>,
     pub phase: Phase,
     input: Option<SessionInput>,
     _events: Option<Task<()>>,
@@ -572,8 +574,8 @@ impl TerminalView {
                 self.reconnect = None;
                 match error {
                     ConnectError::UnknownHostKey { host, port, key, fingerprint } => self.phase = Phase::Trust {
-                        host: if port == 22 { host.into() } else { format!("{host}:{port}").into() },
-                        key: *key,
+                        shown: if port == 22 { host.clone().into() } else { format!("{host}:{port}").into() },
+                        host: Trusted { host, port, key: *key },
                         fingerprint: fingerprint.into(),
                     },
                     ConnectError::AuthFailed { .. } => self.phase = Phase::Password { typed: String::new(), rejected: self.password.is_some() },
@@ -701,8 +703,8 @@ impl TerminalView {
     }
 
     fn trust_and_connect(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Trust { key, .. } = &self.phase {
-            self.trust = Some(key.clone());
+        if let Phase::Trust { host, .. } = &self.phase {
+            self.trust = Some(host.clone());
             self.connect(cx);
         }
     }
@@ -1757,9 +1759,9 @@ impl TerminalView {
             Phase::Connecting if self.connection.local => card(self.label(), None),
             Phase::Connecting => card(target.into(), None),
             Phase::Trust {
-                host, fingerprint, ..
+                shown, fingerprint, ..
             } => card(
-                format!("Trust {host}?").into(),
+                format!("Trust {shown}?").into(),
                 Some(
                     div()
                         .flex()

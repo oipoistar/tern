@@ -89,7 +89,8 @@ pub fn importable(vault: &Vault, text: &str, dir: &Path, user: &str) -> Vec<Host
 }
 
 /// `hosts` minus those the vault, or one before them, already has at the
-/// same user, address and port. A name another host uses, in any case,
+/// same user, address and port, reached the same way. A name another host
+/// uses, in any case,
 /// becomes a free one: "web (OpenSSH)" for the `group` "OpenSSH", then
 /// "web (OpenSSH) 2" and so on. A jump to another of `hosts`, by a name
 /// no other of them has, follows its rename, or leads to the host that
@@ -99,7 +100,7 @@ pub(crate) fn new_hosts(vault: &Vault, hosts: Vec<Host>, group: &str) -> Vec<Hos
     let mut kept: Vec<Host> = Vec::new();
     for mut host in hosts {
         let known = || vault.hosts().chain(kept.iter());
-        if let Some(have) = known().find(|have| same_place(have, &host)) {
+        if let Some(have) = known().find(|have| same_place(have, &host) && same_way(have, &host)) {
             renamed.insert(host.name.clone(), have.name.clone());
             continue;
         }
@@ -132,6 +133,13 @@ pub(crate) fn new_hosts(vault: &Vault, hosts: Vec<Host>, group: &str) -> Vec<Hos
 /// any case) and port.
 fn same_place(a: &Host, b: &Host) -> bool {
     a.user == b.user && a.address.eq_ignore_ascii_case(&b.address) && a.port == b.port
+}
+
+/// Whether two hosts are reached the same way: through the same proxy, and
+/// both directly or both through a jump host. Aliases for one machine that
+/// get there differently ("db" and "db-from-home") are both kept.
+fn same_way(a: &Host, b: &Host) -> bool {
+    a.proxy == b.proxy && a.jump.is_some() == b.jump.is_some()
 }
 
 /// The blocks of `text`, following `Include` into files under `dir`.
@@ -1393,7 +1401,11 @@ Host *
     fn leaves_out_what_the_vault_has_and_renames_clashes() {
         let mut vault = Vault::default();
         vault.save(None, Host::new("bastion", "x", "elsewhere", 22), "Mine");
-        vault.save(None, Host::new("my db", "me", "10.0.4.21", 22), "Mine");
+        let mine = Host {
+            jump: Some("bastion".into()),
+            ..Host::new("my db", "me", "10.0.4.21", 22)
+        };
+        vault.save(None, mine, "Mine");
         let hosts = importable(&vault, CONFIG, Path::new("/home/me/.ssh"), "fallback");
         let bastion = find(&hosts, "bastion (OpenSSH)");
         assert_eq!(bastion.address, "bastion.example.com");
@@ -1404,6 +1416,30 @@ Host *
             find(&hosts, "legacy").jump.as_deref(),
             Some("bastion (OpenSSH)")
         );
+    }
+
+    #[test]
+    fn keeps_aliases_that_get_there_differently() {
+        let config = r#"
+Host db
+    HostName 10.0.4.21
+    User me
+Host db-from-home
+    HostName 10.0.4.21
+    User me
+    ProxyJump gw
+Host db-proxied
+    HostName 10.0.4.21
+    User me
+    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+Host db-again
+    HostName 10.0.4.21
+    User me
+"#;
+        let hosts = importable(&Vault::default(), config, Path::new("/home/me/.ssh"), "me");
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        // db-again is db, reached the same way.
+        assert_eq!(names, ["db", "db-from-home", "db-proxied", "gw"]);
     }
 
     #[test]
