@@ -1,0 +1,2 @@
+# Shell scripts run in bash and in Linux containers: LF on every checkout.
+*.sh text eol=lf
