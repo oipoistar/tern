@@ -19,6 +19,8 @@ pub struct HostDraft {
     pub keep_alive: bool,
     pub agent_forwarding: bool,
     pub on_login: String,
+    /// `NAME=value` pairs, as [`crate::env::parse`] reads them.
+    pub env: String,
 }
 
 /// A form field a problem belongs to.
@@ -30,6 +32,7 @@ pub enum Field {
     User,
     Key,
     Jump,
+    Env,
 }
 
 /// Something to fix before saving, in one line.
@@ -54,6 +57,7 @@ impl HostDraft {
             keep_alive: true,
             agent_forwarding: false,
             on_login: String::new(),
+            env: String::new(),
         }
     }
 
@@ -70,6 +74,7 @@ impl HostDraft {
             keep_alive: host.keep_alive,
             agent_forwarding: host.agent_forwarding,
             on_login: host.on_login.clone().unwrap_or_default(),
+            env: crate::env::format(&host.env),
         }
     }
 
@@ -145,6 +150,10 @@ impl HostDraft {
                 }
             }
         }
+        let env = crate::env::parse(&self.env).unwrap_or_else(|error| {
+            problem(Field::Env, &error);
+            Default::default()
+        });
         if !problems.is_empty() {
             return Err(problems);
         }
@@ -164,6 +173,7 @@ impl HostDraft {
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
+            env,
             forwards: previous
                 .map(|host| host.forwards.clone())
                 .unwrap_or_default(),

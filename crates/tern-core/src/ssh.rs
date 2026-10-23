@@ -78,6 +78,8 @@ pub struct ConnectRequest {
     pub forwards: Vec<Forward>,
     /// Let the server use this computer's SSH agent.
     pub agent_forwarding: bool,
+    /// Environment variables to ask the shell to start with.
+    pub env: Vec<(String, String)>,
 }
 
 /// A host to go through, and how to sign in there.
@@ -102,6 +104,8 @@ pub struct Connection {
     pub keep_alive: bool,
     /// Let the server use this computer's SSH agent.
     pub agent_forwarding: bool,
+    /// Environment variables the shell starts with.
+    pub env: Vec<(String, String)>,
     /// Typed into the shell once it starts.
     pub on_login: Option<String>,
     /// Port forwarding rules switched on for the host.
@@ -119,6 +123,7 @@ impl Connection {
             jumps: Vec::new(),
             keep_alive: true,
             agent_forwarding: false,
+            env: Vec::new(),
             on_login: None,
             forwards: Vec::new(),
         }
@@ -145,6 +150,7 @@ impl Connection {
             keep_alive: self.keep_alive,
             forwards: self.forwards.clone(),
             agent_forwarding: self.agent_forwarding,
+            env: self.env.clone(),
         }
     }
 }
@@ -382,6 +388,7 @@ async fn run(
         keep_alive,
         forwards,
         agent_forwarding,
+        env,
     } = request;
 
     // Through jump hosts: sign in to each, then run the next one's SSH over
@@ -438,6 +445,11 @@ async fn run(
     let channel = handle.channel_open_session().await.map_err(other)?;
     if agent_forwarding {
         channel.agent_forward(false).await.map_err(other)?;
+    }
+    // No reply asked: a server that doesn't accept a variable just leaves
+    // it out, as OpenSSH's client does.
+    for (name, value) in &env {
+        channel.set_env(false, name, value).await.map_err(other)?;
     }
     channel
         .request_pty(false, TERM, size.cols.into(), size.rows.into(), 0, 0, &[])

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::env::Env;
 use crate::forward::Forward;
 
 /// Reachability of a saved host, as last observed (see [`crate::reach`]).
@@ -67,6 +68,10 @@ pub struct Host {
     /// Typed into the shell once it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_login: Option<String>,
+    /// Environment variables the shell starts with (the server decides
+    /// which it accepts, through sshd's `AcceptEnv`).
+    #[serde(default, skip_serializing_if = "Env::is_empty")]
+    pub env: Env,
     /// Port forwarding rules, each switched on or off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
@@ -112,6 +117,7 @@ impl Host {
             keep_alive: true,
             agent_forwarding: false,
             on_login: None,
+            env: Env::new(),
             forwards: Vec::new(),
             updated: 0,
         }

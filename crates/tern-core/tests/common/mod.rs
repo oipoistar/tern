@@ -37,6 +37,8 @@ pub struct TestServer {
     agent_offered: bool,
     /// Accepts user certificates this authority signed.
     user_ca: Option<PublicKey>,
+    /// Variables the client asked for, said in the shell's first output.
+    env: Vec<(String, String)>,
 }
 
 impl Clone for TestServer {
@@ -49,6 +51,7 @@ impl Clone for TestServer {
             probe_agent: self.probe_agent,
             agent_offered: false,
             user_ca: self.user_ca.clone(),
+            env: Vec::new(),
         }
     }
 }
@@ -202,7 +205,21 @@ impl russh::server::Handler for TestServer {
         }
         self.shells.push(channel);
         session.channel_success(channel)?;
+        for (name, value) in &self.env {
+            session.data(channel, format!("env:{name}={value}\r\n").into_bytes())?;
+        }
         session.data(channel, b"ready\r\n".to_vec())?;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        _: ChannelId,
+        name: &str,
+        value: &str,
+        _: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        self.env.push((name.into(), value.into()));
         Ok(())
     }
 
@@ -353,6 +370,7 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
             probe_agent,
             agent_offered: false,
             user_ca,
+            env: Vec::new(),
         }
         .run_on_socket(config, &listener)
         .await;
@@ -378,6 +396,7 @@ pub fn request(
         keep_alive: true,
         forwards: Vec::new(),
         agent_forwarding: false,
+        env: Vec::new(),
     }
 }
 

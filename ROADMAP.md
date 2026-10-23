@@ -103,6 +103,10 @@ claude.ai account). Each item below names the artboard it comes from.
       doubling to half a minute, eight tries; a refused sign-in or a key
       problem stops it for the user; the new shell starts on a clear
       screen with the old one in the scrollback
+- [x] Environment variables per host: an Environment field in the host
+      editor takes OpenSSH's SetEnv form (NAME=value, quotes around
+      spaces); the shell is asked to start with them, and the server's
+      AcceptEnv decides
 
 ## Known gaps in what's built
 

@@ -42,7 +42,7 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 
 `tern-core` has no UI: hosts and the `Vault` with its `vault.json`
 (`host.rs`, `vault.rs`), the bookkeeping of background reachability checks
-(`reach.rs`), the host editor's checks (`draft.rs`), when to reconnect a
+(`reach.rs`), the host editor's checks (`draft.rs`), environment variables (`env.rs`), when to reconnect a
 dropped session (`reconnect.rs`), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump hosts included),

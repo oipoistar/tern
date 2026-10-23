@@ -61,6 +61,15 @@ async fn session_lifecycle() {
         }
     }
 
+    // Environment variables reach the shell before it starts.
+    let mut with_env = request(port, password(), None);
+    with_env.env = vec![("LANG".into(), "C.UTF-8".into())];
+    let mut session = Session::open(with_env);
+    let event = next(&mut session).await;
+    assert!(matches!(event, Event::Connected), "{event:?}");
+    expect_output(&mut session, "env:LANG=C.UTF-8").await;
+    drop(session);
+
     // Through one jump host and through a chain of two (the same server,
     // forwarding to itself): sign in at each hop, then reach the next over
     // a forwarded channel.

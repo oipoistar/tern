@@ -2433,11 +2433,21 @@ mod tests {
         type_into(cx, Field::Address, "10.0.0.9");
         type_into(cx, Field::Port, "2200");
         type_into(cx, Field::User, "root");
+        // Environment variables are NAME=value pairs.
+        type_into(cx, Field::Env, "TZ");
+        click(cx, "save-host");
+        let problems = vault.read_with(cx, |vault, cx| {
+            vault.editor.as_ref().unwrap().read(cx).problem_fields()
+        });
+        assert_eq!(problems, [Field::Env]);
+        type_into(cx, Field::Env, "LANG=C.UTF-8 TZ=UTC");
         click(cx, "save-host");
         assert!(!editor_open(cx));
         vault.read_with(cx, |vault, _| {
             let host = vault.vault.find("db-new").expect("the new host is saved");
             assert_eq!((host.port, host.user.as_str()), (2200, "root"));
+            assert_eq!(host.env.get("TZ").map(String::as_str), Some("UTC"));
+            assert_eq!(host.env.len(), 2);
             assert_eq!(vault.vault.group_of("db-new"), Some("Production"));
             assert_eq!(vault.selected, "db-new");
         });

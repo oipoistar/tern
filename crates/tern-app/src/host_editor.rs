@@ -76,6 +76,7 @@ pub struct HostEditor {
     user: Entity<InputState>,
     tag: Entity<InputState>,
     on_login: Entity<InputState>,
+    env: Entity<InputState>,
     /// For password sign-in: typed to save it, empty to keep the one saved.
     password: Entity<InputState>,
     /// Keep the password in the system's credential store.
@@ -126,6 +127,7 @@ impl HostEditor {
         let user = text_input(&draft.user, "", window, cx);
         let tag = text_input("", "Add tag", window, cx);
         let on_login = text_input(&draft.on_login, "", window, cx);
+        let env = text_input(&draft.env, "NAME=value", window, cx);
         let password_saved =
             host.is_some_and(|host| secrets(cx).load(&host_password(&host.id)).is_some());
         let password = cx.new(|cx| {
@@ -177,6 +179,7 @@ impl HostEditor {
             user,
             tag,
             on_login,
+            env,
             password,
             save_password: password_saved,
             password_saved,
@@ -222,6 +225,7 @@ impl HostEditor {
             keep_alive: self.keep_alive,
             agent_forwarding: self.agent_forwarding,
             on_login: text(&self.on_login),
+            env: text(&self.env),
         }
     }
 
@@ -243,6 +247,7 @@ impl HostEditor {
             Field::Address => self.address.clone(),
             Field::Port => self.port.clone(),
             Field::User => self.user.clone(),
+            Field::Env => self.env.clone(),
             Field::Key | Field::Jump => unreachable!("{field:?} isn't typed"),
         }
     }
@@ -915,6 +920,7 @@ impl HostEditor {
                     ),
             )
             .child(self.field("Run after login", &self.on_login, None, true, t))
+            .child(self.field("Environment", &self.env, Some(Field::Env), true, t))
     }
 
     fn footer(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
