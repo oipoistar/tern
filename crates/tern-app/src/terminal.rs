@@ -152,6 +152,10 @@ pub struct TerminalView {
     reported_cell: Option<(usize, usize)>,
     /// Lines waiting to be pasted until the user says so.
     pending_paste: Option<String>,
+    /// Output arrived since the pane was last on screen.
+    pub unseen: bool,
+    /// The bell rang since then.
+    pub rang: bool,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -343,11 +347,19 @@ impl TerminalView {
             pressed: None,
             reported_cell: None,
             pending_paste: None,
+            unseen: false,
+            rang: false,
             #[cfg(test)]
             sent: RefCell::default(),
             #[cfg(test)]
             answered: Vec::new(),
         }
+    }
+
+    /// The pane is on screen: what happened while it wasn't has been seen.
+    pub fn seen(&mut self) {
+        self.unseen = false;
+        self.rang = false;
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -469,7 +481,7 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn on_session_event(&mut self, event: Event, cx: &mut Context<Self>) {
+    pub(crate) fn on_session_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Connected => {
                 self.phase = Phase::Live;
@@ -496,6 +508,7 @@ impl TerminalView {
                 }
             }
             Event::Output(bytes) => {
+                self.unseen = true;
                 self.parser.advance(&mut self.term, &bytes);
                 self.answer_terminal_events(cx);
                 self.update_preview();
@@ -629,8 +642,11 @@ impl TerminalView {
                         .into_bytes(),
                     );
                 }
-                TermEvent::Bell if settings::current(cx).terminal.bell == Bell::Visual => {
-                    self.flash(cx)
+                TermEvent::Bell => {
+                    self.rang = true;
+                    if settings::current(cx).terminal.bell == Bell::Visual {
+                        self.flash(cx)
+                    }
                 }
                 TermEvent::ClipboardStore(_, text) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text))

@@ -176,6 +176,9 @@ claude.ai account). Each item below names the artboard it comes from.
       run each as it arrives (no bracketed paste) shows them first, with
       Paste (Enter) and Cancel (Escape); Settings, Terminal, Confirm
       pastes turns it off
+- [x] Tab markers: a tab not on screen shows a dot once its sessions
+      print something new, and a bell if one rang; looking at the tab
+      clears them
 
 ## Known gaps in what's built
 

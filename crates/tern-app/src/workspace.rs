@@ -402,6 +402,15 @@ impl Workspace {
     }
 
     fn activate(&mut self, tab: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        // What the tab being left and the one shown printed or rang while
+        // on screen needs no marker.
+        for index in [self.active, tab].into_iter().flatten() {
+            if let Some(shown) = self.tabs.get(index) {
+                for pane in &shown.panes {
+                    pane.update(cx, |pane, _| pane.seen());
+                }
+            }
+        }
         self.active = tab;
         // Marks from the previous screen must not linger over the new one.
         self.live.clear();
@@ -1066,6 +1075,30 @@ impl Workspace {
                 .pr(px(4.))
                 .child(phase_glyph(&terminal.phase, theme))
                 .child(div().max_w(px(180.)).truncate().child(terminal.title()))
+                // A tab not on screen shows a bell if one rang there, or a dot
+                // for output it hasn't shown.
+                .when(self.active != Some(index), |d| {
+                    let panes = session.panes.iter().map(|pane| pane.read(cx));
+                    let (rang, unseen) = panes.fold((false, false), |(rang, unseen), pane| {
+                        (rang || pane.rang, unseen || pane.unseen)
+                    });
+                    let id = format!("activity-{index}");
+                    match (rang, unseen) {
+                        (true, _) => d.child(div().debug_selector(move || id).child(icon(
+                            IconName::Bell,
+                            12.,
+                            theme.text,
+                        ))),
+                        (false, true) => d.child(
+                            div()
+                                .debug_selector(move || id)
+                                .size(px(5.))
+                                .rounded_full()
+                                .bg(theme.text2),
+                        ),
+                        _ => d,
+                    }
+                })
                 .child(
                     div()
                         .id(SharedString::from(format!("close-{index}")))
@@ -1337,6 +1370,36 @@ mod tests {
                 .collect();
             assert_eq!(hosts, ["node-0", "node-1", "node-2", "node-3"]);
         });
+    }
+
+    #[gpui::test]
+    fn marks_tabs_with_unseen_output_and_bells(cx: &mut TestAppContext) {
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        let output = |cx: &mut VisualTestContext, bytes: &[u8]| {
+            first.update(cx, |pane, cx| {
+                pane.on_session_event(Event::Output(bytes.to_vec()), cx)
+            });
+            cx.run_until_parked();
+        };
+        // Output while the tab shows needs no marker.
+        output(cx, b"hello");
+        click(cx, "new-local");
+        assert!(cx.debug_bounds("activity-0").is_none());
+
+        // Hidden, its output gets a dot, then a bell beats the dot.
+        output(cx, b"more");
+        assert!(cx.debug_bounds("activity-0").is_some());
+        output(cx, b"\x07");
+        first.read_with(cx, |pane, _| assert!(pane.rang));
+
+        // Looking at it clears both.
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.simulate_keystrokes("ctrl-tab");
+        assert!(cx.debug_bounds("activity-0").is_none());
+        first.read_with(cx, |pane, _| assert!(!pane.rang && !pane.unseen));
     }
 
     #[gpui::test]
