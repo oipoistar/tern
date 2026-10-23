@@ -163,8 +163,9 @@ claude.ai account). Each item below names the artboard it comes from.
       side, four panes to a tab, ready for Broadcast
 - [x] Copy for OpenSSH: the side panel copies the selected host as an
       ssh command line (port, key, -J chain, -A, proxy, rules switched
-      on) or as a ~/.ssh/config block that the importer reads back as
-      the same host
+      on; a chain whose first hop has a proxy becomes nested
+      ProxyCommands) or as ~/.ssh/config blocks, one per host on the way,
+      that the importer reads back as the same hosts
 - [x] Host notes: a Notes field in the host editor, shown under the
       selected host in the side panel and matched by search. Vault file
       version 9
