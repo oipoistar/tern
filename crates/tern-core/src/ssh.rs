@@ -84,6 +84,9 @@ pub struct ConnectRequest {
     pub agent_forwarding: bool,
     /// Environment variables to ask the shell to start with.
     pub env: Vec<(String, String)>,
+    /// Open a shell. Without one, the session only carries its port
+    /// forwarding rules.
+    pub shell: bool,
 }
 
 /// A host to go through, and how to sign in there.
@@ -193,6 +196,7 @@ impl Connection {
             forwards: self.forwards.clone(),
             agent_forwarding: self.agent_forwarding,
             env: self.env.clone(),
+            shell: true,
         }
     }
 }
@@ -515,6 +519,7 @@ async fn run(
         forwards,
         agent_forwarding,
         env,
+        shell,
     } = request;
 
     // Through jump hosts: sign in to each, then run the next one's SSH over
@@ -580,6 +585,36 @@ async fn run(
         forwarder.set(forward, true).await;
     }
 
+    let mut exit_status = None;
+    // The connection went away without the server closing the shell.
+    let mut lost = false;
+    if !shell {
+        // Forwarding only: no shell, until asked to stop or the connection
+        // drops, which nothing else would notice without a channel open.
+        let mut check = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                command = inbox.recv() => match command {
+                    Some(Input::Forward(forward, on)) => forwarder.set(forward, on).await,
+                    Some(Input::OpenSftp(reply)) => {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(sftp::open(&handle).await);
+                        });
+                    }
+                    Some(Input::Close) | None => break,
+                    Some(_) => {}
+                },
+                _ = check.tick() => {
+                    if handle.is_closed() {
+                        lost = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return finish(forwarder, &handle, &via, lost, None, events).await;
+    }
     let channel = handle.channel_open_session().await.map_err(other)?;
     if agent_forwarding {
         channel.agent_forward(false).await.map_err(other)?;
@@ -596,9 +631,6 @@ async fn run(
     channel.request_shell(true).await.map_err(other)?;
     let (mut reader, writer) = channel.split();
 
-    let mut exit_status = None;
-    // The channel went away without the server closing it.
-    let mut lost = false;
     loop {
         tokio::select! {
             message = reader.wait() => match message {
@@ -639,17 +671,29 @@ async fn run(
             },
         }
     }
+    finish(forwarder, &handle, &via, lost, exit_status, events).await
+}
+
+/// Ends a session: its rules stop, its connections close (the hop nearest
+/// the target first), and it reports how it ended. A shell that reported
+/// its exit ended, however the channel went.
+async fn finish(
+    mut forwarder: Forwarder<Verifier>,
+    handle: &client::Handle<Verifier>,
+    via: &[client::Handle<Verifier>],
+    lost: bool,
+    exit_status: Option<u32>,
+    events: &mpsc::UnboundedSender<Event>,
+) -> Result<(), ConnectError> {
     forwarder.stop_all();
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
-    // The hop nearest the target first.
     for jump in via.iter().rev() {
         let _ = jump
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
-    // A shell that reported its exit ended, however the channel went.
     let _ = events.send(if lost && exit_status.is_none() {
         Event::Lost
     } else {
@@ -701,12 +745,16 @@ async fn open(
         (None, None) => client::connect(config, (target.host.as_str(), target.port), handler).await,
     };
     // A rejected host key surfaces as a generic russh error; report ours.
+    // Network errors read as a few words, without the OS's error number.
     connected.map_err(|error| {
         verdict
             .lock()
             .unwrap()
             .take()
-            .unwrap_or_else(|| other(error))
+            .unwrap_or_else(|| match &error {
+                russh::Error::IO(io) => other(describe(io)),
+                _ => other(error),
+            })
     })
 }
 

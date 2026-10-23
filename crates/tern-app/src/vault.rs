@@ -21,13 +21,16 @@ use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
 use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::snippet::Snippet;
-use tern_core::ssh::{Connection, Target, key_art, known_host_key, probe, quick_destination};
+use tern_core::ssh::{
+    ConnectError, Connection, Event, Session, SessionInput, Target, TermSize, key_art,
+    known_host_key, probe, quick_destination,
+};
 use tern_core::sync::{Merged, Syncer};
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
 use tern_core::{keys, known_hosts};
 
 use crate::bench;
-use crate::forwarding::{ForwardEvent, ForwardsView, States};
+use crate::forwarding::{Alone, ForwardEvent, ForwardsView, States};
 use crate::history::{HistoryEvent, HistoryView};
 use crate::host_editor::{EditorEvent, HostEditor};
 use crate::keychain::{KeychainEvent, KeychainView};
@@ -54,6 +57,14 @@ const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
 /// Wide enough for `user@host` and two tags; three fit beside the sidebar
 /// in the default window.
 const CARD_WIDTH: f32 = 320.;
+
+/// A session without a shell, carrying a host's rules that run without a
+/// terminal.
+struct Background {
+    input: SessionInput,
+    rules: Vec<Forward>,
+    _events: Task<()>,
+}
 
 pub enum VaultEvent {
     Connect(Connection),
@@ -135,6 +146,9 @@ pub struct VaultContent {
     history_file: Option<PathBuf>,
     /// How each rule is doing in open sessions.
     forward_states: States,
+    /// Rules run without a terminal, by host: a session without a shell
+    /// carries them.
+    background: HashMap<String, Background>,
     /// The open sessions' previews, by saved host.
     open_sessions: HashMap<String, Preview>,
     vault: Vault,
@@ -280,7 +294,8 @@ impl VaultContent {
                 Some(_) => self.refresh_forwards(cx),
                 None => {
                     let (hosts, states) = (self.forward_hosts(), self.forward_states.clone());
-                    let view = cx.new(|_| ForwardsView::new(hosts, states));
+                    let alone = self.running_alone();
+                    let view = cx.new(|_| ForwardsView::new(hosts, states, alone));
                     self._screen_events.push(cx.subscribe_in(
                         &view,
                         window,
@@ -499,6 +514,7 @@ impl VaultContent {
             history: History::default(),
             history_file: None,
             forward_states: States::default(),
+            background: HashMap::new(),
             open_sessions: HashMap::new(),
             vault,
             file,
@@ -763,7 +779,127 @@ impl VaultContent {
     fn refresh_forwards(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = &self.forwards {
             let (hosts, states) = (self.forward_hosts(), self.forward_states.clone());
-            view.update(cx, |view, cx| view.refresh(hosts, states, cx));
+            let alone = self.running_alone();
+            view.update(cx, |view, cx| view.refresh(hosts, states, alone, cx));
+        }
+    }
+
+    /// The rules running without a terminal.
+    fn running_alone(&self) -> Alone {
+        self.background
+            .iter()
+            .flat_map(|(host, background)| {
+                background
+                    .rules
+                    .iter()
+                    .map(move |rule| (host.clone(), rule.id()))
+            })
+            .collect()
+    }
+
+    /// Runs `forward` of `host` now without a terminal (`on`), or stops it.
+    /// The host's rules share one session without a shell, which closes
+    /// with its last rule.
+    fn run_alone(&mut self, host: &str, forward: &Forward, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            if let Some(background) = self.background.get_mut(host) {
+                background.input.forward(forward.clone(), false);
+                background.rules.retain(|rule| rule.id() != forward.id());
+                if background.rules.is_empty() {
+                    background.input.close();
+                    self.background.remove(host);
+                }
+            }
+            self.set_forward_state(host.to_string(), forward, ForwardState::Stopped, cx);
+            return;
+        }
+        if let Some(background) = self.background.get_mut(host) {
+            background.input.forward(forward.clone(), true);
+            background.rules.push(forward.clone());
+            self.refresh_forwards(cx);
+            return;
+        }
+        let Some(connection) = self
+            .vault
+            .find(host)
+            .and_then(|saved| self.vault.connection(saved).ok())
+        else {
+            return;
+        };
+        // Saved passwords only: nothing here can ask for one.
+        let store = sync::secrets(cx);
+        let saved =
+            |id: Option<&str>| id.and_then(|id| store.load(&tern_core::secrets::host_password(id)));
+        let password = (connection.auth == Auth::Password)
+            .then(|| saved(connection.host_id.as_deref()))
+            .flatten();
+        let mut request = connection.request(
+            TermSize { cols: 80, rows: 24 },
+            password.as_deref(),
+            None,
+            |jump| saved(jump.host_id.as_deref()),
+        );
+        request.forwards = vec![forward.clone()];
+        request.shell = false;
+        let (input, mut events) = Session::open(request).into_parts();
+        let name = host.to_string();
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                let ended = matches!(
+                    event,
+                    Event::Closed { .. } | Event::Lost | Event::Failed(_) | Event::Prompts(_)
+                );
+                if this
+                    .update(cx, |this, cx| this.on_background_event(&name, event, cx))
+                    .is_err()
+                    || ended
+                {
+                    break;
+                }
+            }
+        });
+        self.background.insert(
+            host.to_string(),
+            Background {
+                input,
+                rules: vec![forward.clone()],
+                _events: task,
+            },
+        );
+        self.refresh_forwards(cx);
+    }
+
+    /// What a session without a shell reports. It can't ask for anything,
+    /// so a question or a refusal ends it, the reason on its rules.
+    fn on_background_event(&mut self, host: &str, event: Event, cx: &mut Context<Self>) {
+        let reason = match event {
+            Event::Forwarding { forward, state } => {
+                return self.set_forward_state(host.to_string(), &forward, state, cx);
+            }
+            Event::Failed(ConnectError::UnknownHostKey { .. }) => {
+                Some("Connect once to trust its key".to_string())
+            }
+            Event::Failed(ConnectError::HostKeyChanged { .. }) => {
+                Some("The host key changed".to_string())
+            }
+            Event::Failed(ConnectError::AuthFailed { .. }) | Event::Prompts(_) => {
+                Some("Signing in needs a terminal".to_string())
+            }
+            Event::Failed(ConnectError::Other(message)) => Some(message),
+            Event::Lost => Some("Connection lost".to_string()),
+            Event::Closed { .. } => None,
+            Event::Connected | Event::Output(_) => return,
+        };
+        let Some(background) = self.background.remove(host) else {
+            return;
+        };
+        background.input.close();
+        for rule in background.rules {
+            let state = match &reason {
+                Some(reason) => ForwardState::Failed(reason.clone()),
+                None => ForwardState::Stopped,
+            };
+            self.set_forward_state(host.to_string(), &rule, state, cx);
         }
     }
 
@@ -783,9 +919,12 @@ impl VaultContent {
         self.refresh_forwards(cx);
     }
 
-    /// The session to `host` ended, and its rules with it.
+    /// The session to `host` ended, and its rules with it; those running
+    /// without a terminal go on.
     pub fn clear_forward_states(&mut self, host: &str, cx: &mut Context<Self>) {
-        self.forward_states.retain(|(of, _), _| of != host);
+        let alone = self.running_alone();
+        self.forward_states
+            .retain(|key, _| key.0 != host || alone.contains(key));
         self.refresh_forwards(cx);
     }
 
@@ -1019,6 +1158,11 @@ impl VaultContent {
             ForwardEvent::Switch { host, forward, on } => {
                 self.vault.switch_forward(host, &forward.id(), *on);
                 live.push((host.clone(), forward.clone(), *on));
+            }
+            ForwardEvent::RunAlone { host, forward, on } => {
+                self.run_alone(host, forward, *on, cx);
+                cx.notify();
+                return;
             }
         }
         self.persist(cx);
@@ -2122,6 +2266,51 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn runs_a_rule_without_a_terminal(cx: &mut TestAppContext) {
+        use std::time::{Duration, Instant};
+
+        use tern_core::forward::{Forward, ForwardKind, ForwardState};
+
+        // Nothing listens on port 1, so the session fails at once, here.
+        let mut hosts = Vault::default();
+        let mut dead = Host::new("dead", "me", "127.0.0.1", 1);
+        let rule = Forward::typed(ForwardKind::Local, "18080", "localhost:80").unwrap();
+        dead.forwards.push(rule.clone());
+        hosts.save(None, dead, "Lab");
+        // The session's events arrive from the SSH runtime's own threads.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (vault, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(hosts, None, LiveSlots::default(), window, cx)
+        });
+        let key = ("dead".to_string(), rule.id());
+        let state = |cx: &mut VisualTestContext| {
+            vault.read_with(cx, |vault, _| vault.forward_states.get(&key).cloned())
+        };
+
+        click(cx, "nav-port-forwarding");
+        click(cx, "run-dead-0");
+        vault.read_with(cx, |vault, _| {
+            assert!(
+                vault
+                    .running_alone()
+                    .contains(&("dead".to_string(), rule.id()))
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(state(cx), Some(ForwardState::Failed(_))) && Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The reason, in a few words, and nothing left running.
+        assert_eq!(
+            state(cx),
+            Some(ForwardState::Failed("connection refused".into()))
+        );
+        vault.read_with(cx, |vault, _| assert!(vault.running_alone().is_empty()));
     }
 
     #[gpui::test]

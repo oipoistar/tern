@@ -146,6 +146,12 @@ claude.ai account). Each item below names the artboard it comes from.
       panes to a tab, each typing the snippet once its shell starts
       (after the host's own command). tern --show <screen> opens the
       vault at a screen
+- [x] Port forwarding without a terminal: a play button beside each rule
+      runs it now in a session without a shell (one per host, shared by
+      its rules, closed with the last); stop ends it. Such a session
+      can't ask for anything, so an untrusted key, a refused sign-in or
+      a server's question shows as the rule's one-line reason.
+      Connection errors now read as a few words everywhere
 
 ## Known gaps in what's built
 

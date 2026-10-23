@@ -154,5 +154,27 @@ async fn forwards_ports_three_ways() {
     ));
 
     drop(session);
+
+    // Rules can run without a shell: the session only carries them.
+    let alone = rule(ForwardKind::Local, free_port(), echo);
+    let mut headless = common::request(port, vec![Credential::Password(PASSWORD.into())], None);
+    headless.forwards = vec![alone.clone()];
+    headless.shell = false;
+    let mut session = Session::open(headless);
+    assert!(matches!(next(&mut session).await, Event::Connected));
+    assert_eq!(state_of(&mut session, &alone).await, ForwardState::Running);
+    let mut through = TcpStream::connect(("127.0.0.1", alone.listen_port))
+        .await
+        .unwrap();
+    round_trip(&mut through, b"no shell needed").await;
+    session.close();
+    let ended = wait_for(&mut session, |event| match event {
+        Event::Closed { exit_status } => Some(exit_status),
+        Event::Lost => Some(Some(u32::MAX)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended, None, "closed, not lost");
+
     let _ = std::fs::remove_dir_all(&scratch);
 }

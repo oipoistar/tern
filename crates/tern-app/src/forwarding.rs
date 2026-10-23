@@ -1,9 +1,10 @@
 //! The Port forwarding screen: each host's rules (`-L`, `-R`, `-D`) with an
 //! ink switch. A rule switched on runs whenever a session to its host is
-//! open; switching it while one is open starts or stops it there. A form
-//! at the top adds or edits a rule; the vault saves what it sends.
+//! open; switching it while one is open starts or stops it there. A play
+//! button runs a rule now without a terminal, in a session of its own. A
+//! form at the top adds or edits a rule; the vault saves what it sends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -30,12 +31,21 @@ pub enum ForwardEvent {
         forward: Forward,
         on: bool,
     },
+    /// Run the rule now without a terminal, or stop it.
+    RunAlone {
+        host: String,
+        forward: Forward,
+        on: bool,
+    },
 }
 
 impl EventEmitter<ForwardEvent> for ForwardsView {}
 
 /// How each rule is doing in an open session, by host and rule.
 pub type States = HashMap<(String, ForwardId), ForwardState>;
+
+/// Rules running without a terminal, by host and rule.
+pub type Alone = HashSet<(String, ForwardId)>;
 
 /// The add or edit form.
 struct Form {
@@ -52,14 +62,16 @@ pub struct ForwardsView {
     /// Every saved host's name and rules, in vault order.
     hosts: Vec<(String, Vec<Forward>)>,
     states: States,
+    alone: Alone,
     form: Option<Form>,
 }
 
 impl ForwardsView {
-    pub fn new(hosts: Vec<(String, Vec<Forward>)>, states: States) -> Self {
+    pub fn new(hosts: Vec<(String, Vec<Forward>)>, states: States, alone: Alone) -> Self {
         Self {
             hosts,
             states,
+            alone,
             form: None,
         }
     }
@@ -69,10 +81,12 @@ impl ForwardsView {
         &mut self,
         hosts: Vec<(String, Vec<Forward>)>,
         states: States,
+        alone: Alone,
         cx: &mut Context<Self>,
     ) {
         self.hosts = hosts;
         self.states = states;
+        self.alone = alone;
         cx.notify();
     }
 
@@ -395,8 +409,13 @@ impl ForwardsView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let state = self.states.get(&(host.to_string(), forward.id()));
+        let alone = self.alone.contains(&(host.to_string(), forward.id()));
+        // Running in a terminal's session already: nothing to start here.
+        let in_session = !alone && matches!(state, Some(ForwardState::Running));
         let row_id = format!("forward-{host}-{index}");
         let switch_id = format!("switch-{host}-{index}");
+        let run_id = format!("run-{host}-{index}");
+        let run = (host.to_string(), forward.clone());
         let (editing, toggled) = (
             (host.to_string(), forward.clone()),
             (host.to_string(), forward.clone()),
@@ -445,6 +464,40 @@ impl ForwardsView {
                         .child(reason.clone()),
                 ),
                 _ => d,
+            })
+            .when(!in_session, |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(run_id.clone()))
+                        .debug_selector(move || run_id)
+                        .size(px(32.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(if alone { t.text } else { t.line })
+                        .hover(|d| d.bg(t.card2))
+                        .child(icon(
+                            if alone {
+                                IconName::Square
+                            } else {
+                                IconName::Play
+                            },
+                            13.,
+                            t.text,
+                        ))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            let (host, forward) = run.clone();
+                            cx.emit(ForwardEvent::RunAlone {
+                                host,
+                                forward,
+                                on: !alone,
+                            });
+                        })),
+                )
             })
             .child(
                 switch(SharedString::from(switch_id.clone()), forward.on, t)

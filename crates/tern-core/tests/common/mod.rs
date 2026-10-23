@@ -463,6 +463,7 @@ pub fn request(
         forwards: Vec::new(),
         agent_forwarding: false,
         env: Vec::new(),
+        shell: true,
     }
 }
 
