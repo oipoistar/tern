@@ -82,6 +82,7 @@ pub struct HostEditor {
     /// The proxy's URL, used while `proxy_on`.
     proxy: Entity<InputState>,
     notes: Entity<TextareaState>,
+    mac: Entity<InputState>,
     proxy_on: bool,
     /// For password sign-in: typed to save it, empty to keep the one saved.
     password: Entity<InputState>,
@@ -136,6 +137,7 @@ impl HostEditor {
         let tag = text_input("", "Add tag", window, cx);
         let on_login = text_input(&draft.on_login, "", window, cx);
         let env = text_input(&draft.env, "NAME=value", window, cx);
+        let mac = text_input(&draft.mac, "aa:bb:cc:dd:ee:ff", window, cx);
         let notes = {
             let value = draft.notes.clone();
             cx.new(|cx| {
@@ -203,6 +205,7 @@ impl HostEditor {
             on_login,
             env,
             notes,
+            mac,
             proxy_on: draft.proxy.is_some(),
             proxy,
             password,
@@ -255,6 +258,7 @@ impl HostEditor {
             on_login: text(&self.on_login),
             env: text(&self.env),
             notes: self.notes.read(cx).value().to_string(),
+            mac: text(&self.mac),
         }
     }
 
@@ -278,6 +282,7 @@ impl HostEditor {
             Field::User => self.user.clone(),
             Field::Env => self.env.clone(),
             Field::Proxy => self.proxy.clone(),
+            Field::Mac => self.mac.clone(),
             Field::Key | Field::Jump => unreachable!("{field:?} isn't typed"),
         }
     }
@@ -1086,6 +1091,7 @@ impl HostEditor {
             )
             .child(self.field("Run after login", &self.on_login, None, true, t))
             .child(self.field("Environment", &self.env, Some(Field::Env), true, t))
+            .child(self.field("Wake-on-LAN MAC", &self.mac, Some(Field::Mac), true, t))
     }
 
     fn footer(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {

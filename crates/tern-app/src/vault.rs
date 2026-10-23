@@ -1105,7 +1105,10 @@ impl VaultContent {
                             .gap(px(8.))
                             .child(self.copy_button("copy-command", "Copy command", host, t, cx))
                             .child(self.copy_button("copy-config", "Copy config", host, t, cx)),
-                    ),
+                    )
+                    .when_some(host.mac.clone(), |d, mac| {
+                        d.child(self.wake_button(&mac, t, cx))
+                    }),
             )
             .when(!host.notes.is_empty(), |d| {
                 d.child(
@@ -1298,6 +1301,50 @@ impl VaultContent {
                         cx.notify();
                     });
                 }));
+                cx.notify();
+            }))
+    }
+
+    /// Wakes the host over the local network; says "Sent" a moment, or why
+    /// it couldn't.
+    fn wake_button(&self, mac: &str, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let sent = self.copied == Some("wake");
+        let mac = mac.to_string();
+        button("wake", t)
+            .debug_selector(|| "wake".into())
+            .justify_center()
+            .h(px(34.))
+            .rounded(px(11.))
+            .text_size(px(12.5))
+            .child(icon(
+                if sent {
+                    IconName::Check
+                } else {
+                    IconName::Power
+                },
+                13.,
+                t.text2,
+            ))
+            .child(if sent { "Sent" } else { "Wake" })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let woken =
+                    tern_core::wol::parse_mac(&mac).and_then(|mac| tern_core::wol::wake(&mac));
+                match woken {
+                    Ok(()) => {
+                        this.copied = Some("wake");
+                        this.notice = None;
+                        this._copied = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1500))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.copied = None;
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    Err(problem) => this.notice = Some(format!("Can't wake it: {problem}").into()),
+                }
                 cx.notify();
             }))
     }
@@ -2510,6 +2557,44 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn wakes_hosts_with_a_mac_address(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        let type_mac = |cx: &mut VisualTestContext, text: &str| {
+            cx.update(|window, cx| {
+                let editor = vault.read(cx).editor.clone().expect("the editor is open");
+                let input = editor.read(cx).input(Field::Mac);
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            });
+            cx.simulate_input(text);
+        };
+        assert!(cx.debug_bounds("wake").is_none());
+        click(cx, "host-bastion");
+        click(cx, "edit-host");
+        type_mac(cx, "aa:bb");
+        click(cx, "save-host");
+        let problems = vault.read_with(cx, |vault, cx| {
+            vault.editor.as_ref().unwrap().read(cx).problem_fields()
+        });
+        assert_eq!(problems, [Field::Mac]);
+        type_mac(cx, "AA-BB-CC-01-02-03");
+        click(cx, "save-host");
+        vault.read_with(cx, |vault, _| {
+            let host = vault.vault.find("bastion").unwrap();
+            assert_eq!(host.mac.as_deref(), Some("aa:bb:cc:01:02:03"));
+        });
+        // Only a host with a MAC address can be woken.
+        assert!(cx.debug_bounds("wake").is_some());
+        click(cx, "host-prod-db-01");
+        assert!(cx.debug_bounds("wake").is_none());
     }
 
     #[gpui::test]

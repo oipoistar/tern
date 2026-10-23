@@ -24,6 +24,7 @@ gpui_kit::assets::icon_assets!(
         List,
         Lock,
         Play,
+        Power,
         Maximize2,
         Minimize2,
         Pencil,

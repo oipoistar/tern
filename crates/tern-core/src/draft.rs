@@ -26,6 +26,8 @@ pub struct HostDraft {
     /// `NAME=value` pairs, as [`crate::env::parse`] reads them.
     pub env: String,
     pub notes: String,
+    /// For Wake-on-LAN; empty for none.
+    pub mac: String,
 }
 
 /// A form field a problem belongs to.
@@ -39,6 +41,7 @@ pub enum Field {
     Jump,
     Proxy,
     Env,
+    Mac,
 }
 
 /// Something to fix before saving, in one line.
@@ -67,6 +70,7 @@ impl HostDraft {
             on_login: String::new(),
             env: String::new(),
             notes: String::new(),
+            mac: String::new(),
         }
     }
 
@@ -87,6 +91,7 @@ impl HostDraft {
             on_login: host.on_login.clone().unwrap_or_default(),
             env: crate::env::format(&host.env),
             notes: host.notes.clone(),
+            mac: host.mac.clone().unwrap_or_default(),
         }
     }
 
@@ -174,6 +179,13 @@ impl HostDraft {
                 .map_err(|error| problem(Field::Proxy, &error))
                 .ok(),
         };
+        let mac = match self.mac.trim() {
+            "" => None,
+            typed => crate::wol::parse_mac(typed)
+                .map(|mac| crate::wol::format_mac(&mac))
+                .map_err(|error| problem(Field::Mac, &error))
+                .ok(),
+        };
         let env = crate::env::parse(&self.env).unwrap_or_else(|error| {
             problem(Field::Env, &error);
             Default::default()
@@ -202,6 +214,7 @@ impl HostDraft {
             on_login: (!on_login.is_empty()).then(|| on_login.to_string()),
             env,
             notes: self.notes.trim_end().to_string(),
+            mac,
             forwards: previous
                 .map(|host| host.forwards.clone())
                 .unwrap_or_default(),

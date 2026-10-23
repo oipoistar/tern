@@ -168,6 +168,10 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Host notes: a Notes field in the host editor, shown under the
       selected host in the side panel and matched by search. Vault file
       version 9
+- [x] Wake-on-LAN: a host can keep its network card's MAC address (typed
+      any common way); the side panel's Wake broadcasts the magic packet
+      on the local network (ports 9 and 7) and says Sent. Vault file
+      version 10
 
 ## Known gaps in what's built
 

@@ -29,6 +29,7 @@ pub mod snippet;
 pub mod ssh;
 pub mod sync;
 pub mod vault;
+pub mod wol;
 
 pub use host::{Auth, Host, HostGroup, HostStatus};
 pub use vault::Vault;

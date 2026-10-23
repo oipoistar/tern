@@ -87,6 +87,10 @@ pub struct Host {
     /// Whatever the user wants to remember about the host.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Its network card's MAC address, `aa:bb:cc:dd:ee:ff`, for waking it
+    /// over the local network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
     /// When it last changed, in milliseconds since the Unix epoch; sync
     /// keeps the newest.
     #[serde(default)]
@@ -134,6 +138,7 @@ impl Host {
             env: Env::new(),
             forwards: Vec::new(),
             notes: String::new(),
+            mac: None,
             updated: 0,
         }
     }
