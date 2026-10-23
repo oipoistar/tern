@@ -1,0 +1,31 @@
+# Tern's SSH lab: an OpenSSH server for each way of signing in, a two-hop
+# jump chain into networks this computer can't reach, SOCKS5 and HTTP
+# proxies, and a web server to forward to. `dev/lab/setup.sh` makes its keys
+# and starts it; `cargo test -p tern-core --test lab -- --ignored` runs
+# Tern against it.
+name: tern-lab
+
+x-lab: &lab
+  build: .
+  image: tern-lab
+  volumes: ["./keys:/lab/keys:ro"]
+
+networks:
+  edge: {}
+  inner: { internal: true }
+  deeper: { internal: true }
+
+services:
+  password: { <<: *lab, hostname: password, command: password, networks: [edge], ports: ["127.0.0.1:2201:22"] }
+  key: { <<: *lab, hostname: key, command: key, networks: [edge], ports: ["127.0.0.1:2202:22"] }
+  otp: { <<: *lab, hostname: otp, command: otp, networks: [edge], ports: ["127.0.0.1:2203:22"] }
+  mfa: { <<: *lab, hostname: mfa, command: mfa, networks: [edge], ports: ["127.0.0.1:2204:22"] }
+  cert: { <<: *lab, hostname: cert, command: cert, networks: [edge], ports: ["127.0.0.1:2205:22"] }
+  strict: { <<: *lab, hostname: strict, command: strict, networks: [edge], ports: ["127.0.0.1:2206:22"] }
+  legacy: { <<: *lab, hostname: legacy, command: legacy, networks: [edge], ports: ["127.0.0.1:2207:22"] }
+  bastion: { <<: *lab, hostname: bastion, command: bastion, networks: [edge, inner], ports: ["127.0.0.1:2210:22"] }
+  hop2: { <<: *lab, hostname: hop2, command: hop2, networks: [inner, deeper] }
+  deep: { <<: *lab, hostname: deep, command: deep, networks: [deeper] }
+  web: { <<: *lab, hostname: web, command: web, networks: [inner] }
+  socks: { <<: *lab, hostname: socks, command: socks, networks: [edge, inner], ports: ["127.0.0.1:1080:1080"] }
+  httpproxy: { <<: *lab, hostname: httpproxy, command: httpproxy, networks: [edge, inner], ports: ["127.0.0.1:8888:8888"] }

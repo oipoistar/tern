@@ -7,6 +7,8 @@ mod host_editor;
 mod identities;
 mod keychain;
 mod known_hosts;
+#[cfg(test)]
+mod lab;
 mod live;
 mod marks;
 mod settings;

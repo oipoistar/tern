@@ -116,6 +116,12 @@ impl FilesPanel {
         }
     }
 
+    /// What the host's side lists, by name.
+    #[cfg(test)]
+    pub fn remote_names(&self) -> Vec<String> {
+        self.remote.iter().map(|entry| entry.name.clone()).collect()
+    }
+
     /// The folder this computer's side starts in: Downloads, or home.
     pub fn default_local_dir() -> PathBuf {
         let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));

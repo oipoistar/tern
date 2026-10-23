@@ -75,3 +75,20 @@ cargo run -p tern-app --release -- --bench 10 --bench-uncached   # same, re-rend
 ```
 
 `TERN_THEME=light|dark` forces an appearance.
+
+### SSH lab
+
+`dev/lab` runs real OpenSSH servers in Docker to test Tern against: one for
+each way of signing in (a password, keys, a password then a one-time code, a
+key then a code, user and host certificates), servers with only today's or
+with older algorithms, a bastion → hop2 → deep chain into networks this
+computer can't reach, SOCKS5 (Dante) and HTTP (Tinyproxy) proxies, and a web
+server to forward to. `entrypoint.sh` says what each offers. The lab's
+tests are ignored unless asked for, and need `docker` on the `PATH`:
+
+```sh
+dev/lab/setup.sh                                              # make its keys, start it
+cargo test -p tern-core --test lab -- --ignored --nocapture   # Tern's SSH against every server
+cargo test -p tern-app lab -- --ignored --nocapture           # the app's panes, keyboard only
+docker compose -f dev/lab/compose.yaml down                   # stop it
+```
