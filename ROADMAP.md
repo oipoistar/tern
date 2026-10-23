@@ -161,6 +161,10 @@ claude.ai account). Each item below names the artboard it comes from.
       hosts. Vault file version 8
 - [x] Open all: a group's heading opens the hosts shown in it side by
       side, four panes to a tab, ready for Broadcast
+- [x] Copy for OpenSSH: the side panel copies the selected host as an
+      ssh command line (port, key, -J chain, -A, proxy, rules switched
+      on) or as a ~/.ssh/config block that the importer reads back as
+      the same host
 
 ## Known gaps in what's built
 

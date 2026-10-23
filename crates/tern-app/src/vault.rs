@@ -139,6 +139,9 @@ pub struct VaultContent {
     keychain: Option<Entity<KeychainView>>,
     /// The Keychain screen shows identities instead of keys.
     show_identities: bool,
+    /// Which copy button just copied, for a moment's "Copied".
+    copied: Option<&'static str>,
+    _copied: Option<Task<()>>,
     identities: Option<Entity<IdentitiesView>>,
     snippets: Option<Entity<SnippetsView>>,
     forwards: Option<Entity<ForwardsView>>,
@@ -530,6 +533,8 @@ impl VaultContent {
             focus: cx.focus_handle(),
             keychain: None,
             show_identities: false,
+            copied: None,
+            _copied: None,
             identities: None,
             snippets: None,
             forwards: None,
@@ -1092,6 +1097,14 @@ impl VaultContent {
                                         cx.listener(|this, _, _, cx| this.open_selected(true, cx)),
                                     ),
                             ),
+                    )
+                    // The host for OpenSSH: a command line, or a config block.
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(self.copy_button("copy-command", "Copy command", host, t, cx))
+                            .child(self.copy_button("copy-config", "Copy config", host, t, cx)),
                     ),
             )
             .when(!host.forwards.is_empty(), |d| {
@@ -1221,6 +1234,58 @@ impl VaultContent {
         if let Some(view) = &self.snippets {
             view.update(cx, |view, cx| view.open_form(None, window, cx));
         }
+    }
+
+    /// Copies `host` for OpenSSH: `copy-command` as an `ssh` command line,
+    /// `copy-config` as a `~/.ssh/config` block. Says "Copied" a moment.
+    fn copy_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        host: &Host,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let copied = self.copied == Some(id);
+        let name = host.name.clone();
+        button(id, t)
+            .debug_selector(move || id.into())
+            .flex_1()
+            .justify_center()
+            .h(px(34.))
+            .rounded(px(11.))
+            .text_size(px(12.5))
+            .child(icon(
+                if copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                },
+                13.,
+                t.text2,
+            ))
+            .child(if copied { "Copied" } else { label })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let Some(host) = this.vault.find(&name) else {
+                    return;
+                };
+                let text = match id {
+                    "copy-command" => openssh::ssh_command(&this.vault, host),
+                    _ => openssh::config_block(&this.vault, host),
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                this.copied = Some(id);
+                this._copied = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1500))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.copied = None;
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
+            }))
     }
 
     /// Opens the saved hosts `names` side by side, four panes to a tab.
@@ -2431,6 +2496,31 @@ mod tests {
         assert_eq!(connection.target.host, "bastion.example.com");
         let command = connection.on_login.expect("the install runs after login");
         assert!(command.contains("'ssh-ed25519 AAAA me@laptop' >> ~/.ssh/authorized_keys"));
+    }
+
+    #[gpui::test]
+    fn copies_a_host_for_openssh(cx: &mut TestAppContext) {
+        let (vault, cx, _) = open_vault(cx);
+        click(cx, "host-bastion");
+        click(cx, "copy-command");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        let expected = vault.read_with(cx, |vault, _| {
+            tern_core::openssh::ssh_command(&vault.vault, vault.vault.find("bastion").unwrap())
+        });
+        assert_eq!(copied, expected);
+        assert!(copied.starts_with("ssh "), "{copied}");
+        vault.read_with(cx, |vault, _| {
+            assert_eq!(vault.copied, Some("copy-command"))
+        });
+        click(cx, "copy-config");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(copied.starts_with("Host bastion\n"), "{copied}");
     }
 
     #[gpui::test]

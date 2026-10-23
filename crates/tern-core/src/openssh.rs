@@ -409,6 +409,140 @@ fn to_hosts(blocks: &[Block], dir: &Path, user: &str) -> Vec<Host> {
     hosts
 }
 
+/// `host` as one `ssh` command line, for a terminal without Tern: its
+/// port, key, jump hosts (`-J`), agent forwarding, proxy and the rules
+/// switched on. A key path with spaces is quoted.
+pub fn ssh_command(vault: &Vault, host: &Host) -> String {
+    let (user, auth, _) = vault.sign_in(host);
+    let mut words = vec!["ssh".to_string()];
+    if host.port != 22 {
+        words.push(format!("-p {}", host.port));
+    }
+    if let Auth::Key(path) = &auth {
+        words.push(format!("-i {}", quote(&path.display().to_string())));
+    }
+    let jumps = jump_list(vault, host);
+    if !jumps.is_empty() {
+        words.push(format!("-J {jumps}"));
+    }
+    if host.agent_forwarding {
+        words.push("-A".into());
+    }
+    if let Some(proxy) = &vault.first_hop_host(host).proxy {
+        words.push(format!(
+            "-o {}",
+            quote(&format!("ProxyCommand={}", proxy_command(proxy)))
+        ));
+    }
+    for forward in host.forwards.iter().filter(|forward| forward.on) {
+        words.push(format!("{} {}", forward.flag(), forward_spec(forward)));
+    }
+    words.push(format!("{user}@{}", host.address));
+    words.join(" ")
+}
+
+/// `host` as a `Host` block for `~/.ssh/config`, which the importer reads
+/// back as the same host.
+pub fn config_block(vault: &Vault, host: &Host) -> String {
+    let (user, auth, _) = vault.sign_in(host);
+    let alias: String = host
+        .name
+        .chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .collect();
+    let mut lines = vec![
+        format!("Host {alias}"),
+        format!("    HostName {}", host.address),
+        format!("    User {user}"),
+    ];
+    if host.port != 22 {
+        lines.push(format!("    Port {}", host.port));
+    }
+    if let Auth::Key(path) = &auth {
+        lines.push(format!(
+            "    IdentityFile {}",
+            quote(&path.display().to_string())
+        ));
+    }
+    let jumps = jump_list(vault, host);
+    if !jumps.is_empty() {
+        lines.push(format!("    ProxyJump {jumps}"));
+    } else if let Some(proxy) = &host.proxy {
+        lines.push(format!("    ProxyCommand {}", proxy_command(proxy)));
+    }
+    if host.agent_forwarding {
+        lines.push("    ForwardAgent yes".into());
+    }
+    lines.push(format!(
+        "    ServerAliveInterval {}",
+        if host.keep_alive { 30 } else { 0 }
+    ));
+    for forward in host.forwards.iter().filter(|forward| forward.on) {
+        let keyword = match forward.kind {
+            ForwardKind::Local => "LocalForward",
+            ForwardKind::Remote => "RemoteForward",
+            ForwardKind::Dynamic => "DynamicForward",
+        };
+        // `port host:port`, as the config writes it.
+        lines.push(format!(
+            "    {keyword} {}",
+            forward_spec(forward).replacen(':', " ", 1)
+        ));
+    }
+    if !host.env.is_empty() {
+        lines.push(format!("    SetEnv {}", crate::env::format(&host.env)));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// `host`'s jump hosts as `-J` and `ProxyJump` take them: `user@host:port`,
+/// first hop first, comma-separated.
+fn jump_list(vault: &Vault, host: &Host) -> String {
+    vault
+        .jumps(host)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|via| {
+            let (user, _, _) = vault.sign_in(via);
+            if via.port == 22 {
+                format!("{user}@{}", via.address)
+            } else {
+                format!("{user}@{}:{}", via.address, via.port)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A rule as `-L`/`-R`/`-D` take it: `port:host:port`, or the port alone.
+fn forward_spec(forward: &Forward) -> String {
+    match forward.kind {
+        ForwardKind::Dynamic => forward.listen_port.to_string(),
+        _ => format!(
+            "{}:{}:{}",
+            forward.listen_port, forward.to_host, forward.to_port
+        ),
+    }
+}
+
+/// `nc` reaching a host through `proxy`, as `ProxyCommand` runs it.
+fn proxy_command(proxy: &Proxy) -> String {
+    let kind = match proxy.kind {
+        ProxyKind::Socks5 => "5",
+        ProxyKind::Http => "connect",
+    };
+    format!("nc -X {kind} -x {}:{} %h %p", proxy.host, proxy.port)
+}
+
+/// `text` in double quotes when it has spaces.
+fn quote(text: &str) -> String {
+    if text.contains(char::is_whitespace) {
+        format!("\"{text}\"")
+    } else {
+        text.to_string()
+    }
+}
+
 /// The proxy an `nc`/`ncat` `ProxyCommand` goes through: `-X 5` (or none)
 /// is SOCKS5 and `-X connect` HTTP, with the proxy after `-x`.
 fn proxy_of_command(words: &[String]) -> Option<Proxy> {
@@ -568,6 +702,50 @@ Host *
             find(&hosts, "legacy").jump.as_deref(),
             Some("bastion (OpenSSH)")
         );
+    }
+
+    #[test]
+    fn writes_hosts_back_for_openssh() {
+        let mut vault = Vault::default();
+        let mut bastion = Host::new("bastion", "admin", "bastion.example.com", 2222);
+        bastion.auth = Auth::Agent;
+        vault.save(None, bastion, "Prod");
+        let mut db = Host::new("prod db", "deploy", "10.0.4.21", 22);
+        db.jump = Some("bastion".into());
+        db.agent_forwarding = true;
+        db.keep_alive = false;
+        db.env = crate::env::parse("LANG=C.UTF-8").unwrap();
+        let mut rule = Forward::typed(ForwardKind::Local, "5433", "localhost:5432").unwrap();
+        rule.on = true;
+        db.forwards.push(rule);
+        vault.save(None, db.clone(), "Prod");
+
+        assert_eq!(
+            ssh_command(&vault, &db),
+            "ssh -J admin@bastion.example.com:2222 -A -L 5433:localhost:5432 deploy@10.0.4.21"
+        );
+        let block = config_block(&vault, &db);
+        assert!(
+            block.starts_with("Host prod-db\n    HostName 10.0.4.21\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("    ProxyJump admin@bastion.example.com:2222\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("    LocalForward 5433 localhost:5432\n"),
+            "{block}"
+        );
+
+        // Read back, it's the same host.
+        let read = importable(&Vault::default(), &block, Path::new("."), "someone");
+        let again = read.iter().find(|host| host.name == "prod-db").unwrap();
+        assert_eq!(again.target(), "deploy@10.0.4.21");
+        assert!(again.agent_forwarding && !again.keep_alive);
+        assert_eq!(again.env, db.env);
+        assert_eq!(again.forwards.len(), 1);
+        assert_eq!(again.jump.as_deref(), Some("bastion.example.com"));
     }
 
     #[test]
