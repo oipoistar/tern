@@ -88,6 +88,7 @@ tests are ignored unless asked for, and need `docker` on the `PATH`:
 
 ```sh
 dev/lab/setup.sh                                              # make its keys, start it
+cargo run -p tern-core --example lab_hosts                    # add its servers to Tern's vault (quit Tern first)
 cargo test -p tern-core --test lab -- --ignored --nocapture   # Tern's SSH against every server
 cargo test -p tern-app lab -- --ignored --nocapture           # the app's panes, keyboard only
 docker compose -f dev/lab/compose.yaml down                   # stop it
