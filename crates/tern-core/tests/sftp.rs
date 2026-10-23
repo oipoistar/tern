@@ -1,12 +1,13 @@
 //! End-to-end checks of SFTP over a session, against the in-process server
 //! serving a scratch folder: listing with item counts, downloading and
-//! uploading with progress, and never replacing a file.
+//! uploading with progress, never replacing a file, and renaming, making
+//! folders, changing permissions and deleting.
 
 mod common;
 
 use common::*;
 use russh::keys::{Algorithm, PrivateKey};
-use tern_core::sftp::{Entry, Progress, list_local};
+use tern_core::sftp::{Entry, Progress, list_local, mkdir_local, remove_local, rename_local};
 use tern_core::ssh::{Credential, Event, Session, check_host_key};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -55,13 +56,15 @@ async fn copies_files_both_ways() {
                 name: "docs".into(),
                 dir: true,
                 size: listed[0].size,
-                items: Some(2)
+                items: Some(2),
+                mode: listed[0].mode,
             },
             Entry {
                 name: "hello.txt".into(),
                 dir: false,
                 size: 15,
-                items: None
+                items: None,
+                mode: listed[1].mode,
             },
         ]
     );
@@ -112,6 +115,58 @@ async fn copies_files_both_ways() {
         .map(|entry| entry.name)
         .collect();
     assert_eq!(names, ["big.bin", "hello (2).txt", "hello.txt"]);
+
+    // Managing files on the host: a folder, a rename into it, permissions,
+    // and deleting the folder with what it holds.
+    sftp.mkdir("/new").await.unwrap();
+    assert!(
+        sftp.mkdir("/new")
+            .await
+            .unwrap_err()
+            .contains("already exists")
+    );
+    sftp.rename("/hello.txt", "/new/greeting.txt")
+        .await
+        .unwrap();
+    assert!(served.join("new").join("greeting.txt").exists());
+    sftp.upload(here.join("hello.txt"), "/", Progress::default())
+        .await
+        .unwrap();
+    assert!(
+        sftp.rename("/hello.txt", "/new/greeting.txt")
+            .await
+            .unwrap_err()
+            .contains("already exists"),
+        "nothing is replaced"
+    );
+    let mode_of = |entries: Vec<Entry>, name: &str| {
+        entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.mode)
+            .unwrap()
+    };
+    sftp.set_mode("/new/greeting.txt", 0o444).await.unwrap();
+    assert_eq!(
+        mode_of(sftp.list("/new").await.unwrap(), "greeting.txt") & 0o222,
+        0
+    );
+    sftp.set_mode("/new/greeting.txt", 0o644).await.unwrap();
+    assert_ne!(
+        mode_of(sftp.list("/new").await.unwrap(), "greeting.txt") & 0o200,
+        0
+    );
+    sftp.remove("/new", true).await.unwrap();
+    assert!(!served.join("new").exists());
+    sftp.remove("/hello.txt", false).await.unwrap();
+    assert!(!served.join("hello.txt").exists());
+
+    // And on this computer.
+    mkdir_local(&here.join("box")).unwrap();
+    rename_local(&here.join("big.bin"), &here.join("box").join("big.bin")).unwrap();
+    assert!(rename_local(&here.join("hello.txt"), &here.join("hello (2).txt")).is_err());
+    remove_local(&here.join("box"), true).unwrap();
+    assert!(!here.join("box").exists());
 
     drop((input, events));
     let _ = std::fs::remove_dir_all(&scratch);

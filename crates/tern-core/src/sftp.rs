@@ -1,5 +1,6 @@
 //! Files over a session's connection, with SFTP: listing folders on the host
-//! and on this computer, and copying files either way with progress. A copy
+//! and on this computer, copying files either way with progress, and
+//! renaming, deleting, making folders and changing permissions. A copy
 //! never replaces a file; it takes the next free name instead.
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ pub struct Entry {
     pub size: u64,
     /// How many things a folder holds, when they were counted.
     pub items: Option<usize>,
+    /// Permission bits (`0o755`), where the side reports them.
+    pub mode: Option<u32>,
 }
 
 /// How far a copy has got. Clones share it, so the copy updates it and a
@@ -120,6 +123,7 @@ impl Sftp {
                         dir: metadata.is_dir(),
                         size: metadata.len(),
                         items: None,
+                        mode: metadata.permissions.map(|mode| mode & 0o7777),
                     }
                 })
                 .filter(|entry| entry.name != "." && entry.name != "..")
@@ -148,6 +152,66 @@ impl Sftp {
                 entries[index].items = items;
             }
             Ok(entries)
+        })
+    }
+
+    /// Renames (or moves) `from` to `to` on the host. Refused if `to`
+    /// exists, so nothing is replaced.
+    pub fn rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> impl Future<Output = Result<(), String>> + 'static {
+        let (sftp, from, to) = (self.0.clone(), from.to_string(), to.to_string());
+        spawn(async move {
+            if sftp.try_exists(to.clone()).await.unwrap_or(false) {
+                return Err(format!("{} already exists", name_of(&to)));
+            }
+            sftp.rename(from, to)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Makes the folder `path` on the host.
+    pub fn mkdir(&self, path: &str) -> impl Future<Output = Result<(), String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move {
+            if sftp.try_exists(path.clone()).await.unwrap_or(false) {
+                return Err(format!("{} already exists", name_of(&path)));
+            }
+            sftp.create_dir(path)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Deletes the file `path` on the host, or the folder with everything
+    /// in it.
+    pub fn remove(
+        &self,
+        path: &str,
+        dir: bool,
+    ) -> impl Future<Output = Result<(), String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move { remove_remote(&sftp, path, dir).await })
+    }
+
+    /// Sets the permission bits of `path` on the host.
+    pub fn set_mode(
+        &self,
+        path: &str,
+        mode: u32,
+    ) -> impl Future<Output = Result<(), String>> + 'static {
+        let (sftp, path) = (self.0.clone(), path.to_string());
+        spawn(async move {
+            let attributes = russh_sftp::protocol::FileAttributes {
+                permissions: Some(mode & 0o7777),
+                ..Default::default()
+            };
+            sftp.set_metadata(path, attributes)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 
@@ -228,6 +292,122 @@ impl Sftp {
     }
 }
 
+/// Deletes a folder's contents depth first, then the folder.
+async fn remove_remote(sftp: &SftpSession, path: String, dir: bool) -> Result<(), String> {
+    let failed = |error: russh_sftp::client::error::Error| error.to_string();
+    if !dir {
+        return sftp.remove_file(path).await.map_err(failed);
+    }
+    // Iteratively, folders still to empty on a stack, so deep trees don't
+    // need recursion in an async fn.
+    let mut pending = vec![(path, false)];
+    while let Some((folder, emptied)) = pending.pop() {
+        if emptied {
+            sftp.remove_dir(folder).await.map_err(failed)?;
+            continue;
+        }
+        pending.push((folder.clone(), true));
+        for entry in sftp.read_dir(folder.clone()).await.map_err(failed)? {
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = join(&folder, &name);
+            if entry.metadata().is_dir() {
+                pending.push((child, false));
+            } else {
+                sftp.remove_file(child).await.map_err(failed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The last part of an SFTP path.
+fn name_of(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Renames `from` to `to` on this computer; refused if `to` exists.
+pub fn rename_local(from: &Path, to: &Path) -> Result<(), String> {
+    if to.exists() {
+        let name = to.file_name().unwrap_or_default().to_string_lossy();
+        return Err(format!("{name} already exists"));
+    }
+    std::fs::rename(from, to).map_err(|error| error.to_string())
+}
+
+/// Makes the folder `path` on this computer.
+pub fn mkdir_local(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|error| error.to_string())
+}
+
+/// Deletes the file `path` on this computer, or the folder with everything
+/// in it.
+pub fn remove_local(path: &Path, dir: bool) -> Result<(), String> {
+    if dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// A file or folder name as typed for renaming or a new folder: trimmed,
+/// and refused if empty, `.` or `..`, or holding a path separator.
+pub fn check_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("A name is required".into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("{name} can't be a name"));
+    }
+    if name.contains(['/', '\\']) {
+        return Err("A name can't contain / or \\".into());
+    }
+    Ok(name)
+}
+
+/// Permission bits as `ls` shows them: `rwxr-xr-x`.
+pub fn mode_text(mode: u32) -> String {
+    let mut text = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        text.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        text.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        text.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+    }
+    text
+}
+
+/// Permission bits typed in octal (`755`, `0644`) or as `ls` shows them
+/// (`rw-r--r--`).
+pub fn parse_mode(text: &str) -> Result<u32, String> {
+    let text = text.trim();
+    let wrong = || format!("{text} isn't a mode like 755 or rwxr-xr-x");
+    if text.len() == 9 && text.chars().all(|c| "rwx-".contains(c)) {
+        let mut mode = 0;
+        for (at, c) in text.chars().enumerate() {
+            let expected = ['r', 'w', 'x'][at % 3];
+            if c == expected {
+                mode |= 1 << (8 - at);
+            } else if c != '-' {
+                return Err(wrong());
+            }
+        }
+        return Ok(mode);
+    }
+    let digits = text.strip_prefix("0o").unwrap_or(text);
+    if (3..=4).contains(&digits.len()) && digits.chars().all(|c| ('0'..='7').contains(&c)) {
+        return u32::from_str_radix(digits, 8).map_err(|_| wrong());
+    }
+    Err(wrong())
+}
+
 /// What the folder `dir` on this computer holds, like [`Sftp::list`].
 pub fn list_local(dir: &Path) -> Result<Vec<Entry>, String> {
     let read = std::fs::read_dir(dir).map_err(|error| error.to_string())?;
@@ -243,11 +423,24 @@ pub fn list_local(dir: &Path) -> Result<Vec<Entry>, String> {
                 items: dir
                     .then(|| std::fs::read_dir(entry.path()).ok().map(Iterator::count))
                     .flatten(),
+                mode: local_mode(&metadata),
             })
         })
         .collect();
     sort(&mut entries);
     Ok(entries)
+}
+
+#[cfg(unix)]
+fn local_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Some(metadata.permissions().mode() & 0o7777)
+}
+
+/// Windows has no permission bits to show.
+#[cfg(not(unix))]
+fn local_mode(_: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 /// Folders first, then by name ignoring case.
@@ -317,6 +510,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checks_names_and_reads_modes() {
+        assert_eq!(check_name("  notes.txt "), Ok("notes.txt"));
+        assert!(check_name("").is_err());
+        assert!(check_name("..").is_err());
+        assert!(check_name("a/b").unwrap_err().contains('/'));
+        assert!(check_name("a\\b").is_err());
+
+        assert_eq!(mode_text(0o755), "rwxr-xr-x");
+        assert_eq!(mode_text(0o640), "rw-r-----");
+        assert_eq!(parse_mode("755"), Ok(0o755));
+        assert_eq!(parse_mode("0644"), Ok(0o644));
+        assert_eq!(parse_mode("rw-r-----"), Ok(0o640));
+        assert_eq!(parse_mode(&mode_text(0o751)), Ok(0o751));
+        assert!(parse_mode("999").is_err());
+        assert!(parse_mode("rwxrwxrwz").is_err());
+        assert!(parse_mode("xw-r--r--").is_err());
+    }
+
+    #[test]
     fn joins_and_climbs_sftp_paths() {
         assert_eq!(join("/", "etc"), "/etc");
         assert_eq!(join("/home/me", "notes.txt"), "/home/me/notes.txt");
@@ -350,13 +562,15 @@ mod tests {
                     name: "Beta".into(),
                     dir: true,
                     size: 0,
-                    items: Some(1)
+                    items: Some(1),
+                    mode: entries[0].mode,
                 },
                 Entry {
                     name: "alpha.txt".into(),
                     dir: false,
                     size: 5,
-                    items: None
+                    items: None,
+                    mode: entries[1].mode,
                 },
             ]
         );

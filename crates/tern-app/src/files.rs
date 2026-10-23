@@ -1,13 +1,16 @@
 //! The Files panel beside a session's panes: SFTP on the host, or this
-//! computer's folders, with a path bar (Up, Upload, Refresh), a list of
-//! names with sizes or item counts, and transfers with an ink progress bar
-//! and a check when done. Clicking a file copies it to the other side's
-//! folder; files dropped on the panel upload to the host's folder.
+//! computer's folders, with a path bar (Up, New folder, Upload, Refresh), a
+//! list of names with sizes or item counts, and transfers with an ink
+//! progress bar and a check when done. Clicking a file copies it to the
+//! other side's folder; files dropped on the panel upload to the host's
+//! folder. Hovering a row offers rename, permissions (on the host) and
+//! delete, which a line under the path bar takes or confirms.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::sftp::{self, Entry, Progress, Sftp};
@@ -22,6 +25,25 @@ const PROGRESS_TICK: Duration = Duration::from_millis(100);
 enum Side {
     Remote,
     Local,
+}
+
+/// What the line under the path bar is doing.
+#[derive(Clone)]
+enum Change {
+    Rename(Entry),
+    NewFolder,
+    Mode(Entry),
+    Delete(Entry),
+}
+
+/// The line under the path bar: a name or mode to type, or a delete to
+/// confirm.
+struct Form {
+    change: Change,
+    /// `None` for a delete.
+    input: Option<Entity<InputState>>,
+    problem: Option<SharedString>,
+    _enter: Option<Subscription>,
 }
 
 struct Transfer {
@@ -41,6 +63,7 @@ pub struct FilesPanel {
     remote: Vec<Entry>,
     local: Vec<Entry>,
     transfers: Vec<Transfer>,
+    form: Option<Form>,
     _opening: Task<()>,
     _ticker: Option<Task<()>>,
 }
@@ -79,6 +102,7 @@ impl FilesPanel {
             remote: Vec::new(),
             local,
             transfers: Vec::new(),
+            form: None,
             _opening: task,
             _ticker: None,
         }
@@ -121,6 +145,112 @@ impl FilesPanel {
                 self.problem = None;
             }
             Err(problem) => self.problem = Some(problem.into()),
+        }
+        cx.notify();
+    }
+
+    /// Opens the line under the path bar for `change`, with the field
+    /// focused and filled with what's there now.
+    fn begin(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
+        let value = match &change {
+            Change::Rename(entry) => Some(entry.name.clone()),
+            Change::NewFolder => Some(String::new()),
+            Change::Mode(entry) => Some(format!("{:o}", entry.mode.unwrap_or(0o644))),
+            Change::Delete(_) => None,
+        };
+        let input = value.map(|value| {
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            input
+        });
+        let enter = input.as_ref().map(|input| {
+            cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.apply(cx);
+                }
+            })
+        });
+        self.form = Some(Form {
+            change,
+            input,
+            problem: None,
+            _enter: enter,
+        });
+        cx.notify();
+    }
+
+    /// Does what the line under the path bar says; a problem keeps it open.
+    fn apply(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.form else {
+            return;
+        };
+        let typed = form
+            .input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        let change = form.change.clone();
+        let name = match &change {
+            Change::Rename(_) | Change::NewFolder => match sftp::check_name(&typed) {
+                Ok(name) => name.to_string(),
+                Err(problem) => return self.refuse(problem, cx),
+            },
+            Change::Mode(entry) | Change::Delete(entry) => entry.name.clone(),
+        };
+        match self.side {
+            Side::Local => {
+                let path = |name: &str| self.local_dir.join(name);
+                let done = match &change {
+                    Change::Rename(entry) => sftp::rename_local(&path(&entry.name), &path(&name)),
+                    Change::NewFolder => sftp::mkdir_local(&path(&name)),
+                    Change::Delete(entry) => sftp::remove_local(&path(&entry.name), entry.dir),
+                    Change::Mode(_) => Ok(()),
+                };
+                self.finish(done, cx);
+            }
+            Side::Remote => {
+                let Some(sftp) = self.sftp.clone() else {
+                    return;
+                };
+                let path = |name: &str| sftp::join(&self.remote_dir, name);
+                let work: std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>> =
+                    match &change {
+                        Change::Rename(entry) => {
+                            Box::pin(sftp.rename(&path(&entry.name), &path(&name)))
+                        }
+                        Change::NewFolder => Box::pin(sftp.mkdir(&path(&name))),
+                        Change::Delete(entry) => {
+                            Box::pin(sftp.remove(&path(&entry.name), entry.dir))
+                        }
+                        Change::Mode(entry) => match sftp::parse_mode(&typed) {
+                            Ok(mode) => Box::pin(sftp.set_mode(&path(&entry.name), mode)),
+                            Err(problem) => return self.refuse(problem, cx),
+                        },
+                    };
+                cx.spawn(async move |this, cx| {
+                    let done = work.await;
+                    let _ = this.update(cx, |this, cx| this.finish(done, cx));
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn refuse(&mut self, problem: String, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.problem = Some(problem.into());
+        }
+        cx.notify();
+    }
+
+    /// After a change: closed and listed again, or the reason it failed.
+    fn finish(&mut self, done: Result<(), String>, cx: &mut Context<Self>) {
+        match done {
+            Ok(()) => {
+                self.form = None;
+                self.refresh(cx);
+            }
+            Err(problem) => self.refuse(problem, cx),
         }
         cx.notify();
     }
@@ -286,6 +416,11 @@ impl FilesPanel {
                     .text_ellipsis_start()
                     .child(path),
             )
+            .when(self.side == Side::Local || self.sftp.is_some(), |d| {
+                d.child(small("files-new-folder", IconName::FolderPlus).on_click(
+                    cx.listener(|this, _, window, cx| this.begin(Change::NewFolder, window, cx)),
+                ))
+            })
             .when(self.side == Side::Remote && self.sftp.is_some(), |d| {
                 d.child(
                     small("files-upload", IconName::Upload).on_click(
@@ -309,9 +444,33 @@ impl FilesPanel {
         };
         let clicked = entry.clone();
         let hover = t.card2;
+        let group: SharedString = format!("file-row-{index}").into();
+        let action = |name: &'static str, glyph: IconName, change: Change| {
+            let id = format!("file-{name}-{index}");
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
+                .size(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.))
+                .opacity(0.)
+                .group_hover(group.clone(), |s| s.opacity(1.))
+                .hover(|s| s.bg(t.card))
+                .child(icon(glyph, 13., t.text2))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.begin(change.clone(), window, cx);
+                }))
+        };
+        let permissions = (self.side == Side::Remote && entry.mode.is_some())
+            .then(|| action("mode", IconName::Lock, Change::Mode(entry.clone())));
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
+            .group(group.clone())
             .h(px(34.))
             .px(px(8.))
             .flex()
@@ -346,7 +505,119 @@ impl FilesPanel {
                     .text_color(t.text3)
                     .child(detail),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .child(action(
+                        "rename",
+                        IconName::Pencil,
+                        Change::Rename(entry.clone()),
+                    ))
+                    .children(permissions)
+                    .child(action(
+                        "delete",
+                        IconName::Trash,
+                        Change::Delete(entry.clone()),
+                    )),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.open(&clicked, cx)))
+    }
+
+    /// The line under the path bar: a field with Save, or a delete to
+    /// confirm; its problem in a line below.
+    fn form(&self, form: &Form, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let button = |id: &'static str, label: &'static str, color: Hsla| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(30.))
+                .px(px(10.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .rounded(px(9.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|s| s.bg(t.card))
+                .child(label)
+        };
+        let action = match &form.change {
+            Change::Delete(_) => ("files-confirm", "Delete", t.danger),
+            _ => ("files-confirm", "Save", t.text),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .h(px(38.))
+                    .pl(px(10.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .rounded(px(12.))
+                    .bg(t.card2)
+                    .border_1()
+                    .border_color(if form.problem.is_some() {
+                        t.danger
+                    } else {
+                        t.card2
+                    })
+                    // Escape leaves things as they were.
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.form = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .map(|d| match (&form.input, &form.change) {
+                        (Some(input), change) => d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.))
+                                .when(matches!(change, Change::Mode(_)), |d| d.font_family(MONO))
+                                .child(Input::new(input).appearance(false)),
+                        ),
+                        (None, Change::Delete(entry)) => d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.))
+                                .truncate()
+                                .child(format!("Delete {}?", entry.name)),
+                        ),
+                        (None, _) => d,
+                    })
+                    .child(
+                        button(action.0, action.1, action.2)
+                            .on_click(cx.listener(|this, _, _, cx| this.apply(cx))),
+                    )
+                    .child(
+                        button("files-cancel", "Cancel", t.text2).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.form = None;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .when_some(form.problem.clone(), |d, problem| {
+                d.child(
+                    div()
+                        .px(px(4.))
+                        .text_size(px(12.))
+                        .text_color(t.danger)
+                        .truncate()
+                        .child(problem),
+                )
+            })
     }
 
     fn transfer(&self, transfer: &Transfer, t: &Theme) -> impl IntoElement {
@@ -472,6 +743,9 @@ impl Render for FilesPanel {
                     })),
             )
             .child(self.path_bar(t, cx))
+            .when_some(self.form.as_ref(), |d, form| {
+                d.child(self.form(form, t, cx))
+            })
             .when_some(self.problem.clone(), |d, problem| {
                 d.child(
                     div()
@@ -579,6 +853,52 @@ mod tests {
             assert_eq!(panel.local_dir, dir);
             assert_eq!(panel.local[0].items, Some(1));
         });
+
+        // A new folder, named in the line under the path bar.
+        click(cx, "files-new-folder");
+        cx.simulate_input("box");
+        cx.simulate_keystrokes("enter");
+        assert!(dir.join("box").is_dir());
+        let names = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .local
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(names(cx), ["box", "photos", "notes.txt"]);
+
+        // Rename: a name with a slash is refused in one line, then fixed.
+        click(cx, "file-rename-2");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input("a/b");
+        click(cx, "files-confirm");
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.form.as_ref().unwrap().problem.is_some())
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input("memo.txt");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(names(cx), ["box", "photos", "memo.txt"]);
+
+        // Delete asks first; Cancel leaves it.
+        click(cx, "file-delete-1");
+        click(cx, "files-cancel");
+        assert!(dir.join("photos").exists());
+        click(cx, "file-delete-1");
+        click(cx, "files-confirm");
+        assert!(!dir.join("photos").exists());
+        assert_eq!(names(cx), ["box", "memo.txt"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

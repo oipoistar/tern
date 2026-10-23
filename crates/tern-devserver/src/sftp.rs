@@ -232,6 +232,29 @@ impl russh_sftp::server::Handler for FsSftp {
         std::fs::rename(self.local(&oldpath), self.local(&newpath)).map_err(code)?;
         Ok(ok(id))
     }
+
+    /// Only permissions change. Windows has none but read-only, which
+    /// follows the owner's write bit.
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        if let Some(mode) = attrs.permissions {
+            let local = self.local(&path);
+            let mut permissions = std::fs::metadata(&local).map_err(code)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                permissions.set_mode(mode & 0o7777);
+            }
+            #[cfg(not(unix))]
+            permissions.set_readonly(mode & 0o200 == 0);
+            std::fs::set_permissions(&local, permissions).map_err(code)?;
+        }
+        Ok(ok(id))
+    }
 }
 
 #[cfg(test)]

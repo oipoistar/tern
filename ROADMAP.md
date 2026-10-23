@@ -130,6 +130,11 @@ claude.ai account). Each item below names the artboard it comes from.
       tern --local; panes split as local shells too, there's no Files or
       History for them, and Restart brings an exited shell back.
       Ctrl+Tab and Ctrl+Shift+Tab go round the tabs, the vault included
+- [x] File management in the Files panel: New folder in the path bar;
+      hovering a row offers rename, permissions on the host (octal or
+      rwx) and delete (folders with what they hold), each taken or
+      confirmed in one line under the path bar, on the host and on this
+      computer; nothing is ever replaced
 
 ## Known gaps in what's built
 
