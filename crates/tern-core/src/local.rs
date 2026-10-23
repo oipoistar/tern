@@ -3,12 +3,17 @@
 
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
 use crate::forward::ForwardState;
 use crate::ssh::{ConnectError, Event, Input, TermSize};
+
+/// How long output still on its way when the shell exits may take to
+/// arrive, where something else can hold the terminal open.
+const DRAIN: Duration = Duration::from_millis(250);
 
 /// The shell a local terminal runs: PowerShell 7 when it's installed, else
 /// Windows PowerShell; elsewhere `$SHELL`, else `/bin/sh`.
@@ -90,16 +95,33 @@ pub(crate) fn run(
         Arc::new(Mutex::new(Some(pair.master)));
     let _ = events.send(Event::Connected);
 
-    let output = events.clone();
-    let pump = std::thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        while let Ok(read) = reader.read(&mut buffer) {
-            if read == 0 || output.send(Event::Output(buffer[..read].to_vec())).is_err() {
-                break;
+    // Output goes out through this until the session closes, and never
+    // after: a job the shell left running may still be writing.
+    let output = Arc::new(Mutex::new(Some(events.clone())));
+    // The pump drops `pumping` when it ends, which `pumped` hears.
+    let (pumping, pumped) = std::sync::mpsc::channel::<()>();
+    let pump = {
+        let output = output.clone();
+        std::thread::spawn(move || {
+            let _pumping = pumping;
+            let mut buffer = [0u8; 8192];
+            while let Ok(read) = reader.read(&mut buffer) {
+                let sent = read > 0
+                    && output.lock().unwrap().as_ref().is_some_and(|events| {
+                        events.send(Event::Output(buffer[..read].to_vec())).is_ok()
+                    });
+                if !sent {
+                    break;
+                }
             }
-        }
-    });
+        })
+    };
 
+    // Set once the shell has been waited for. Its pid is free from then on
+    // and may soon be another process's, so the input side signals the
+    // shell only while holding this, and only before.
+    let reaped = Arc::new(Mutex::new(false));
+    let ending = reaped.clone();
     let mut killer = child.clone_killer();
     let resizer = master.clone();
     let replies = events.clone();
@@ -133,15 +155,28 @@ pub(crate) fn run(
                 Input::Close => break,
             }
         }
-        // The pane closed or asked to: end the shell.
-        let _ = killer.kill();
+        // The pane closed or asked to: end the shell, if it's still there.
+        let reaped = ending.lock().unwrap();
+        if !*reaped {
+            let _ = killer.kill();
+        }
     });
 
     let exit_status = child.wait().ok().map(|status| status.exit_code());
-    // Windows' ConPTY keeps the output open until the terminal itself is
-    // closed, so the pump would wait forever after the shell exits.
+    *reaped.lock().unwrap() = true;
     master.lock().unwrap().take();
-    let _ = pump.join();
+    if cfg!(windows) {
+        // Windows' ConPTY keeps the output open until the terminal itself
+        // is closed, as it was just above; the pump then reads to the end.
+        let _ = pump.join();
+    } else {
+        // Elsewhere the output stays open while anything holds the
+        // terminal, as a job the shell left running (`server &`) does. What
+        // was still on its way gets a moment; the session ends with the
+        // shell.
+        let _ = pumped.recv_timeout(DRAIN);
+    }
+    output.lock().unwrap().take();
     let _ = events.send(Event::Closed { exit_status });
 }
 
