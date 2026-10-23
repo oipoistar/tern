@@ -45,6 +45,9 @@ mod tests {
         assert!(worth_retrying(&ConnectError::Other(
             "connection refused".into()
         )));
+        assert!(!worth_retrying(&ConnectError::JumpRefused(
+            "can't sign in to bastion: authentication failed (tried password)".into()
+        )));
         assert!(!worth_retrying(&ConnectError::AuthFailed {
             tried: Vec::new()
         }));

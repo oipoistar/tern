@@ -968,7 +968,9 @@ impl VaultContent {
             Event::Failed(ConnectError::AuthFailed { .. }) | Event::Prompts(_) => {
                 Some("Signing in needs a terminal".to_string())
             }
-            Event::Failed(ConnectError::Other(message)) => Some(message),
+            Event::Failed(ConnectError::JumpRefused(message) | ConnectError::Other(message)) => {
+                Some(message)
+            }
             Event::Lost => Some("Connection lost".to_string()),
             Event::Closed { .. } => None,
             Event::Connected | Event::Output(_) => return,

@@ -255,6 +255,9 @@ pub enum ConnectError {
     AuthFailed {
         tried: Vec<String>,
     },
+    /// A jump host rejected every credential; the message names it. Like a
+    /// refused sign-in it needs the user, so it isn't tried again.
+    JumpRefused(String),
     Other(String),
 }
 
@@ -277,7 +280,7 @@ impl std::fmt::Display for ConnectError {
             Self::AuthFailed { tried } => {
                 write!(f, "authentication failed (tried {})", tried.join(", "))
             }
-            Self::Other(message) => f.write_str(message),
+            Self::JumpRefused(message) | Self::Other(message) => f.write_str(message),
         }
     }
 }
@@ -321,6 +324,35 @@ pub struct Prompts {
 
 /// How many rounds of questions a sign-in may take before Tern gives up.
 const MAX_PROMPT_ROUNDS: usize = 8;
+
+/// Whether a hidden question asks for the account's password, rather than
+/// a one-time code or a new password (an expired one asks for both).
+fn asks_account_password(prompt: &str) -> bool {
+    let prompt = prompt.to_lowercase();
+    let words: Vec<&str> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let other = [
+        "new",
+        "retype",
+        "repeat",
+        "again",
+        "confirm",
+        "verify",
+        "verification",
+        "otp",
+        "totp",
+        "oath",
+        "token",
+        "code",
+        "pin",
+    ];
+    words.contains(&"password")
+        && !words.iter().any(|word| other.contains(word))
+        && !prompt.contains("one-time")
+        && !prompt.contains("one time")
+}
 
 pub(crate) enum Input {
     Data(Vec<u8>),
@@ -558,7 +590,15 @@ async fn run(
         };
         authenticate(&mut jump_handle, jump, jump_credentials, &mut asker, true)
             .await
-            .map_err(|error| other(format!("can't sign in to {}: {error}", jump.host)))?;
+            .map_err(|error| {
+                let message = format!("can't sign in to {}: {error}", jump.host);
+                // A refusal won't pass by itself, and repeating a wrong
+                // password can lock the account; a dropped line may pass.
+                match error {
+                    ConnectError::AuthFailed { .. } => ConnectError::JumpRefused(message),
+                    _ => other(message),
+                }
+            })?;
         let next = jumps.get(at + 1).map_or(&target, |(next, _)| next);
         let channel = jump_handle
             .channel_open_direct_tcpip(next.host.clone(), next.port.into(), "127.0.0.1", 0)
@@ -1109,6 +1149,7 @@ async fn interactive(
     ask_password: bool,
 ) -> Result<bool> {
     use client::KeyboardInteractiveAuthResponse as Reply;
+    let mut unused = password;
     let mut reply = handle
         .authenticate_keyboard_interactive_start(target.user.as_str(), None)
         .await?;
@@ -1122,18 +1163,17 @@ async fn interactive(
                 ..
             } => (instructions, prompts),
         };
-        let asks_password = |prompt: &client::Prompt| {
-            !prompt.echo && prompt.prompt.to_lowercase().contains("password")
-        };
-        let mut answers: Vec<Option<String>> = prompts
-            .iter()
-            .map(|prompt| {
-                asks_password(prompt)
-                    .then(|| password.map(String::from))
-                    .flatten()
-            })
-            .collect();
-        if prompts.iter().any(asks_password) && password.is_none() && !ask_password {
+        // The password answers the first question for it, once: asked
+        // again, it was wrong, and the user decides what to give.
+        let mut answers: Vec<Option<String>> = Vec::new();
+        let mut needs_password = false;
+        for prompt in &prompts {
+            let account = !prompt.echo && asks_account_password(&prompt.prompt);
+            let answer = account.then(|| unused.take().map(String::from)).flatten();
+            needs_password |= account && answer.is_none();
+            answers.push(answer);
+        }
+        if needs_password && !ask_password {
             return Ok(false);
         }
         let questions: Vec<(String, bool)> = prompts
@@ -1329,6 +1369,27 @@ pub fn parse_command(input: &str) -> Result<(Target, Option<PathBuf>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_only_the_account_password_question() {
+        for asked in [
+            "Password:",
+            "Password for alice@db:",
+            "(current) UNIX password:",
+        ] {
+            assert!(asks_account_password(asked), "{asked}");
+        }
+        for other in [
+            "One-time password (OATH) for `alice':",
+            "New password:",
+            "Retype new password:",
+            "Verification code:",
+            "Password + OTP token:",
+            "Passphrase for key:",
+        ] {
+            assert!(!asks_account_password(other), "{other}");
+        }
+    }
 
     #[test]
     fn parses_bare_destination() {

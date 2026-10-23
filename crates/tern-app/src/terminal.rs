@@ -587,7 +587,9 @@ impl TerminalView {
                         .into(),
                         cx,
                     ),
-                    ConnectError::Other(message) => self.end(message.into(), cx),
+                    ConnectError::JumpRefused(message) | ConnectError::Other(message) => {
+                        self.end(message.into(), cx)
+                    }
                 }
             }
         }

@@ -85,7 +85,8 @@ async fn session_lifecycle() {
         drop(session);
     }
 
-    // A jump host that refuses the sign-in is named in the error.
+    // A jump host that refuses the sign-in is named in the error, which
+    // isn't one to retry.
     let mut through = request(port, password(), None);
     through.jumps = vec![(
         through.target.clone(),
@@ -93,7 +94,7 @@ async fn session_lifecycle() {
     )];
     let mut session = Session::open(through);
     match next(&mut session).await {
-        Event::Failed(ConnectError::Other(message)) => {
+        Event::Failed(ConnectError::JumpRefused(message)) => {
             assert!(
                 message.starts_with("can't sign in to 127.0.0.1"),
                 "{message}"
