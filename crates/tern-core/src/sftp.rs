@@ -162,7 +162,8 @@ impl Sftp {
     }
 
     /// Renames (or moves) `from` to `to` on the host. Refused if `to`
-    /// exists, so nothing is replaced.
+    /// exists, so nothing is replaced, unless `to` is `from` itself in
+    /// another case, on a host whose folders ignore case.
     pub fn rename(
         &self,
         from: &str,
@@ -170,12 +171,27 @@ impl Sftp {
     ) -> impl Future<Output = Result<(), String>> + 'static {
         let (sftp, from, to) = (self.0.clone(), from.to_string(), to.to_string());
         spawn(async move {
-            if sftp.try_exists(to.clone()).await.unwrap_or(false) {
+            let failed = |error: russh_sftp::client::error::Error| error.to_string();
+            if from == to {
+                return Ok(());
+            }
+            if !sftp.try_exists(to.clone()).await.unwrap_or(false) {
+                return sftp.rename(from, to).await.map_err(failed);
+            }
+            if !is_case_change(&sftp, &from, &to).await {
                 return Err(format!("{} already exists", name_of(&to)));
             }
-            sftp.rename(from, to)
+            // OpenSSH won't rename onto a name that exists, and `to` does:
+            // it's `from`. So the name changes by way of a free one.
+            let aside = free_remote_name(&sftp, &parent(&from), name_of(&from)).await;
+            sftp.rename(from.clone(), aside.clone())
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(failed)?;
+            if let Err(error) = sftp.rename(aside.clone(), to).await {
+                let _ = sftp.rename(aside, from).await;
+                return Err(failed(error));
+            }
+            Ok(())
         })
     }
 
@@ -241,13 +257,7 @@ impl Sftp {
             one_name(&name, &['/', '\\'])?;
             let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
             progress.start(source.metadata().await.map_err(failed)?.len());
-            let mut remote = join(&remote_dir, &name);
-            for n in 2.. {
-                if !sftp.try_exists(&remote).await.unwrap_or(false) {
-                    break;
-                }
-                remote = join(&remote_dir, &numbered(&name, n));
-            }
+            let remote = free_remote_name(&sftp, &remote_dir, &name).await;
             let mut target = sftp
                 .create(&remote)
                 .await
@@ -343,6 +353,44 @@ fn is_folder(mode: Option<u32>) -> bool {
     mode.is_some_and(|mode| mode & TYPE == FOLDER)
 }
 
+/// The first of `dir/name`, `dir/name (2)`… on the host that doesn't exist.
+async fn free_remote_name(sftp: &SftpSession, dir: &str, name: &str) -> String {
+    let mut path = join(dir, name);
+    for n in 2.. {
+        if !sftp.try_exists(path.clone()).await.unwrap_or(false) {
+            break;
+        }
+        path = join(dir, &numbered(name, n));
+    }
+    path
+}
+
+/// Whether `to`, which exists on the host, is `from` in another case; see
+/// [`only_case_differs`].
+async fn is_case_change(sftp: &SftpSession, from: &str, to: &str) -> bool {
+    let folder = parent(to);
+    if parent(from) != folder {
+        return false;
+    }
+    let Ok(listing) = sftp.read_dir(folder).await else {
+        return false;
+    };
+    let names: Vec<String> = listing.map(|entry| entry.file_name()).collect();
+    only_case_differs(name_of(from), name_of(to), names.iter().map(String::as_str))
+}
+
+/// Whether renaming `from` to `to`, a name that exists in the same folder,
+/// changes only its case: the two differ only in case, and nothing else in
+/// the folder (`names`) goes by `to`, so the folder ignores case and `to`
+/// is `from` itself.
+fn only_case_differs<'a>(from: &str, to: &str, names: impl IntoIterator<Item = &'a str>) -> bool {
+    let folded = to.to_lowercase();
+    from.to_lowercase() == folded
+        && names
+            .into_iter()
+            .all(|name| name == from || name.to_lowercase() != folded)
+}
+
 /// The last part of an SFTP path.
 fn name_of(path: &str) -> &str {
     path.trim_end_matches('/')
@@ -352,15 +400,42 @@ fn name_of(path: &str) -> &str {
 }
 
 /// Renames `from` to `to` on this computer. Refused if `to` exists, so
-/// nothing is replaced, and if `to` doesn't end in a name this computer
-/// keeps in one folder.
+/// nothing is replaced, unless `to` is `from` itself in another case, in a
+/// folder that ignores case; and refused if `to` doesn't end in a name this
+/// computer keeps in one folder.
 pub fn rename_local(from: &Path, to: &Path) -> Result<(), String> {
     local_target(to)?;
-    if to.exists() {
+    if from == to {
+        return Ok(());
+    }
+    if to.symlink_metadata().is_ok() && !is_local_case_change(from, to) {
         let name = to.file_name().unwrap_or_default().to_string_lossy();
         return Err(format!("{name} already exists"));
     }
     std::fs::rename(from, to).map_err(|error| error.to_string())
+}
+
+/// Whether `to`, which exists on this computer, is `from` in another case;
+/// see [`only_case_differs`].
+fn is_local_case_change(from: &Path, to: &Path) -> bool {
+    let (Some(folder), Some(from_name), Some(to_name)) = (
+        to.parent(),
+        from.file_name().and_then(|name| name.to_str()),
+        to.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return false;
+    };
+    if from.parent() != Some(folder) {
+        return false;
+    }
+    let Ok(listing) = std::fs::read_dir(folder) else {
+        return false;
+    };
+    let names: Vec<String> = listing
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    only_case_differs(from_name, to_name, names.iter().map(String::as_str))
 }
 
 /// Makes the folder `path` on this computer; refused if `path` doesn't end
@@ -687,6 +762,33 @@ mod tests {
         assert!(!is_folder(Some(0o120777)), "a link");
         assert!(!is_folder(Some(0o755)), "no type at all");
         assert!(!is_folder(None));
+    }
+
+    #[test]
+    fn tells_a_change_of_case_from_another_file() {
+        // A folder that ignores case holds the one file under either name.
+        assert!(only_case_differs(
+            "readme.md",
+            "README.md",
+            ["readme.md", "notes.txt"]
+        ));
+        assert!(only_case_differs("Ünïcode", "üNÏCODE", ["Ünïcode"]));
+        // One that minds case can hold both, and the other one stays.
+        assert!(!only_case_differs(
+            "readme.md",
+            "README.md",
+            ["readme.md", "README.md"]
+        ));
+        assert!(!only_case_differs(
+            "readme.md",
+            "Readme.md",
+            ["readme.md", "README.md"]
+        ));
+        assert!(!only_case_differs(
+            "notes.txt",
+            "README.md",
+            ["notes.txt", "readme.md"]
+        ));
     }
 
     #[test]

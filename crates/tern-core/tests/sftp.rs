@@ -1,8 +1,8 @@
 //! End-to-end checks of SFTP over a session, against the in-process server
 //! serving a scratch folder: listing with item counts, downloading and
 //! uploading with progress, never replacing a file nor leaving the chosen
-//! folder, and renaming, making folders, changing permissions and
-//! deleting.
+//! folder, and renaming (case alone too), making folders, changing
+//! permissions and deleting.
 
 mod common;
 
@@ -187,6 +187,22 @@ async fn copies_files_both_ways() {
         mode_of(sftp.list("/new").await.unwrap(), "greeting.txt") & 0o200,
         0
     );
+    // Only the case can change, whether the host's folders mind case or
+    // not, and a rename to the same name changes nothing.
+    sftp.rename("/new/greeting.txt", "/new/Greeting.txt")
+        .await
+        .unwrap();
+    sftp.rename("/new/Greeting.txt", "/new/Greeting.txt")
+        .await
+        .unwrap();
+    let names: Vec<String> = sftp
+        .list("/new")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, ["Greeting.txt"]);
     sftp.remove("/new", true).await.unwrap();
     assert!(!served.join("new").exists());
     sftp.remove("/hello.txt", false).await.unwrap();
@@ -209,11 +225,18 @@ async fn copies_files_both_ways() {
     assert!(rename_local(&here.join("hello.txt"), &here.join("hello (2).txt")).is_err());
     remove_local(&here.join("box"), true).unwrap();
     assert!(!here.join("box").exists());
+    rename_local(&here.join("hello.txt"), &here.join("Hello.txt")).unwrap();
+    let names: Vec<String> = list_local(&here)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, ["hello (2).txt", "Hello.txt"]);
     if cfg!(windows) {
         // Joined to a folder, a name with a drive would replace it.
         let refused = mkdir_local(&here.join("q:notes")).unwrap_err();
         assert!(refused.contains(':'), "{refused}");
-        let refused = rename_local(&here.join("hello.txt"), &here.join("hello.txt:old"));
+        let refused = rename_local(&here.join("Hello.txt"), &here.join("Hello.txt:old"));
         assert!(refused.unwrap_err().contains(':'));
     }
 
