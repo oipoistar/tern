@@ -4,8 +4,13 @@
 
 mod common;
 
-use common::next;
+use std::time::Duration;
+
+use common::next_within;
 use tern_core::ssh::{Event, Session, TermSize};
+
+/// A shell can take a while to start on a cold machine, as CI runners are.
+const START: Duration = Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_this_computers_shell() {
@@ -13,21 +18,24 @@ async fn runs_this_computers_shell() {
         cols: 100,
         rows: 30,
     });
-    let event = next(&mut session).await;
+    let event = next_within(&mut session, START).await;
     assert!(matches!(event, Event::Connected), "{event:?}");
 
     // Windows' ConPTY asks where the cursor is and waits for the answer, as
-    // a real terminal gives it.
+    // a real terminal gives it. A question can arrive split over two reads,
+    // so they're counted in everything seen.
     let mut seen = String::new();
+    let mut answered = 0;
     let mut typed = false;
     loop {
-        match next(&mut session).await {
+        match next_within(&mut session, START).await {
             Event::Output(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if text.contains("\x1b[6n") {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+                let asked = seen.matches("\x1b[6n").count();
+                for _ in answered..asked {
                     session.write(b"\x1b[1;1R".to_vec());
                 }
-                seen.push_str(&text);
+                answered = asked;
                 // Both PowerShell and POSIX shells work this out to 42, so
                 // only the shell's answer matches, not the typed line.
                 if !typed {
@@ -44,7 +52,7 @@ async fn runs_this_computers_shell() {
 
     session.write(b"exit\r".to_vec());
     loop {
-        match next(&mut session).await {
+        match next_within(&mut session, START).await {
             Event::Output(_) => {}
             Event::Closed { exit_status } => {
                 assert_eq!(exit_status, Some(0));

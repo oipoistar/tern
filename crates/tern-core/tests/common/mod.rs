@@ -468,7 +468,12 @@ pub fn request(
 }
 
 pub async fn next(session: &mut Session) -> Event {
-    tokio::time::timeout(Duration::from_secs(10), session.next_event())
+    next_within(session, Duration::from_secs(10)).await
+}
+
+/// The next event, waiting up to `wait` for it.
+pub async fn next_within(session: &mut Session, wait: Duration) -> Event {
+    tokio::time::timeout(wait, session.next_event())
         .await
         .expect("timed out waiting for the session")
         .expect("session ended without an event")
