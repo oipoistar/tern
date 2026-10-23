@@ -1,8 +1,8 @@
 //! Escape sequences Tern acts on itself, picked out of a session's output
 //! before the terminal sees it: shell integration's command marks (OSC
-//! 133, as FinalTerm, iTerm2, WezTerm and Windows Terminal read them) and
-//! inline images (iTerm2's OSC 1337 `File=`). A sequence split between
-//! chunks of output waits for its end.
+//! 133, as FinalTerm, iTerm2, WezTerm and Windows Terminal read them), the
+//! shell's folder (OSC 7) and inline images (iTerm2's OSC 1337 `File=`). A
+//! sequence split between chunks of output waits for its end.
 
 /// What a scan of output found, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +10,8 @@ pub enum Piece {
     /// Output for the terminal, as it came.
     Text(Vec<u8>),
     Mark(Mark),
+    /// The folder the shell is in now, on its host.
+    Folder(String),
     /// An inline image: what followed `File=`, up to the terminator.
     Image(Vec<u8>),
 }
@@ -29,6 +31,7 @@ pub enum Mark {
 
 /// The sequences picked out, by their start after `ESC ]`.
 const MARK: &[u8] = b"133;";
+const FOLDER: &[u8] = b"7;";
 const IMAGE: &[u8] = b"1337;File=";
 /// An unfinished sequence held for longer than this was never one.
 const HOLD_AT_MOST: usize = 64 << 20;
@@ -75,11 +78,11 @@ impl Scanner {
                 continue;
             }
             let body = &rest[2..];
-            let wanted = [MARK, IMAGE]
+            let wanted = [MARK, FOLDER, IMAGE]
                 .into_iter()
                 .find(|prefix| body.starts_with(prefix));
             let Some(prefix) = wanted else {
-                let partial = [MARK, IMAGE]
+                let partial = [MARK, FOLDER, IMAGE]
                     .iter()
                     .any(|prefix| body.len() < prefix.len() && prefix.starts_with(body));
                 if partial {
@@ -97,6 +100,11 @@ impl Scanner {
                     pieces.push(if prefix == MARK {
                         match mark(content) {
                             Some(mark) => Piece::Mark(mark),
+                            None => Piece::Text(Vec::new()),
+                        }
+                    } else if prefix == FOLDER {
+                        match folder(content) {
+                            Some(folder) => Piece::Folder(folder),
                             None => Piece::Text(Vec::new()),
                         }
                     } else {
@@ -144,6 +152,34 @@ fn terminator(body: &[u8]) -> Option<(usize, usize)> {
         0x1b if body.get(at + 1) == Some(&b'\\') => Some((at, at + 2)),
         _ => None,
     })
+}
+
+/// The path in what followed `7;`: a `file://host/path` URL, its
+/// escapes (`%20`) undone. The host is the session's own.
+fn folder(content: &[u8]) -> Option<String> {
+    let url = std::str::from_utf8(content).ok()?;
+    let rest = url.strip_prefix("file://")?;
+    let path = &rest[rest.find('/')?..];
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// The mark in what followed `133;`: `A`, `B`, `C` or `D[;status]`, with any
@@ -210,6 +246,26 @@ mod tests {
         assert_eq!(
             scanner.scan(b"\x1b]2;title\x07"),
             [text("\x1b]2;title\x07")]
+        );
+    }
+
+    #[test]
+    fn picks_the_shells_folder_out() {
+        let mut scanner = Scanner::default();
+        assert_eq!(
+            scanner.scan(b"\x1b]7;file://web-01/srv/my%20app\x07$ "),
+            [Piece::Folder("/srv/my app".into()), text("$ ")]
+        );
+        assert_eq!(
+            scanner.scan(b"\x1b]7;file:///home/lab\x1b\\"),
+            [Piece::Folder("/home/lab".into())]
+        );
+        // Not a file URL: nothing to follow, nothing shown.
+        assert_eq!(scanner.scan(b"\x1b]7;kitty-shell-cwd:/x\x07"), []);
+        // OSC 7 isn't OSC 77 or 777.
+        assert_eq!(
+            scanner.scan(b"\x1b]777;notify;hi\x07"),
+            [text("\x1b]777;notify;hi\x07")]
         );
     }
 

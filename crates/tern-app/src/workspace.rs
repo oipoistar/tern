@@ -1027,6 +1027,18 @@ impl Workspace {
                 TerminalEvent::Pasted(text) => {
                     this.broadcast(&terminal, |pane, cx| pane.type_paste(text, cx), cx)
                 }
+                // The Files panel on the pane follows its shell.
+                TerminalEvent::Folder(folder) => {
+                    let files = this
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| tab.files.clone())
+                        .find(|files| files.read(cx).is_for(&terminal));
+                    if let Some(files) = files {
+                        let folder = folder.clone();
+                        files.update(cx, |files, cx| files.follow(folder, cx));
+                    }
+                }
             },
         ));
     }
@@ -2773,6 +2785,30 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn the_files_panel_follows_its_shell(cx: &mut TestAppContext) {
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        click(cx, "toggle-files");
+        let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        pane.update(cx, |pane, cx| {
+            let moved = b"\x1b]7;file://web-01/srv/my%20app\x07$ ".to_vec();
+            pane.on_session_event(Event::Output(moved), cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let files = workspace.tabs[0]
+                .files
+                .as_ref()
+                .expect("Files is open")
+                .read(cx);
+            // Before SFTP opens, it'll start there.
+            assert_eq!(files.following(), Some("/srv/my app"));
+            assert_eq!(pane.read(cx).folder(), Some("/srv/my app"));
+        });
     }
 
     #[gpui::test]

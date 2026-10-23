@@ -19,6 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::edits::{self, Edit};
 use tern_core::sftp::{self, Entry, Progress, Sftp, Stamp};
+use tern_core::shells;
 
 use crate::terminal::TerminalView;
 use crate::theme::{self, MONO, Theme};
@@ -93,6 +94,8 @@ pub struct FilesPanel {
     transfers: Vec<Transfer>,
     form: Option<Form>,
     edits: Vec<Editing>,
+    /// The folder the pane's shell moved to before SFTP opened, to start in.
+    following: Option<String>,
     /// Files opened in this computer's apps, for tests.
     #[cfg(test)]
     opened: Vec<PathBuf>,
@@ -120,6 +123,7 @@ impl FilesPanel {
             transfers: Vec::new(),
             form: None,
             edits: Vec::new(),
+            following: None,
             #[cfg(test)]
             opened: Vec::new(),
             _opening: Task::ready(()),
@@ -128,6 +132,26 @@ impl FilesPanel {
         };
         panel.open_sftp(pane, None, cx);
         panel
+    }
+
+    /// Goes to the folder the pane's shell moved to; before SFTP opens,
+    /// it starts there.
+    pub fn follow(&mut self, folder: String, cx: &mut Context<Self>) {
+        if self.sftp.is_some() {
+            self.go_remote(folder, cx);
+        } else {
+            self.following = Some(folder);
+        }
+    }
+
+    /// Moves the pane's shell into the host's folder shown; a guarded
+    /// host asks first.
+    pub(crate) fn cd_shell(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane.upgrade() else {
+            return;
+        };
+        let command = format!("cd -- {}\r", shells::quote(&self.remote_dir));
+        pane.update(cx, |pane, cx| pane.type_command(command.into_bytes(), cx));
     }
 
     /// Whether this shows `pane`'s host.
@@ -161,6 +185,7 @@ impl FilesPanel {
                 match opened {
                     Ok((sftp, dir)) => {
                         this.sftp = Some(sftp);
+                        let dir = this.following.take().unwrap_or(dir);
                         this.go_remote(dir, cx);
                     }
                     Err(problem) => this.problem = Some(problem.into()),
@@ -196,6 +221,12 @@ impl FilesPanel {
     #[cfg(test)]
     pub fn session(&self) -> u64 {
         self.session
+    }
+
+    /// The folder to start in once SFTP opens, the shell having moved.
+    #[cfg(test)]
+    pub fn following(&self) -> Option<&str> {
+        self.following.as_deref()
     }
 
     /// Edits the host's file `name` in the folder shown, as its row's
@@ -771,6 +802,32 @@ impl FilesPanel {
                 small("files-refresh", IconName::RefreshCw)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
+            // The shell into this folder; inked while the shell is there.
+            .when(self.side == Side::Remote && self.sftp.is_some(), |d| {
+                let here = self
+                    .pane
+                    .upgrade()
+                    .is_some_and(|pane| pane.read(cx).folder() == Some(self.remote_dir.as_str()));
+                d.child(
+                    div()
+                        .id("files-cd")
+                        .debug_selector(|| "files-cd".into())
+                        .size(px(30.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.))
+                        .cursor_pointer()
+                        .when(here, |d| d.bg(t.text))
+                        .child(icon(
+                            IconName::SquareTerminal,
+                            15.,
+                            if here { t.card } else { t.text2 },
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.cd_shell(cx))),
+                )
+            })
     }
 
     fn row(&self, index: usize, entry: &Entry, t: &Theme, cx: &Context<Self>) -> impl IntoElement {

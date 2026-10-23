@@ -317,6 +317,28 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
             marks.ends_with(&[Marked::Done, Marked::Failed])
         });
         println!("ok    commands are marked, done or failed, as bash reports them");
+
+        // The shell's folder, as bash reports it: Files follows a cd, and
+        // Files' button moves the shell.
+        shell(
+            &view,
+            cx,
+            "PS1='\\[\\e]7;file://$HOSTNAME$PWD\\a\\]'\"$PS1\"; cd /etc && echo moved-$((10+10))",
+            "moved-20",
+        );
+        wait(&view, cx, "the folder told", |view| {
+            view.folder() == Some("/etc")
+        });
+        let folder = view.read_with(cx, |view, _| view.folder().unwrap().to_string());
+        panel.update(cx, |panel, cx| panel.follow(folder, cx));
+        lists("passwd", cx);
+        panel.update(cx, |panel, cx| panel.follow("/usr".into(), cx));
+        lists("bin", cx);
+        panel.update(cx, |panel, cx| panel.cd_shell(cx));
+        wait(&view, cx, "the shell moved", |view| {
+            view.folder() == Some("/usr")
+        });
+        println!("ok    Files follows the shell's folder, and moves the shell");
     }
 
     // A shell inside a container on the host: the stand-in runs it on the

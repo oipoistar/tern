@@ -210,6 +210,8 @@ pub enum TerminalEvent {
     /// The user pasted this text (newlines as returns), for broadcasting:
     /// each pane brackets it as its own shell asked.
     Pasted(String),
+    /// The shell moved to this folder on its host (OSC 7).
+    Folder(String),
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -250,6 +252,8 @@ pub struct TerminalView {
     /// A long command finished while the pane wasn't looked at: whether
     /// it succeeded.
     pub finished: Option<bool>,
+    /// The folder the shell last said it's in.
+    folder: Option<String>,
     /// Inline images shown, by the number their cells carry, oldest first.
     images: HashMap<u16, Placed>,
     image_order: VecDeque<u16>,
@@ -584,7 +588,7 @@ impl TerminalView {
         replay.next += due.len();
         for shown in due {
             match shown {
-                Shown::Output(text) => self.feed(text.as_bytes()),
+                Shown::Output(text) => self.feed(text.as_bytes(), cx),
                 Shown::Resize(cols, rows) => {
                     self.size = TermSize { cols, rows };
                     self.term.resize(GridSize(self.size));
@@ -1058,6 +1062,7 @@ impl TerminalView {
             scanner: Scanner::default(),
             command_since: None,
             finished: None,
+            folder: None,
             images: HashMap::new(),
             image_order: VecDeque::new(),
             next_image: 1,
@@ -1108,7 +1113,7 @@ impl TerminalView {
 
     /// Gives the terminal output, picking out the sequences Tern acts on
     /// itself.
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.scanner.quiet(bytes) {
             self.parser.advance(&mut self.term, bytes);
             return;
@@ -1117,9 +1122,20 @@ impl TerminalView {
             match piece {
                 Piece::Text(text) => self.parser.advance(&mut self.term, &text),
                 Piece::Mark(mark) => self.on_mark(mark),
+                Piece::Folder(folder) => {
+                    if self.folder.as_ref() != Some(&folder) {
+                        self.folder = Some(folder.clone());
+                        cx.emit(TerminalEvent::Folder(folder));
+                    }
+                }
                 Piece::Image(content) => self.place_image(&content),
             }
         }
+    }
+
+    /// The folder the shell last said it's in, when it says (OSC 7).
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
     }
 
     /// Shows an inline image at the cursor over cells written for it,
@@ -1456,7 +1472,7 @@ impl TerminalView {
                 {
                     self.recording = None;
                 }
-                self.feed(&bytes);
+                self.feed(&bytes, cx);
                 self.answer_terminal_events(cx);
                 self.update_preview();
             }

@@ -26,6 +26,12 @@ pub fn end(name: &str) -> String {
     )
 }
 
+/// `text` as one word for a POSIX shell, whatever it holds: in single
+/// quotes, a quote in it ending them for an escaped one.
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// FNV-1a, which stays the same across Rust versions and platforms.
 fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -48,6 +54,14 @@ mod tests {
         // A typed host's key has characters a shell would read.
         let typed = name("me@host'; rm -rf /:22", 3);
         assert!(typed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn quotes_anything_as_one_word() {
+        assert_eq!(quote("/srv/app"), "'/srv/app'");
+        assert_eq!(quote("/srv/my app"), "'/srv/my app'");
+        assert_eq!(quote("it's; rm -rf /"), "'it'\\''s; rm -rf /'");
+        assert_eq!(quote(""), "''");
     }
 
     #[test]

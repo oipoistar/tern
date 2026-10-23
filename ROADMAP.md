@@ -282,6 +282,11 @@ claude.ai account). Each item below names the artboard it comes from.
       continues after the image as in iTerm2, and copied text leaves the
       image out. Recordings keep images, and replays show them. Kitty's
       and Sixel's protocols aren't read yet
+- [x] Files follows the shell: when the shell reports its folder (OSC 7;
+      the README's bash lines do), the pane's Files panel goes there,
+      starting there if SFTP is still opening; a button in its path bar
+      moves the shell into the folder shown (cd, quoted; a guarded host
+      asks first), inked while the shell is there
 
 ## Known gaps in what's built
 
