@@ -625,7 +625,13 @@ impl TerminalView {
         for event in events {
             match event {
                 TermEvent::PtyWrite(text) => self.send(text.into_bytes()),
-                TermEvent::Title(title) => self.title = Some(title.into()),
+                TermEvent::Title(title) => {
+                    self.title = Some(if self.connection.local {
+                        tern_core::local::title(&title).into()
+                    } else {
+                        title.into()
+                    })
+                }
                 TermEvent::ResetTitle => self.title = None,
                 TermEvent::ColorRequest(index, reply) => {
                     let palette = TermPalette::current(cx);
