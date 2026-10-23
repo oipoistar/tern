@@ -12,8 +12,12 @@ path = "src/main.rs"
 tern-core.workspace = true
 gpui-kit.workspace = true
 alacritty_terminal = "0.26"
+# Decoding inline images; GPUI already builds these formats.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [dev-dependencies]
+# Inline images, as tests send them.
+base64 = "0.22"
 tern-core = { workspace = true, features = ["test-support"] }
 # Headless UI tests use GPUI's own test support, from the exact GPUI build
 # gpui-kit pins. (gpui-kit's `test-support` also pulls the separate GPUI Fast

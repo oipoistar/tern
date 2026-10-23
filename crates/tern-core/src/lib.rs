@@ -14,6 +14,7 @@ pub mod fuzzy;
 pub mod history;
 pub mod host;
 pub mod identity;
+pub mod images;
 pub mod keys;
 pub mod known_hosts;
 pub mod links;

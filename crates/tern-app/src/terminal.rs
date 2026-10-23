@@ -13,10 +13,11 @@
 //! while Shift is held, which keeps it for selecting.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Range, RangeInclusive};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
@@ -38,6 +39,7 @@ use tern_core::cast::{Cast, Recorder, Shown};
 use tern_core::containers::{self, Container};
 use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
+use tern_core::images;
 use tern_core::probe::{self, Listening, Vitals};
 use tern_core::reconnect;
 use tern_core::sequences::{Mark, Piece, Scanner};
@@ -70,6 +72,21 @@ const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1
 const PROBE_EVERY: Duration = Duration::from_secs(5);
 /// How often a recording being played moves on.
 const REPLAY_TICK: Duration = Duration::from_millis(33);
+/// What an inline image's cells hold: a character no font draws, in a
+/// colour naming the image (red and green) and its row (blue).
+const PLACEHOLDER: char = '\u{10EEEE}';
+/// Inline images kept, at most: older ones stop showing.
+const IMAGES_KEPT: usize = 64;
+
+/// An inline image placed in the terminal, drawn over its cells.
+struct Placed {
+    image: Arc<RenderImage>,
+    /// Its first column, and the columns and rows it covers.
+    col: usize,
+    cols: u16,
+    rows: u16,
+}
+
 /// A command running this long gets its tab a check when it finishes off
 /// screen.
 const LONG_COMMAND: Duration = Duration::from_secs(10);
@@ -233,6 +250,10 @@ pub struct TerminalView {
     /// A long command finished while the pane wasn't looked at: whether
     /// it succeeded.
     pub finished: Option<bool>,
+    /// Inline images shown, by the number their cells carry, oldest first.
+    images: HashMap<u16, Placed>,
+    image_order: VecDeque<u16>,
+    next_image: u16,
     /// This pane plays back a recording instead of a session: the
     /// recording, unless it couldn't be read.
     played: bool,
@@ -1037,6 +1058,9 @@ impl TerminalView {
             scanner: Scanner::default(),
             command_since: None,
             finished: None,
+            images: HashMap::new(),
+            image_order: VecDeque::new(),
+            next_image: 1,
             played: false,
             replay: None,
             _probing: None,
@@ -1093,9 +1117,71 @@ impl TerminalView {
             match piece {
                 Piece::Text(text) => self.parser.advance(&mut self.term, &text),
                 Piece::Mark(mark) => self.on_mark(mark),
-                Piece::Image(_) => {}
+                Piece::Image(content) => self.place_image(&content),
             }
         }
+    }
+
+    /// Shows an inline image at the cursor over cells written for it,
+    /// leaving the cursor after it on its last row, as iTerm2 does. One
+    /// that isn't shown inline, or can't be read, is left out.
+    fn place_image(&mut self, content: &[u8]) {
+        let Ok(inline) = images::parse(content) else {
+            return;
+        };
+        if !inline.inline {
+            return;
+        }
+        let Ok(decoded) = image::load_from_memory(&inline.data) else {
+            return;
+        };
+        let mut pixels = decoded.into_rgba8();
+        let geometry = self.grid.get();
+        // Before the pane is first drawn, a cell is about this big.
+        let cell = if geometry.cell_width > px(0.) {
+            (geometry.cell_width.as_f32(), geometry.line_height.as_f32())
+        } else {
+            (8., 17.)
+        };
+        let (cols, rows) = images::cells(
+            &inline,
+            pixels.dimensions(),
+            cell,
+            (self.size.cols, self.size.rows),
+        );
+        // GPUI paints BGRA.
+        for pixel in pixels.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
+        let id = self.next_image;
+        self.next_image = self.next_image.checked_add(1).unwrap_or(1);
+        let col = self.term.grid().cursor.point.column.0;
+        self.images.insert(
+            id,
+            Placed {
+                image,
+                col,
+                cols,
+                rows,
+            },
+        );
+        self.image_order.push_back(id);
+        if self.image_order.len() > IMAGES_KEPT
+            && let Some(oldest) = self.image_order.pop_front()
+        {
+            self.images.remove(&oldest);
+        }
+        let mut cells = String::new();
+        for row in 0..rows {
+            if row > 0 {
+                cells += &format!("\r\n\x1b[{}G", col + 1);
+            }
+            cells += &format!("\x1b[38;2;{};{};{}m", id >> 8, id & 0xff, row);
+            cells.extend(std::iter::repeat_n(PLACEHOLDER, usize::from(cols)));
+        }
+        cells += "\x1b[39m";
+        self.parser.advance(&mut self.term, cells.as_bytes());
     }
 
     /// Acts on a shell integration mark, where the output has got to.
@@ -2144,7 +2230,10 @@ impl TerminalView {
     pub(crate) fn output_text(&self) -> String {
         let top = GridPoint::new(self.term.topmost_line(), Column(0));
         let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
-        let text = self.term.bounds_to_string(top, bottom);
+        let text = self
+            .term
+            .bounds_to_string(top, bottom)
+            .replace(PLACEHOLDER, "");
         let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
         let end = lines
             .iter()
@@ -2193,6 +2282,7 @@ impl TerminalView {
         if let Some(text) = self
             .term
             .selection_to_string()
+            .map(|text| text.replace(PLACEHOLDER, ""))
             .filter(|text| !text.is_empty())
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -2444,6 +2534,7 @@ impl TerminalView {
         let mut frame = Frame {
             rows: (0..rows).map(|_| RowFrame::default()).collect(),
             cursor: None,
+            images: Vec::new(),
             ink: palette.foreground,
         };
 
@@ -2466,6 +2557,37 @@ impl TerminalView {
             let cell = indexed.cell;
             if col == 0 {
                 frame.rows[row].mark = marked(cell);
+            }
+            // An inline image's cell: drawn as part of the image.
+            if cell.c == PLACEHOLDER {
+                if let AnsiColor::Spec(Rgb { r, g, b }) = cell.fg {
+                    let id = u16::from(r) << 8 | u16::from(g);
+                    if let Some(placed) = self.images.get(&id) {
+                        let image_row = usize::from(b);
+                        match frame.images.last_mut() {
+                            Some(tile)
+                                if tile.row == row
+                                    && tile.id == id
+                                    && tile.image_row == image_row
+                                    && tile.to == col =>
+                            {
+                                tile.to += 1;
+                            }
+                            _ => frame.images.push(ImageTile {
+                                row,
+                                from: col,
+                                to: col + 1,
+                                id,
+                                image_row,
+                                image: placed.image.clone(),
+                                col: placed.col,
+                                cols: placed.cols,
+                                rows: placed.rows,
+                            }),
+                        }
+                    }
+                }
+                continue;
             }
             let mut fg = resolve(cell.fg, content.colors, palette);
             let mut bg = resolve(cell.bg, content.colors, palette);
@@ -2995,8 +3117,25 @@ impl Metrics {
 struct Frame {
     rows: Vec<RowFrame>,
     cursor: Option<CursorFrame>,
+    /// Inline images' visible stretches of cells.
+    images: Vec<ImageTile>,
     /// The ink of the gutter's marks.
     ink: Hsla,
+}
+
+/// A stretch of a row's cells showing part of an inline image.
+struct ImageTile {
+    row: usize,
+    from: usize,
+    to: usize,
+    id: u16,
+    /// Which of the image's rows the cells show.
+    image_row: usize,
+    image: Arc<RenderImage>,
+    /// Where the whole image sits: its first column, columns and rows.
+    col: usize,
+    cols: u16,
+    rows: u16,
 }
 
 #[derive(Default)]
@@ -3058,6 +3197,32 @@ fn paint_frame(
         )
     };
 
+    // Inline images, each stretch of cells showing its part of the image.
+    for tile in &frame.images {
+        let clip = Bounds::new(
+            at(tile.row, tile.from),
+            size(*cell_width * (tile.to - tile.from) as f32, *line_height),
+        );
+        let top = tile.row as f32 - tile.image_row as f32;
+        let whole = Bounds::new(
+            point(
+                origin.x + *cell_width * tile.col as f32,
+                origin.y + *line_height * top,
+            ),
+            size(
+                *cell_width * f32::from(tile.cols),
+                *line_height * f32::from(tile.rows),
+            ),
+        );
+        let _ = window.paint_image(
+            clip,
+            whole,
+            Corners::default(),
+            tile.image.clone(),
+            0,
+            false,
+        );
+    }
     // Shell integration's marks, in the padding left of the grid: a ring
     // for a command that succeeded, a dot for one that failed.
     for (row, line) in frame.rows.iter().enumerate() {
@@ -3359,6 +3524,33 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn shows_inline_images_over_cells_that_move_with_the_text(cx: &mut TestAppContext) {
+        use base64::Engine as _;
+
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(40, 34, image::Rgba([200, 30, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Five columns wide, as imgcat asks; the height follows.
+        let output = format!("before\r\n\x1b]1337;File=inline=1;width=5:{data}\x07\r\nafter");
+        let (view, cx) = pane_with(cx, &output);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.images.len(), 1);
+            let placed = view.images.values().next().unwrap();
+            assert_eq!((placed.col, placed.cols, placed.rows), (0, 5, 2));
+            // Its cells copy as nothing; the text after it is below it.
+            assert_eq!(view.output_text(), "before\n\n\nafter\n");
+        });
+        // One that isn't shown inline is left out.
+        view.update(cx, |view, cx| {
+            let download = format!("\x1b]1337;File=inline=0:{data}\x07");
+            view.on_session_event(Event::Output(download.into_bytes()), cx)
+        });
+        view.read_with(cx, |view, _| assert_eq!(view.images.len(), 1));
     }
 
     #[gpui::test]

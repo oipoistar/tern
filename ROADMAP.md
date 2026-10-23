@@ -273,6 +273,14 @@ claude.ai account). Each item below names the artboard it comes from.
       command under the pointer, and a command that ran ten seconds or
       more finishing in a tab not on screen gives the tab a check.
       Recordings keep the marks, and replays show them
+- [x] Inline images: iTerm2's OSC 1337 File= images (imgcat and the
+      tools that speak it) show at the cursor, at the size asked for
+      (cells, pixels, a share of the terminal, or their own; never wider
+      than the terminal, their shape kept unless told not to), over
+      cells that move, scroll and clear with the text; the cursor
+      continues after the image as in iTerm2, and copied text leaves the
+      image out. Recordings keep images, and replays show them. Kitty's
+      and Sixel's protocols aren't read yet
 
 ## Known gaps in what's built
 
