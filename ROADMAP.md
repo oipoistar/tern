@@ -294,6 +294,14 @@ claude.ai account). Each item below names the artboard it comes from.
       that finds it back opens a session tab out of the way that runs the
       command once (a guarded host asks first). Waiting commands stay in
       waiting.json in the data folder and never sync
+- [x] Typing that doesn't wait: when echoes take 20 ms or more, what's
+      typed shows at once, faintly, with the cursor after it, and the
+      server's echo takes it over (as mosh does). Guesses show only on a
+      line where an echo already matched one, so what a program reads
+      without echo (a password) never shows, nor anything after a
+      question for a password; a wrong guess drops them all, and
+      full-screen programs aren't guessed. Predict typing in the
+      terminal settings turns it off
 
 ## Known gaps in what's built
 

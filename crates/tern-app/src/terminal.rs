@@ -40,6 +40,7 @@ use tern_core::containers::{self, Container};
 use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
 use tern_core::images;
+use tern_core::predict::{self, Predictor};
 use tern_core::probe::{self, Listening, Vitals};
 use tern_core::reconnect;
 use tern_core::sequences::{Mark, Piece, Scanner};
@@ -254,6 +255,10 @@ pub struct TerminalView {
     pub finished: Option<bool>,
     /// The folder the shell last said it's in.
     folder: Option<String>,
+    /// What's typed and not yet echoed, shown faintly on a slow
+    /// connection, and the timer that gives up on it.
+    predictor: Predictor,
+    _give_up: Option<Task<()>>,
     /// Inline images shown, by the number their cells carry, oldest first.
     images: HashMap<u16, Placed>,
     image_order: VecDeque<u16>,
@@ -1063,6 +1068,8 @@ impl TerminalView {
             command_since: None,
             finished: None,
             folder: None,
+            predictor: Predictor::default(),
+            _give_up: None,
             images: HashMap::new(),
             image_order: VecDeque::new(),
             next_image: 1,
@@ -1116,21 +1123,97 @@ impl TerminalView {
     fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.scanner.quiet(bytes) {
             self.parser.advance(&mut self.term, bytes);
-            return;
-        }
-        for piece in self.scanner.scan(bytes) {
-            match piece {
-                Piece::Text(text) => self.parser.advance(&mut self.term, &text),
-                Piece::Mark(mark) => self.on_mark(mark),
-                Piece::Folder(folder) => {
-                    if self.folder.as_ref() != Some(&folder) {
-                        self.folder = Some(folder.clone());
-                        cx.emit(TerminalEvent::Folder(folder));
+        } else {
+            for piece in self.scanner.scan(bytes) {
+                match piece {
+                    Piece::Text(text) => self.parser.advance(&mut self.term, &text),
+                    Piece::Mark(mark) => self.on_mark(mark),
+                    Piece::Folder(folder) => {
+                        if self.folder.as_ref() != Some(&folder) {
+                            self.folder = Some(folder.clone());
+                            cx.emit(TerminalEvent::Folder(folder));
+                        }
                     }
+                    Piece::Image(content) => self.place_image(&content),
                 }
-                Piece::Image(content) => self.place_image(&content),
             }
         }
+        self.check_guesses(bytes);
+    }
+
+    /// Guesses where what's typed will show, before the server echoes it:
+    /// at the cursor, on a line with nothing after it, outside full-screen
+    /// programs and never after a question for a password.
+    fn predict(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mode = *self.term.mode();
+        if self.played
+            || !settings::current(cx).terminal.predict_typing
+            || mode.contains(TermMode::ALT_SCREEN)
+            || !mode.contains(TermMode::SHOW_CURSOR)
+        {
+            return;
+        }
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        let cols = grid.columns();
+        let row = &grid[cursor.line];
+        let blank_after =
+            (cursor.column.0..cols).all(|col| matches!(row[Column(col)].c, ' ' | '\0'));
+        let before: String = (0..cursor.column.0).map(|col| row[Column(col)].c).collect();
+        if predict::asks_secret(&before) {
+            self.predictor.other_key(true);
+            return;
+        }
+        let now = Instant::now();
+        for c in text.chars() {
+            let at = (cursor.line.0, cursor.column.0);
+            self.predictor.typed(c, at, blank_after, cols, now);
+        }
+        self._give_up = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(predict::GIVE_UP).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.predictor.expire(Instant::now()) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// A key sent to the shell: Backspace takes back the last guess, and
+    /// any other stops guessing until the server answers.
+    fn predict_key(&mut self, keystroke: &Keystroke) {
+        let modifiers = &keystroke.modifiers;
+        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
+        match keystroke.key.as_str() {
+            "backspace" if plain => self.predictor.erased(),
+            key => self.predictor.other_key(key == "enter"),
+        }
+    }
+
+    /// Output was shown: echoed guesses go, and a wrong one drops them all.
+    fn check_guesses(&mut self, bytes: &[u8]) {
+        if self.predictor.is_idle() {
+            return;
+        }
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        let (lines, cols) = (grid.screen_lines() as i32, grid.columns());
+        let cell = |(line, col): predict::Cell| {
+            if (0..lines).contains(&line) && col < cols {
+                grid[GridPoint::new(Line(line), Column(col))].c
+            } else {
+                ' '
+            }
+        };
+        let fed = bytes.contains(&b'\n');
+        let at = (cursor.line.0, cursor.column.0);
+        self.predictor.output(at, fed, cell, Instant::now());
+    }
+
+    /// What's typed and shown before its echo.
+    #[cfg(test)]
+    pub fn guessed(&self) -> String {
+        self.predictor.shown().iter().map(|guess| guess.c).collect()
     }
 
     /// The folder the shell last said it's in, when it says (OSC 7).
@@ -1432,6 +1515,7 @@ impl TerminalView {
             Event::Connected => {
                 let reattached = self.had_shell && self.shell.is_some();
                 self.phase = Phase::Live;
+                self.predictor.clear();
                 // A container's pane leaves the host to the host's.
                 if !self.connection.local && self.connection.container.is_none() {
                     self.probe(cx);
@@ -1664,6 +1748,7 @@ impl TerminalView {
             return;
         }
         self.size = size;
+        self.predictor.clear();
         if let Some(recorder) = &mut self.recording
             && recorder.resize(size.cols, size.rows).is_err()
         {
@@ -1758,8 +1843,10 @@ impl TerminalView {
         match &mut self.phase {
             Phase::Live => {
                 if is_paste(keystroke) {
+                    self.predictor.other_key(false);
                     self.paste(cx);
                 } else if let Some(bytes) = encode_key(keystroke, *self.term.mode()) {
+                    self.predict_key(keystroke);
                     self.send_typed(bytes, cx);
                 } else {
                     return;
@@ -1835,7 +1922,10 @@ impl TerminalView {
     /// Text from the keyboard or an input method.
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         match &mut self.phase {
-            Phase::Live => self.send_typed(text.as_bytes().to_vec(), cx),
+            Phase::Live => {
+                self.predict(text, cx);
+                self.send_typed(text.as_bytes().to_vec(), cx)
+            }
             Phase::Password { typed, .. } | Phase::Questions { typed, .. } => typed.push_str(text),
             _ => return,
         }
@@ -2558,9 +2648,19 @@ impl TerminalView {
         let show_cursor = matches!(self.phase, Phase::Live)
             && content.mode.contains(TermMode::SHOW_CURSOR)
             && cursor.shape != CursorShape::Hidden;
-        let cursor_row = cursor.point.line.0 + offset;
+        // What's typed and not echoed yet shows faintly, the cursor after it.
+        let guesses = if content.mode.contains(TermMode::ALT_SCREEN) {
+            &[]
+        } else {
+            self.predictor.shown()
+        };
+        let (cursor_line, cursor_col) = match guesses.last() {
+            Some(last) => (last.at.0, last.at.1 + 1),
+            None => (cursor.point.line.0, cursor.point.column.0),
+        };
+        let cursor_row = cursor_line + offset;
         let cursor_at = (show_cursor && (0..rows as i32).contains(&cursor_row))
-            .then_some((cursor_row as usize, cursor.point.column.0));
+            .then_some((cursor_row as usize, cursor_col));
         let block_cursor = focused && cursor.shape == CursorShape::Block;
         let selection = content.selection;
 
@@ -2676,6 +2776,34 @@ impl TerminalView {
                     text: cell.c.to_string(),
                     style,
                     wide,
+                }),
+            }
+        }
+
+        let faint = palette.foreground.opacity(0.45);
+        for guess in guesses {
+            let row = guess.at.0 + offset;
+            if !(0..rows as i32).contains(&row) {
+                continue;
+            }
+            let (line, col) = (&mut frame.rows[row as usize], guess.at.1);
+            match line.segments.last_mut() {
+                Some(segment) if segment.style.color == faint && segment.end_col == col => {
+                    segment.text.push(guess.c);
+                    segment.end_col += 1;
+                }
+                _ => line.segments.push(Segment {
+                    col,
+                    end_col: col + 1,
+                    text: guess.c.to_string(),
+                    style: Style {
+                        color: faint,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        strike: false,
+                    },
+                    wide: false,
                 }),
             }
         }
@@ -3617,6 +3745,65 @@ mod tests {
             view.seen();
             assert_eq!(view.finished, None);
         });
+    }
+
+    #[gpui::test]
+    fn shows_typing_before_a_slow_echo(cx: &mut TestAppContext) {
+        use std::time::Duration;
+
+        let (view, cx) = pane_with(cx, "$ ");
+        focus(&view, cx);
+        // The faint text on the first line, and where the cursor is drawn.
+        let shown = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                let palette = TermPalette::for_theme(&theme::current(cx));
+                let frame = view.frame(&palette, true, &[]);
+                let faint = palette.foreground.opacity(0.45);
+                let text: String = frame.rows[0]
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.style.color == faint)
+                    .map(|segment| segment.text.as_str())
+                    .collect();
+                let cursor = frame.rows[0]
+                    .backgrounds
+                    .iter()
+                    .find(|span| span.color == palette.cursor)
+                    .map(|span| span.start);
+                (text, cursor)
+            })
+        };
+        let echo = |text: &str, cx: &mut VisualTestContext| {
+            let bytes = text.as_bytes().to_vec();
+            view.update(cx, |view, cx| {
+                view.on_session_event(Event::Output(bytes), cx)
+            });
+        };
+
+        // The first key on a line waits for its echo: it might be a password.
+        cx.simulate_input("l");
+        assert_eq!(shown(cx), (String::new(), Some(2)));
+        std::thread::sleep(Duration::from_millis(30));
+        echo("l", cx);
+
+        // The echo was slow: what's typed now shows at once, the cursor after.
+        cx.simulate_input("s -");
+        assert_eq!(shown(cx), ("s -".into(), Some(6)));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(shown(cx), ("s ".into(), Some(5)));
+        // Echoes take guesses over; a guessed space only moves the cursor.
+        echo("s", cx);
+        assert_eq!(shown(cx), (String::new(), Some(5)));
+        echo(" ", cx);
+        assert_eq!(shown(cx), (String::new(), Some(5)));
+        view.read_with(cx, |view, _| assert!(view.predictor.shown().is_empty()));
+
+        // After Enter, a password asked for: nothing typed shows.
+        cx.simulate_keystrokes("enter");
+        echo("\r\nPassword: ", cx);
+        cx.simulate_input("hunter2");
+        let (text, _) = shown(cx);
+        assert_eq!(text, "");
     }
 
     #[gpui::test]

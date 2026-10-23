@@ -81,6 +81,9 @@ pub struct TerminalSettings {
     /// Ask before pasting several lines into a shell that would run each
     /// as it arrives.
     pub confirm_paste: bool,
+    /// On a slow connection, show what's typed before the server echoes
+    /// it ([`crate::predict`]).
+    pub predict_typing: bool,
     /// A colour scheme by name ([`crate::schemes`]); none follows the
     /// app's look.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +139,7 @@ impl Default for TerminalSettings {
             bell: Bell::Visual,
             copy_on_select: false,
             confirm_paste: true,
+            predict_typing: true,
             colors: None,
             unknown: Unknown::new(),
         }

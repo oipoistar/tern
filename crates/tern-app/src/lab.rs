@@ -544,6 +544,50 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         println!("ok    a command waiting for a host runs once it's back");
     }
 
+    // A slow connection: what's typed shows before its echo, and what a
+    // program reads without echo never shows.
+    {
+        let relay = slow_relay(2202, Duration::from_millis(150));
+        let (view, cx) = pane(cx, here(relay, Some(key())));
+        trust_until_live(&view, cx);
+        shell(&view, cx, "echo ready-$((1+1))", "ready-2");
+        let last_line = |view: &TerminalView| {
+            let text = view.output_text();
+            text.trim_end()
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        cx.simulate_input("e");
+        wait(&view, cx, "the first key's echo", |view| {
+            last_line(view).ends_with("$ e")
+        });
+        cx.simulate_input("cho fast");
+        assert_eq!(view.read_with(cx, |view, _| view.guessed()), "cho fast");
+        wait(&view, cx, "the echoes", |view| {
+            last_line(view).ends_with("$ echo fast") && view.guessed().is_empty()
+        });
+        cx.simulate_keystrokes("enter");
+
+        cx.simulate_input("read -s -p \"$(printf 'Co%s' 'de: ')\" code; echo got-${#code}");
+        cx.simulate_keystrokes("enter");
+        wait(&view, cx, "the question", |view| {
+            last_line(view).ends_with("Code:")
+        });
+        for c in ["h", "u", "n", "t", "e", "r", "2"] {
+            cx.simulate_input(c);
+            std::thread::sleep(Duration::from_millis(60));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| assert!(view.guessed().is_empty()));
+        }
+        cx.simulate_keystrokes("enter");
+        wait(&view, cx, "the answer", |view| {
+            view.output_text().contains("got-7")
+        });
+        println!("ok    on a slow connection typing shows at once, a hidden answer never");
+    }
+
     // The server's key changed: refused, with the line to look at.
     {
         docker(&[
@@ -562,6 +606,51 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         );
         println!("ok    a changed host key: {ended}");
     }
+}
+
+/// A relay on this computer to `port` that holds what it passes for
+/// `delay` each way, like a slow connection; its port.
+fn slow_relay(port: u16, delay: Duration) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = TcpStream::connect(("127.0.0.1", port)) else {
+                continue;
+            };
+            let ways = [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ];
+            for (mut from, mut to) in ways {
+                let (sent, held) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+                std::thread::spawn(move || {
+                    let mut buf = [0; 16384];
+                    while let Ok(n @ 1..) = from.read(&mut buf) {
+                        if sent
+                            .send((Instant::now() + delay, buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                std::thread::spawn(move || {
+                    for (due, bytes) in held {
+                        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                        if to.write_all(&bytes).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(Shutdown::Write);
+                });
+            }
+        }
+    });
+    relay
 }
 
 /// Trusts new keys until the pane signs in or asks for a password; which.
