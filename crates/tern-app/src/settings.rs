@@ -619,6 +619,17 @@ impl SettingsView {
                     t,
                 ))
                 .child(Self::row(
+                    "Confirm pastes",
+                    switch("confirm-paste", terminal.confirm_paste, t)
+                        .debug_selector(|| "confirm-paste".into())
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            update(cx, |settings| {
+                                settings.terminal.confirm_paste = !settings.terminal.confirm_paste
+                            })
+                        })),
+                    t,
+                ))
+                .child(Self::row(
                     "Copy on select",
                     switch("copy-on-select", terminal.copy_on_select, t)
                         .debug_selector(|| "copy-on-select".into())

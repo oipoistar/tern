@@ -43,7 +43,9 @@ use tern_core::ssh::{
 };
 
 use crate::settings;
-use crate::term_input::{MouseReport, encode_key, encode_mouse, wheel_keys};
+use crate::term_input::{
+    MouseReport, encode_key, encode_mouse, paste_needs_confirming, wheel_keys,
+};
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::icon;
 
@@ -148,6 +150,8 @@ pub struct TerminalView {
     pressed: Option<MouseButton>,
     /// The cell the program last heard the pointer was in.
     reported_cell: Option<(usize, usize)>,
+    /// Lines waiting to be pasted until the user says so.
+    pending_paste: Option<String>,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -338,6 +342,7 @@ impl TerminalView {
             link: None,
             pressed: None,
             reported_cell: None,
+            pending_paste: None,
             #[cfg(test)]
             sent: RefCell::default(),
             #[cfg(test)]
@@ -698,6 +703,21 @@ impl TerminalView {
             cx.notify();
             return;
         }
+        // A paste waiting to be confirmed: Enter pastes, Escape doesn't.
+        if self.pending_paste.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => {
+                    if let Some(text) = self.pending_paste.take() {
+                        self.paste_text(text, cx);
+                    }
+                }
+                "escape" => self.pending_paste = None,
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         match &mut self.phase {
             Phase::Live => {
                 if is_paste(keystroke) {
@@ -785,10 +805,23 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Pastes the clipboard, asking first when it has lines the shell
+    /// would run as they arrive.
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        if settings::current(cx).terminal.confirm_paste && paste_needs_confirming(&text, bracketed)
+        {
+            self.pending_paste = Some(text);
+            cx.notify();
+            return;
+        }
+        self.paste_text(text, cx);
+    }
+
+    fn paste_text(&mut self, text: String, cx: &mut Context<Self>) {
         // Terminals expect CR for newlines; bracketed paste lets the shell
         // tell pasted text from typed text.
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1445,6 +1478,61 @@ impl TerminalView {
             self.connection.target.user, self.connection.target.host, self.connection.target.port
         );
 
+        if let Some(text) = &self.pending_paste {
+            let into: SharedString = if self.connection.local {
+                "this computer".into()
+            } else {
+                self.label()
+            };
+            let lines: Vec<&str> = text.trim_end_matches(['\r', '\n']).lines().collect();
+            let shown = lines.len().min(6);
+            return Some(card(
+                format!("Paste {} lines into {}?", lines.len(), into).into(),
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.))
+                        .child(
+                            div()
+                                .id("paste-preview")
+                                .debug_selector(|| "paste-preview".into())
+                                .max_w(px(476.))
+                                .p(px(10.))
+                                .rounded(px(10.))
+                                .bg(theme.card2)
+                                .font_family(MONO)
+                                .text_size(px(12.))
+                                .children(
+                                    lines[..shown]
+                                        .iter()
+                                        .map(|line| div().truncate().child(line.to_string())),
+                                )
+                                .when(lines.len() > shown, |d| d.child("…")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button("paste-confirm", "Paste", true).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(text) = this.pending_paste.take() {
+                                            this.paste_text(text, cx);
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(button("paste-cancel", "Cancel", false).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.pending_paste = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
+                        .into_any_element(),
+                ),
+            ));
+        }
         Some(match &self.phase {
             Phase::Live => return None,
             Phase::Connecting if self.reconnect.is_some() => card(
@@ -2452,6 +2540,35 @@ mod tests {
             // Nothing of it went to a shell.
             assert!(view.sent.borrow().is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn asks_before_pasting_lines_the_shell_would_run(cx: &mut TestAppContext) {
+        use gpui_kit::ClipboardItem;
+
+        let (view, cx) = pane_with(cx, "");
+        let sent = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| String::from_utf8(view.sent.take()).unwrap())
+        };
+        focus(&view, cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("make\nmake install\n".into()));
+
+        // Escape drops it; Enter pastes it.
+        cx.simulate_keystrokes(&shortcut("v"));
+        assert_eq!(sent(cx), "");
+        assert!(cx.debug_bounds("paste-preview").is_some());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(sent(cx), "");
+        cx.simulate_keystrokes(&shortcut("v"));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sent(cx), "make\rmake install\r");
+
+        // A shell with bracketed paste gets it at once, marked as pasted.
+        view.update(cx, |view, cx| {
+            view.on_session_event(Event::Output(b"\x1b[?2004h".to_vec()), cx)
+        });
+        cx.simulate_keystrokes(&shortcut("v"));
+        assert_eq!(sent(cx), "\x1b[200~make\rmake install\r\x1b[201~");
     }
 
     #[gpui::test]

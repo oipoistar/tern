@@ -157,6 +157,13 @@ pub fn encode_mouse(
     Some(bytes)
 }
 
+/// Whether pasting `text` should be confirmed first: it has more than one
+/// line, and without bracketed paste the shell would run each line as it
+/// arrives.
+pub fn paste_needs_confirming(text: &str, bracketed: bool) -> bool {
+    !bracketed && text.trim_end_matches(['\r', '\n']).contains(['\r', '\n'])
+}
+
 /// What a turn of the wheel sends a full-screen program that doesn't take
 /// the mouse (less, man): arrow keys, `lines` up when positive, else down.
 pub fn wheel_keys(lines: i32, mode: TermMode) -> Vec<u8> {
@@ -290,6 +297,19 @@ mod tests {
             encode_mouse(MouseReport::WheelDown, 0, 0, &ctrl(), sgr),
             Some(b"\x1b[<81;1;1M".to_vec())
         );
+    }
+
+    #[test]
+    fn asks_before_pasting_lines_a_shell_would_run() {
+        use super::paste_needs_confirming;
+
+        assert!(paste_needs_confirming("rm -rf build\nmake\n", false));
+        assert!(paste_needs_confirming("a\r\nb", false));
+        // One line, with or without its newline, goes straight in.
+        assert!(!paste_needs_confirming("make\n", false));
+        assert!(!paste_needs_confirming("make", false));
+        // A shell with bracketed paste waits for Enter anyway.
+        assert!(!paste_needs_confirming("a\nb", true));
     }
 
     #[test]

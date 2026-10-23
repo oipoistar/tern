@@ -62,6 +62,9 @@ pub struct TerminalSettings {
     pub bell: Bell,
     /// Selecting text copies it.
     pub copy_on_select: bool,
+    /// Ask before pasting several lines into a shell that would run each
+    /// as it arrives.
+    pub confirm_paste: bool,
     /// A colour scheme by name ([`crate::schemes`]); none follows the
     /// app's look.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +116,7 @@ impl Default for TerminalSettings {
             scrollback: 10_000,
             bell: Bell::Visual,
             copy_on_select: false,
+            confirm_paste: true,
             colors: None,
         }
     }

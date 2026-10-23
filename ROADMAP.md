@@ -172,6 +172,10 @@ claude.ai account). Each item below names the artboard it comes from.
       any common way); the side panel's Wake broadcasts the magic packet
       on the local network (ports 9 and 7) and says Sent. Vault file
       version 10
+- [x] Paste protection: pasting several lines into a shell that would
+      run each as it arrives (no bracketed paste) shows them first, with
+      Paste (Enter) and Cancel (Escape); Settings, Terminal, Confirm
+      pastes turns it off
 
 ## Known gaps in what's built
 
