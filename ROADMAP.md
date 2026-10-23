@@ -49,7 +49,8 @@ claude.ai account). Each item below names the artboard it comes from.
       screen to add, edit and delete them, and a bar under each session
       whose chips type a command and Enter, with a dashed New snippet
 - [x] History (item 7): every connection attempt that ends, with when, how
-      long and how it ended, in `history.json` (last 200); Reconnect uses
+      long and how it ended, in `history.json` (last 200); sessions still
+      open as Tern closes or quits count as closed then; Reconnect uses
       the saved host's current settings
 - [x] Port forwarding (item 8): per-host `-L`, `-R` and `-D` (SOCKS5) rules
       in the vault file (version 3), started with a session when switched

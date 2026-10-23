@@ -252,6 +252,8 @@ pub struct Workspace {
     tabs_file: Option<PathBuf>,
     /// The active tab and each tab's panes when they were last written.
     remembered: (Option<usize>, Vec<Vec<EntityId>>),
+    /// Tern is closing, and its open sessions were written to History.
+    quitting: bool,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -261,6 +263,19 @@ impl Workspace {
         let live = LiveSlots::default();
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
         let mut workspace = Self::with(vault, live, TerminalView::new, window, cx);
+        // Sessions still open as Tern closes go into History too: as its
+        // window closes, or as it quits without that (Cmd+Q on macOS).
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = this.update(cx, |workspace, cx| workspace.record_open_sessions(cx));
+            true
+        });
+        workspace
+            ._subscriptions
+            .push(cx.on_app_quit(|workspace, cx| {
+                workspace.record_open_sessions(cx);
+                async {}
+            }));
         // A plain start opens the tabs open when Tern last quit, and from
         // then on keeps track of them. Flags are for checks and leave both
         // alone.
@@ -422,6 +437,7 @@ impl Workspace {
             _settings_events: None,
             tabs_file: None,
             remembered: (None, Vec::new()),
+            quitting: false,
             _ticker: ticker,
             _subscriptions: vec![connect, appearance, focus_lost],
         }
@@ -1389,6 +1405,25 @@ impl Workspace {
         };
         tab.focused = pane;
         self.activate(Some(index), window, cx);
+    }
+
+    /// Writes every live session to History as closed, as Tern quits;
+    /// without this the sessions still open at the end, the usual way one
+    /// ends, would never be there. Kept shells keep running.
+    fn record_open_sessions(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.quitting, true) {
+            return;
+        }
+        let panes: Vec<Entity<TerminalView>> =
+            self.tabs.iter().flat_map(|tab| tab.panes.clone()).collect();
+        for pane in panes {
+            let terminal = pane.read(cx);
+            if terminal.is_live() && !terminal.connection().local && !terminal.replaying() {
+                let visit = terminal.visit("Closed");
+                self.vault
+                    .update(cx, |vault, cx| vault.record_visit(visit, cx));
+            }
+        }
     }
 
     /// Records a live pane in History as closed by hand, and ends the
@@ -2738,6 +2773,41 @@ mod tests {
         assert_eq!(sent(cx), nothing());
         cx.simulate_keystrokes("enter");
         assert_eq!(sent(cx), [Vec::new(), b"uptime".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn sessions_open_as_tern_closes_go_into_history(cx: &mut TestAppContext) {
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        // A second tab whose pane never got a shell isn't a visit.
+        click(cx, "layout-2");
+        let panes = workspace.read_with(cx, |workspace, _| workspace.tabs[0].panes.clone());
+        panes[1].update(cx, |pane, cx| {
+            pane.on_session_event(
+                Event::Failed(tern_core::ssh::ConnectError::Other("refused".into())),
+                cx,
+            )
+        });
+        let visits = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .vault
+                    .read(cx)
+                    .visits()
+                    .iter()
+                    .map(|visit| visit.ended.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = visits(cx);
+        workspace.update(cx, |workspace, cx| workspace.record_open_sessions(cx));
+        let after = visits(cx);
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(after[0], "Closed");
+        // Closing and quitting both ask: it's written once.
+        workspace.update(cx, |workspace, cx| workspace.record_open_sessions(cx));
+        assert_eq!(visits(cx).len(), after.len());
     }
 
     #[gpui::test]

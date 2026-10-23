@@ -1562,6 +1562,12 @@ impl VaultContent {
         }
     }
 
+    /// The connections History holds, newest first.
+    #[cfg(test)]
+    pub fn visits(&self) -> &[Visit] {
+        &self.history.visits
+    }
+
     /// The saved snippets, for a session's snippet bar.
     pub fn snippets(&self) -> &[Snippet] {
         &self.vault.snippets
