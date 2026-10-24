@@ -87,6 +87,15 @@ at startup, for looking at it without clicking.
   and `live_layer` paints them each frame. The frame ticker stops while no
   placeholder is registered (a terminal tab is showing). Static drawings
   like the art paint inline.
+- **GPUI redraws a window whenever an entity its last frame read changes**,
+  whether or not that entity is on screen. Drawing tabs from the panes
+  themselves redrew the whole window for every bit of output in a hidden
+  tab; the workspace draws them from a summary (`Badge`) it updates when a
+  pane notifies, and redraws only when the summary changes.
+- **Keep file work off the launch path.** Host key art reads every
+  known_hosts file once for all hosts, in the background
+  (`known_hosts::keys_for`); per host, a big hashed file cost seconds.
+  `--bench-start` times launch to the first frame.
 - **Prefer quads to paths for small repeated shapes.** GPUI draws rounded
   quads on the GPU, while paths are tessellated on the CPU. Dots are quads;
   only the trace's line is a path.

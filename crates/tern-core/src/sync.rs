@@ -46,6 +46,9 @@ const MAGIC: &[u8; 8] = b"TERNSYN1";
 /// need it.
 pub const FORMAT: u32 = 1;
 const SALT: usize = 16;
+/// How long an unchanged file is left as it is: sync clients upload every
+/// write, but other devices list when each last wrote.
+pub const REWRITE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const NONCE: usize = 24;
 /// Argon2id's cost: 64 MiB, three passes, one lane.
 const MEMORY_KIB: u32 = 64 * 1024;
@@ -468,6 +471,8 @@ pub struct Syncer {
     derived: HashMap<[u8; SALT], [u8; 32]>,
     /// The salt of this device's own file, kept for the session.
     own_salt: [u8; SALT],
+    /// The file last written, what it held (but when), and when.
+    last: Option<(PathBuf, Vec<u8>, std::time::Instant)>,
 }
 
 impl Syncer {
@@ -478,6 +483,7 @@ impl Syncer {
             passphrase: passphrase.into(),
             derived: HashMap::new(),
             own_salt,
+            last: None,
         }
     }
 
@@ -561,13 +567,30 @@ impl Syncer {
     }
 
     /// Writes this device's snapshot into `folder`.
+    /// Writes `snapshot` as this device's file, unless the file there
+    /// already holds it, written less than [`REWRITE_AFTER`] ago.
     pub fn write(&mut self, folder: &Path, snapshot: &Snapshot) -> Result<(), String> {
-        let json = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
-        let sealed = self.seal(&json)?;
         let path = folder
             .join(FOLDER)
             .join(format!("{}.tern", snapshot.device_id));
-        paths::write_atomically(&path, &sealed).map_err(|error| error.to_string())
+        let held = serde_json::to_vec(&Snapshot {
+            written: 0,
+            ..snapshot.clone()
+        })
+        .map_err(|error| error.to_string())?;
+        if let Some((last, same, at)) = &self.last
+            && *last == path
+            && *same == held
+            && at.elapsed() < REWRITE_AFTER
+            && path.is_file()
+        {
+            return Ok(());
+        }
+        let json = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        let sealed = self.seal(&json)?;
+        paths::write_atomically(&path, &sealed).map_err(|error| error.to_string())?;
+        self.last = Some((path, held, std::time::Instant::now()));
+        Ok(())
     }
 }
 
@@ -788,6 +811,18 @@ mod tests {
 
         assert!(Syncer::new("wrong").read(&folder, "here").is_err());
         assert!(ours.read(&folder.join("missing"), "here").is_err());
+
+        // Nothing changed: the file stays as it was, until something does.
+        let file = folder
+            .join(FOLDER)
+            .join(format!("{}.tern", here.sync.device_id));
+        let before = std::fs::read(&file).unwrap();
+        ours.write(&folder, &snapshot(&Vault::default(), &here, Vec::new()))
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        ours.write(&folder, &snapshot(&Vault::sample(), &here, Vec::new()))
+            .unwrap();
+        assert_ne!(std::fs::read(&file).unwrap(), before);
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

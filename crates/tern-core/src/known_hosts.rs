@@ -2,9 +2,13 @@
 //! `~/.ssh/known_hosts`, which Tern only reads, and Tern's own file, whose
 //! entries can be forgotten.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use hmac::{Hmac, KeyInit, Mac};
 use russh::keys::PublicKey;
+use sha1::Sha1;
 
 use crate::paths;
 use crate::randomart::Randomart;
@@ -80,6 +84,75 @@ pub fn list_in(files: &[(PathBuf, bool)]) -> Vec<KnownHost> {
     known
 }
 
+/// The keys the known_hosts file at `path` holds for each of `places`
+/// (address and port), reading it once for all of them, as a host card's
+/// art needs for every host. Names match as they do for a connection:
+/// `host`, `[host]:port` off port 22, or either hashed (`|1|`).
+pub fn keys_for(places: &[(String, u16)], path: &Path) -> HashMap<(String, u16), Vec<PublicKey>> {
+    let mut found: HashMap<(String, u16), Vec<PublicKey>> = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return found;
+    };
+    // The name each place has in a known_hosts file.
+    let names: Vec<(String, &(String, u16))> = places
+        .iter()
+        .map(|place| {
+            let (host, port) = place;
+            let name = if *port == 22 {
+                host.clone()
+            } else {
+                format!("[{host}]:{port}")
+            };
+            (name, place)
+        })
+        .collect();
+    let by_name: HashMap<&str, &(String, u16)> = names
+        .iter()
+        .map(|(name, place)| (name.as_str(), *place))
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
+            continue;
+        }
+        let Some((patterns, key)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let mut matched: Vec<&(String, u16)> = Vec::new();
+        for pattern in patterns.split(',') {
+            if let Some(hashed) = pattern.strip_prefix("|1|") {
+                let Some((salt, hash)) = hashed.split_once('|') else {
+                    continue;
+                };
+                let (Ok(salt), Ok(hash)) = (engine.decode(salt), engine.decode(hash)) else {
+                    continue;
+                };
+                let Ok(mac) = Hmac::<Sha1>::new_from_slice(&salt) else {
+                    continue;
+                };
+                for (name, place) in &names {
+                    if mac.clone().chain_update(name).verify_slice(&hash).is_ok() {
+                        matched.push(place);
+                    }
+                }
+            } else if let Some(place) = by_name.get(pattern) {
+                matched.push(place);
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        let Ok(key) = PublicKey::from_openssh(key.trim()) else {
+            continue;
+        };
+        for place in matched {
+            found.entry(place.clone()).or_default().push(key.clone());
+        }
+    }
+    found
+}
+
 /// The hosts and key on one known_hosts line: `patterns keytype key
 /// [comment]`.
 fn parse_line(line: &str) -> Option<(Option<String>, PublicKey)> {
@@ -146,6 +219,62 @@ mod tests {
             .unwrap()
             .public_key()
             .clone()
+    }
+
+    #[test]
+    fn finds_every_hosts_keys_in_one_read() {
+        let dir = std::env::temp_dir().join(format!("tern-keys-for-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let (plain, hashed, ported, other) = (key(), key(), key(), key());
+        let salt = [7u8; 20];
+        let mac = Hmac::<Sha1>::new_from_slice(&salt)
+            .unwrap()
+            .chain_update("db.example.com")
+            .finalize()
+            .into_bytes();
+        let engine = base64::engine::general_purpose::STANDARD;
+        let lines = [
+            "# comment".to_string(),
+            format!("web.example.com,10.0.0.5 {}", plain.to_openssh().unwrap()),
+            format!(
+                "|1|{}|{} {}",
+                engine.encode(salt),
+                engine.encode(mac),
+                hashed.to_openssh().unwrap()
+            ),
+            format!("[10.0.0.5]:2222 {}", ported.to_openssh().unwrap()),
+            format!("@revoked web.example.com {}", other.to_openssh().unwrap()),
+            format!("elsewhere.example.com {}", other.to_openssh().unwrap()),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let places: Vec<(String, u16)> = [
+            ("web.example.com", 22),
+            ("10.0.0.5", 22),
+            ("db.example.com", 22),
+            ("10.0.0.5", 2222),
+            ("nowhere.example.com", 22),
+        ]
+        .map(|(host, port)| (host.to_string(), port))
+        .into();
+        let found = keys_for(&places, &path);
+        let keys = |host: &str, port: u16| found.get(&(host.to_string(), port)).cloned();
+        assert_eq!(keys("web.example.com", 22), Some(vec![plain.clone()]));
+        assert_eq!(keys("10.0.0.5", 22), Some(vec![plain]));
+        assert_eq!(keys("db.example.com", 22), Some(vec![hashed]));
+        assert_eq!(keys("10.0.0.5", 2222), Some(vec![ported]));
+        assert_eq!(keys("nowhere.example.com", 22), None);
+        // As a connection's check reads the same file, a host at a time.
+        for (host, port) in &places {
+            let one: Vec<PublicKey> =
+                russh::keys::known_hosts::known_host_keys_path(host, *port, &path)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, key)| key)
+                    .collect();
+            assert_eq!(keys(host, *port).unwrap_or_default(), one, "{host}:{port}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! channels, so any executor (GPUI's included) can drive a session without
 //! knowing about Tokio.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1113,12 +1113,36 @@ fn known_host_key_in(files: &[PathBuf], host: &str, port: u16) -> Option<HostKey
         // connecting reports the real error.
         .flat_map(|file| known_hosts::known_host_keys_path(host, port, file).unwrap_or_default())
         .map(|(_, key)| key)
-        .min_by_key(|key| match key.algorithm() {
-            Algorithm::Ed25519 => 0,
-            Algorithm::Ecdsa { .. } => 1,
-            Algorithm::Rsa { .. } => 2,
-            _ => 3,
-        })
+        .min_by_key(preference)
+}
+
+/// The key [`known_host_key`] gives for each of `places` (address and
+/// port), reading each known_hosts file once for all of them.
+pub fn known_host_keys_for(places: &[(String, u16)]) -> HashMap<(String, u16), HostKey> {
+    let mut best: HashMap<(String, u16), HostKey> = HashMap::new();
+    for file in known_hosts_files() {
+        for (place, keys) in crate::known_hosts::keys_for(places, &file) {
+            for key in keys {
+                match best.get(&place) {
+                    Some(kept) if preference(kept) <= preference(&key) => {}
+                    _ => {
+                        best.insert(place.clone(), key);
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The order Tern asks servers for host key types in.
+fn preference(key: &HostKey) -> u8 {
+    match key.algorithm() {
+        Algorithm::Ed25519 => 0,
+        Algorithm::Ecdsa { .. } => 1,
+        Algorithm::Rsa { .. } => 2,
+        _ => 3,
+    }
 }
 
 pub fn fingerprint(key: &PublicKey) -> String {

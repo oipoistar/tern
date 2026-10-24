@@ -28,7 +28,7 @@ use tern_core::snippet::Snippet;
 use tern_core::sources::{self, Sources};
 use tern_core::ssh::{
     ConnectError, Connection, Event, Session, SessionInput, Target, TermSize, key_art,
-    known_host_key, probe, quick_destination,
+    known_host_keys_for, probe, quick_destination,
 };
 use tern_core::sync::{Merged, Syncer};
 use tern_core::vaults::{FIRST, VaultEntry};
@@ -247,6 +247,8 @@ pub struct VaultContent {
     window: AnyWindowHandle,
     /// Seals and opens sync files, and the passphrase it was made with.
     syncer: Option<(String, Arc<Mutex<Syncer>>)>,
+    /// Drawing the hosts' key art, off the UI thread.
+    _keys: Option<Task<()>>,
     /// The sync running now, the one waiting after a change, and the
     /// minute-by-minute one.
     _sync: Option<Task<()>>,
@@ -360,7 +362,7 @@ impl VaultContent {
     fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
         match section {
-            Section::Hosts => self.refresh_keys(),
+            Section::Hosts => self.refresh_keys(cx),
             Section::Keychain if self.show_identities => match &self.identities {
                 Some(view) => {
                     let identities = self.vault.identities.clone();
@@ -689,11 +691,12 @@ impl VaultContent {
             _screen_events: Vec::new(),
             window: window.window_handle(),
             syncer: None,
+            _keys: None,
             _sync: None,
             _sync_soon: None,
             _sync_loop: None,
         };
-        content.refresh_keys();
+        content.refresh_keys(cx);
         content.refresh_imports();
         content
     }
@@ -1313,7 +1316,7 @@ impl VaultContent {
                 .unwrap_or_default();
         }
         self.persist(cx);
-        self.refresh_keys();
+        self.refresh_keys(cx);
         Ok(())
     }
 
@@ -1447,7 +1450,7 @@ impl VaultContent {
             self.selected = first.name.clone();
         }
         self.persist(cx);
-        self.refresh_keys();
+        self.refresh_keys(cx);
         // Either source may have offered what the other just added.
         let vault = &self.vault;
         let in_vault = |host: &Host| {
@@ -1572,7 +1575,7 @@ impl VaultContent {
                     .map(|host| host.name.clone())
                     .unwrap_or_default();
             }
-            self.refresh_keys();
+            self.refresh_keys(cx);
             self.refresh_forwards(cx);
             if let Some(view) = &self.snippets {
                 let saved = self.vault.snippets.clone();
@@ -1622,15 +1625,29 @@ impl VaultContent {
 
     /// Re-reads which hosts have a trusted key (known_hosts files only, read
     /// never written), so a key trusted in a session shows up here.
-    pub fn refresh_keys(&mut self) {
-        self.keys = self
+    pub fn refresh_keys(&mut self, cx: &mut Context<Self>) {
+        let mut places: Vec<(String, u16)> = self
             .vault
             .hosts()
-            .filter_map(|host| {
-                let key = known_host_key(&host.address, host.port)?;
-                Some(((host.address.clone(), host.port), key_art(&key)))
-            })
+            .map(|host| (host.address.clone(), host.port))
             .collect();
+        places.sort();
+        places.dedup();
+        // Off the UI thread, each known_hosts file read once: hashed names
+        // take a hash per host and line, which adds up in big files.
+        let work = cx.background_executor().spawn(async move {
+            known_host_keys_for(&places)
+                .into_iter()
+                .map(|(place, key)| (place, key_art(&key)))
+                .collect::<HashMap<_, _>>()
+        });
+        self._keys = Some(cx.spawn(async move |this, cx| {
+            let keys = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.keys = keys;
+                cx.notify();
+            });
+        }));
     }
 
     /// Hosts the search matches, in vault order; none while search is empty,
@@ -2492,7 +2509,7 @@ impl VaultContent {
                         .record(place, Some(*latency_ms), Instant::now());
                 }
                 self.selected = host.name.clone();
-                self.refresh_keys();
+                self.refresh_keys(cx);
             }
             EditorEvent::Delete(name) => {
                 let id = self.vault.find(name).map(|host| host.id.clone());

@@ -6,6 +6,10 @@
 //! layout, prepaint and paint of the whole tree (not the GPU or present). OS
 //! CPU-time counters are no use here: Windows charges them in 15.6 ms ticks.
 //! Median and 90th percentile keep the odd slow frame from swinging results.
+//!
+//! `tern --bench-start`: open the vault in the data folder (`TERN_DATA_DIR`)
+//! in the same off-screen window, print how long the first frame took from
+//! the start of `main`, and quit.
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -19,6 +23,8 @@ use tern_core::{Host, HostGroup, Vault};
 const WARMUP: Duration = Duration::from_secs(2);
 
 static SECONDS: OnceLock<Option<f32>> = OnceLock::new();
+/// When `main` began, for `--bench-start`.
+static STARTED: OnceLock<Instant> = OnceLock::new();
 
 thread_local! {
     static FRAME_START: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -36,6 +42,18 @@ pub fn seconds() -> Option<f32> {
 
 pub fn enabled() -> bool {
     seconds().is_some()
+}
+
+/// `--bench-start`: time the launch instead. Read once: it's asked every
+/// frame.
+pub fn launch() -> bool {
+    static LAUNCH: OnceLock<bool> = OnceLock::new();
+    *LAUNCH.get_or_init(|| std::env::args().any(|arg| arg == "--bench-start"))
+}
+
+/// Notes when Tern began; call first thing in `main`.
+pub fn note_start() {
+    STARTED.get_or_init(Instant::now);
 }
 
 /// `--bench-uncached` re-renders the whole screen every frame, as Tern did
@@ -116,6 +134,13 @@ pub fn frame_start() {
 
 /// Marks the end of a frame's work; call after the last paint.
 pub fn frame_end() {
+    if launch() {
+        let ms = STARTED
+            .get()
+            .map_or(0., |at| at.elapsed().as_secs_f64() * 1000.);
+        println!("launch: first frame {ms:.1} ms after main");
+        std::process::exit(0);
+    }
     let Some(started) = FRAME_START.take() else {
         return;
     };

@@ -25,6 +25,7 @@ mod workspace;
 use gpui_kit::*;
 
 fn main() {
+    bench::note_start();
     gpui_kit::application()
         .with_assets(assets::TernAssets)
         .run(|cx| {
@@ -35,7 +36,7 @@ fn main() {
                 tern_core::secrets::SystemSecrets,
             )));
 
-            let benching = bench::enabled();
+            let benching = bench::enabled() || bench::launch();
             let options = WindowOptions {
                 window_bounds: Some(if benching {
                     bench::window_bounds()

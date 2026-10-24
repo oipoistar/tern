@@ -229,6 +229,32 @@ struct Filling {
     _subscriptions: Vec<Subscription>,
 }
 
+/// What a tab shows of a pane: live, ended or on its way, its title, and
+/// what happened there while it wasn't looked at. The tabs are drawn from
+/// these, never from the panes: GPUI redraws a window whenever an entity it
+/// read while drawing changes, so reading a pane behind another tab would
+/// redraw the window for every bit of its output.
+#[derive(Clone, PartialEq)]
+struct Badge {
+    phase: u8,
+    title: SharedString,
+    rang: bool,
+    finished: bool,
+    unseen: bool,
+}
+
+impl Badge {
+    fn of(terminal: &TerminalView) -> Self {
+        Self {
+            phase: phase_code(&terminal.phase),
+            title: terminal.title(),
+            rang: terminal.rang,
+            finished: terminal.finished.is_some(),
+            unseen: terminal.unseen,
+        }
+    }
+}
+
 /// The list of the focused host's running containers, while open.
 struct ContainersMenu {
     pane: Entity<TerminalView>,
@@ -261,6 +287,8 @@ pub struct Workspace {
     remembered: (Option<usize>, Vec<Vec<EntityId>>),
     /// Tern is closing, and its open sessions were written to History.
     quitting: bool,
+    /// What each pane's tab showed when the window last heard from it.
+    badges: HashMap<EntityId, Badge>,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -424,6 +452,7 @@ impl Workspace {
             tabs_file: None,
             remembered: (None, Vec::new()),
             quitting: false,
+            badges: HashMap::new(),
             _ticker: ticker,
             _subscriptions: vec![appearance, focus_lost],
         }
@@ -1037,8 +1066,23 @@ impl Workspace {
     /// History, its rules for Port forwarding, and its typing for
     /// broadcast.
     fn watch(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        // A pane behind another tab redraws the window only when what its
+        // tab shows changes, not for every bit of output.
+        self.badges
+            .insert(terminal.entity_id(), Badge::of(terminal.read(cx)));
         self._subscriptions
-            .push(cx.observe(terminal, |_, _, cx| cx.notify()));
+            .push(cx.observe(terminal, |this, terminal, cx| {
+                let badge = Badge::of(terminal.read(cx));
+                let changed =
+                    this.badges.insert(terminal.entity_id(), badge.clone()) != Some(badge);
+                let shown = this
+                    .active
+                    .and_then(|index| this.tabs.get(index))
+                    .is_some_and(|tab| tab.panes.contains(&terminal));
+                if changed || shown {
+                    cx.notify();
+                }
+            }));
         self._subscriptions.push(cx.subscribe(
             terminal,
             |this, terminal, event: &TerminalEvent, cx| match event {
@@ -1113,6 +1157,8 @@ impl Workspace {
             if let Some(shown) = self.tabs.get(index) {
                 for pane in &shown.panes {
                     pane.update(cx, |pane, _| pane.seen());
+                    self.badges
+                        .insert(pane.entity_id(), Badge::of(pane.read(cx)));
                 }
             }
         }
@@ -1127,7 +1173,7 @@ impl Workspace {
             None => {
                 self.share_sessions(cx);
                 self.vault.update(cx, |vault, cx| {
-                    vault.refresh_keys();
+                    vault.refresh_keys(cx);
                     vault.focus(window, cx);
                     cx.notify();
                 });
@@ -1509,6 +1555,7 @@ impl Workspace {
         }
         let closing = self.tabs[index].panes[pane].clone();
         self.record_closed(&closing, cx);
+        self.badges.remove(&closing.entity_id());
         // Dropping the view drops the session's input, which disconnects.
         let tab = &mut self.tabs[index];
         tab.panes.remove(pane);
@@ -1535,6 +1582,7 @@ impl Workspace {
         // Live sessions closed by hand still go into History.
         for pane in self.tabs[index].panes.clone() {
             self.record_closed(&pane, cx);
+            self.badges.remove(&pane.entity_id());
         }
         if self
             .filling
@@ -2052,7 +2100,10 @@ impl Workspace {
                                         .items_center()
                                         .gap(px(8.))
                                         .text_size(px(12.))
-                                        .child(phase_glyph(&terminal.read(cx).phase, theme))
+                                        .child(phase_glyph(
+                                            phase_code(&terminal.read(cx).phase),
+                                            theme,
+                                        ))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -2358,24 +2409,31 @@ impl Workspace {
             )
             .children(self.tabs.iter().enumerate().map(|(index, session)| {
                 let focused = session.focused();
-                let terminal = focused.read(cx);
+                let badge = self
+                    .badges
+                    .get(&focused.entity_id())
+                    .cloned()
+                    .unwrap_or_else(|| Badge::of(focused.read(cx)));
                 tab(
                     SharedString::from(format!("tab-{}", focused.entity_id())),
                     self.active == Some(index),
                 )
                 .pr(px(4.))
-                .child(phase_glyph(&terminal.phase, theme))
-                .child(div().max_w(px(180.)).truncate().child(terminal.title()))
+                .child(phase_glyph(badge.phase, theme))
+                .child(div().max_w(px(180.)).truncate().child(badge.title))
                 // A tab not on screen shows a bell if one rang there, a check
                 // if a long command finished, or a dot for output it hasn't
                 // shown.
                 .when(self.active != Some(index), |d| {
-                    let panes = session.panes.iter().map(|pane| pane.read(cx));
+                    let panes = session
+                        .panes
+                        .iter()
+                        .filter_map(|pane| self.badges.get(&pane.entity_id()));
                     let (rang, finished, unseen) =
                         panes.fold((false, false, false), |(rang, finished, unseen), pane| {
                             (
                                 rang || pane.rang,
-                                finished || pane.finished.is_some(),
+                                finished || pane.finished,
                                 unseen || pane.unseen,
                             )
                         });
@@ -2439,10 +2497,20 @@ impl Workspace {
 
 /// A session's state as a glyph: a solid dot while live, a ring once
 /// ended, a spinner on the way.
-fn phase_glyph(phase: &Phase, theme: &Theme) -> AnyElement {
+/// A pane's phase as a tab tells it: live, ended or on its way.
+fn phase_code(phase: &Phase) -> u8 {
     match phase {
-        Phase::Live => status_dot(theme).into_any_element(),
-        Phase::Ended(_) => div()
+        Phase::Live => 0,
+        Phase::Ended(_) => 1,
+        _ => 2,
+    }
+}
+
+/// The glyph for a [`phase_code`].
+fn phase_glyph(phase: u8, theme: &Theme) -> AnyElement {
+    match phase {
+        0 => status_dot(theme).into_any_element(),
+        1 => div()
             .size(px(7.))
             .rounded_full()
             .border_1()
@@ -2922,6 +2990,38 @@ mod tests {
         click(cx, "vault-delete-confirm");
         assert_eq!(cx.update(|_, cx| vaults::list(cx).vaults.len()), 1);
         assert!(cx.debug_bounds("vault-Work").is_none());
+    }
+
+    #[gpui::test]
+    fn output_behind_another_tab_redraws_only_its_mark(cx: &mut TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use tern_core::ssh::Event;
+
+        let (workspace, cx) = open_workspace(cx);
+        let behind = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
+        behind.update(cx, |pane, cx| pane.on_session_event(Event::Connected, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let terminal = cx.new(TerminalView::offline);
+            workspace.add_session(terminal, window, cx);
+        });
+        cx.run_until_parked();
+        let redraws = Rc::new(Cell::new(0));
+        let counted = redraws.clone();
+        let _counting =
+            cx.update(|_, cx| cx.observe(&workspace, move |_, _| counted.set(counted.get() + 1)));
+
+        // The first output marks the tab; the rest changes nothing it shows.
+        for line in 0..20 {
+            let bytes = format!("line {line}\r\n").into_bytes();
+            behind.update(cx, |pane, cx| {
+                pane.on_session_event(Event::Output(bytes), cx)
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(redraws.get(), 1);
+        assert!(cx.debug_bounds("activity-0").is_some());
     }
 
     #[gpui::test]

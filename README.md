@@ -85,6 +85,7 @@ cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed2551
 cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi" --jump "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1"
 cargo run -p tern-app --release -- --bench 10                    # frame cost of the vault's latency traces
 cargo run -p tern-app --release -- --bench 10 --bench-uncached   # same, re-rendering everything
+cargo run -p tern-app --release -- --bench-start                 # time from launch to the first frame, with the data folder's vault
 ```
 
 `TERN_THEME=light|dark` forces an appearance.

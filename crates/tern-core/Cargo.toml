@@ -8,9 +8,11 @@ edition.workspace = true
 anyhow = "1"
 # Encrypting what sync writes: Argon2id for the key, XChaCha20-Poly1305 for the data.
 argon2 = "0.6"
-# Inline images' data.
+# Inline images' data, and known_hosts' hashed names.
 base64 = "0.22"
 chacha20poly1305 = "0.11"
+# Matching known_hosts' hashed names (the versions russh uses).
+hmac = "0.13"
 # The system's credential store, for the sync passphrase and saved passwords.
 keyring = "4"
 # Local terminals: the shell on a pseudo-terminal.
@@ -23,6 +25,7 @@ russh = { version = "0.64.1", default-features = false, features = ["flate2", "r
 russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "fs"] }
 
 [features]
