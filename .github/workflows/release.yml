@@ -14,6 +14,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Git's bash, as in CI (see ci.yml).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   windows:
     name: Windows
@@ -26,7 +31,6 @@ jobs:
       # The exe carries Cargo.toml's version; a tag that says otherwise is
       # a mistake.
       - name: Check the tag matches the version
-        shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
@@ -43,7 +47,6 @@ jobs:
         run: cargo build -p tern-app --release --locked
 
       - name: Publish
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
