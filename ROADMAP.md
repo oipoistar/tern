@@ -315,6 +315,8 @@ claude.ai account). Each item below names the artboard it comes from.
       always were, the others' go to vaults/<id>/ in the data folder, and
       the list to vaults.json, which never syncs. Tabs reopened at start
       find their hosts in whichever vault has them
+- [x] A tab's menu: right-clicking a session tab offers Close tab, Close
+      other tabs and Close all tabs; the sessions closed go into History
 - [x] `~/.ssh` as each system expects: on Linux and macOS, keys Tern
       generates, imports or receives through sync go into `~/.ssh` (the
       folder 0700, keys 0600, never over a file there), noted in Tern's own
