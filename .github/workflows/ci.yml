@@ -1,6 +1,8 @@
-# The checks AGENTS.md asks for before every commit, on Windows, macOS and
-# Linux: formatting, warning-free clippy, and the tests (headless UI tests
-# and the end-to-end SSH tests included).
+# The checks AGENTS.md asks for before every commit: formatting,
+# warning-free clippy, and the tests (headless UI tests and the end-to-end
+# SSH tests included). Windows runs on the project's own machine, a
+# self-hosted runner (see DEVELOPMENT.md); macOS and Linux are paused for
+# now.
 
 name: CI
 
@@ -22,12 +24,19 @@ env:
 
 jobs:
   check:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: windows
+            runs-on: [self-hosted, Windows, X64]
+          # Paused for now; bring them back to run there too.
+          # - name: macos
+          #   runs-on: macos-latest
+          # - name: ubuntu
+          #   runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -46,11 +55,13 @@ jobs:
             libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libfontconfig-dev libfreetype-dev libvulkan1
 
+      # A self-hosted runner keeps its build output from run to run.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       # Formatting doesn't differ by platform; once is enough.
       - name: Formatting
-        if: runner.os == 'Linux'
+        if: runner.os == 'Windows'
         run: cargo fmt --all --check
 
       - name: Clippy

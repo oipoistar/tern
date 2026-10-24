@@ -17,7 +17,8 @@ env:
 jobs:
   windows:
     name: Windows
-    runs-on: windows-latest
+    # The project's own machine, as CI's Windows checks (see DEVELOPMENT.md).
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Build
         run: cargo build -p tern-app --release --locked
@@ -45,7 +47,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp target/release/tern.exe Tern-windows-x64.exe
+          cp "${CARGO_TARGET_DIR:-target}/release/tern.exe" Tern-windows-x64.exe
           gh release create "$GITHUB_REF_NAME" Tern-windows-x64.exe \
             --title "Tern ${GITHUB_REF_NAME#v}" \
             --notes "Download **Tern-windows-x64.exe** below and run it: one file, nothing to install. The first time, Windows may say it protected your PC, as Tern isn't signed yet: choose **More info**, then **Run anyway**." \

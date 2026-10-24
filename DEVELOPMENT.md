@@ -101,6 +101,24 @@ cargo test -p tern-app lab -- --ignored --nocapture           # the app's panes,
 docker compose -f dev/lab/compose.yaml down                   # stop it
 ```
 
+## CI runner
+
+CI's Windows checks and the release build run on the project's own Windows
+machine, a self-hosted GitHub Actions runner in `C:\actions-runner`; the
+macOS and Linux checks are paused (bring them back in
+`.github/workflows/ci.yml`). The runner works in a clean environment, never
+that of whatever started it, with its own Rust (`cargo` and `rustup` in its
+folder) and its build output in `target`, there too, which a run's checkout
+doesn't clean, so builds stay incremental. Start it, hidden, with:
+
+```sh
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\actions-runner\start.ps1
+```
+
+A self-hosted runner runs whatever a workflow says, on that machine. Before
+the repository goes public, keep pull requests from forks off it (or run
+them on GitHub's machines), or anyone could run code there.
+
 ## Release
 
 `.github/workflows/release.yml` builds and publishes a release when a
@@ -112,6 +130,6 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The workflow checks the tag matches the version, builds Tern for Windows and
-publishes the release with `Tern-windows-x64.exe`, the file the README's
-download link always fetches from the latest release.
+The workflow checks the tag matches the version, builds Tern for Windows on
+the CI runner and publishes the release with `Tern-windows-x64.exe`, the
+file the README's download link always fetches from the latest release.
