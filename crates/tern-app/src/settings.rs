@@ -120,8 +120,10 @@ pub struct SettingsView {
     scrollback: Entity<InputState>,
     passphrase: Entity<InputState>,
     device: Entity<InputState>,
-    /// A sync passphrase is kept in the system's store.
+    /// A sync passphrase is kept in the system's store; why the one typed
+    /// wasn't kept.
     passphrase_saved: bool,
+    passphrase_problem: Option<&'static str>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -200,6 +202,7 @@ impl SettingsView {
             passphrase,
             device,
             passphrase_saved,
+            passphrase_problem: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -214,6 +217,10 @@ impl SettingsView {
         let typed = self.passphrase.read(cx).value().to_string();
         if typed.is_empty() {
             return;
+        }
+        self.passphrase_problem = tern_core::sync::passphrase_problem(&typed);
+        if self.passphrase_problem.is_some() {
+            return cx.notify();
         }
         if sync::secrets(cx)
             .store(&vaults::passphrase(cx), &typed)
@@ -299,7 +306,16 @@ impl SettingsView {
                     .debug_selector(|| "sync-save-passphrase".into())
                     .child("Save")
                     .on_click(cx.listener(|this, _, _, cx| this.save_passphrase(cx))),
-            );
+            )
+            .when_some(self.passphrase_problem, |d, problem| {
+                d.child(
+                    div()
+                        .debug_selector(|| "sync-passphrase-problem".into())
+                        .text_size(px(13.))
+                        .text_color(t.danger)
+                        .child(problem),
+                )
+            });
         let switch_row =
             |label: &'static str, id: &'static str, on: bool, set: fn(&mut SyncSettings)| {
                 Self::row(

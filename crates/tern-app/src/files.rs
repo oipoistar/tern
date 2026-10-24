@@ -535,6 +535,13 @@ impl FilesPanel {
             let Ok((local, theirs)) = copied else {
                 return;
             };
+            let local = match edits::openable(local) {
+                Ok(local) => local,
+                Err(problem) => {
+                    this.problem = Some(problem.to_string().into());
+                    return;
+                }
+            };
             match edits::stamp(&local) {
                 Ok(ours) => {
                     this.open_here(&local, cx);

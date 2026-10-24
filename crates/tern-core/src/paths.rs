@@ -102,16 +102,60 @@ pub fn system_known_hosts() -> Option<PathBuf> {
 
 /// Writes `bytes` to `path` through a temporary file renamed over the old
 /// one, so a crash mid-write never leaves half a file. Creates the folder.
+/// On Unix, files and folders made are the user's alone (0600 and 0700):
+/// a vault names hosts, users and commands.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        private_dir(dir)?;
     }
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    let mut file = std::fs::File::create(&temp)?;
+    let mut file = private_file(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(&temp, path)
+}
+
+/// Creates `dir` and the folders above it that are missing, the ones made
+/// only for this user on Unix.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Creates (or empties) the file at `path`, for this user only on Unix
+/// from the start, not after a moment readable by others.
+pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_whole_files_for_this_user_only() {
+        let dir = std::env::temp_dir().join(format!("tern-paths-{}", std::process::id()));
+        let path = dir.join("inner").join("vault.json");
+        write_atomically(&path, b"{}").unwrap();
+        write_atomically(&path, b"{\"groups\":[]}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"groups\":[]}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&dir.join("inner")), 0o700);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,12 +1,24 @@
 //! Web addresses in terminal text, which Ctrl+click (Cmd+click on macOS)
-//! opens.
+//! opens. What a host prints is untrusted: only web, mail and ssh links
+//! from it open, and `file:` links only from this computer's own shell.
 
 use std::ops::Range;
 
 /// The schemes a link starts with.
-const SCHEMES: [&str; 6] = [
-    "https://", "http://", "ftp://", "file://", "ssh://", "mailto:",
-];
+const SCHEMES: [&str; 5] = ["https://", "http://", "file://", "ssh://", "mailto:"];
+
+/// Whether the link `url`, found in output, may be opened. A `file:` link
+/// opens only from a shell on this computer (`local`) and only to a path
+/// here: one naming another computer (`file://server/share`) would have
+/// Windows hand that computer this account's credentials, and from a host
+/// one could point at a program to run.
+pub fn may_open(url: &str, local: bool) -> bool {
+    let lower = url.to_ascii_lowercase();
+    match lower.strip_prefix("file://") {
+        Some(path) => local && path.starts_with('/') && !path.starts_with("//"),
+        None => true,
+    }
+}
 
 /// The byte ranges of the links in `text`, in order.
 pub fn find(text: &str) -> Vec<Range<usize>> {
@@ -71,6 +83,18 @@ mod tests {
 
     fn links(text: &str) -> Vec<&str> {
         find(text).into_iter().map(|range| &text[range]).collect()
+    }
+
+    #[test]
+    fn opens_files_only_from_here_and_only_here() {
+        use super::may_open;
+
+        assert!(may_open("https://example.com/a", false));
+        assert!(may_open("mailto:ops@example.com", false));
+        assert!(!may_open("file:///C:/Users/me/Downloads/run.exe", false));
+        assert!(may_open("file:///home/me/report.html", true));
+        assert!(!may_open("file://attacker.example/share/x", true));
+        assert!(!may_open("FILE:////attacker.example/share/x", true));
     }
 
     #[test]

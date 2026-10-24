@@ -54,6 +54,15 @@ const NONCE: usize = 24;
 const MEMORY_KIB: u32 = 64 * 1024;
 const PASSES: u32 = 3;
 
+/// The fewest characters a new sync passphrase may have. It's all that
+/// guards the files in a folder a cloud keeps, private keys among them.
+pub const MIN_PASSPHRASE: usize = 12;
+
+/// Why `typed` won't do as a new sync passphrase, in one line.
+pub fn passphrase_problem(typed: &str) -> Option<&'static str> {
+    (typed.chars().count() < MIN_PASSPHRASE).then_some("Use at least 12 characters")
+}
+
 /// How this device syncs, kept with the settings (not synced itself).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -787,6 +796,14 @@ mod tests {
             .settings
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_passphrase_needs_some_length() {
+        assert!(passphrase_problem("hunter2").is_some());
+        assert!(passphrase_problem("eleven char").is_some());
+        assert_eq!(passphrase_problem("twelve chars"), None);
+        assert_eq!(passphrase_problem("čšžćđ čšžćđ!"), None);
     }
 
     #[test]

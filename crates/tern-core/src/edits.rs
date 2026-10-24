@@ -50,16 +50,123 @@ pub fn stamp(path: &Path) -> std::io::Result<Stamp> {
 }
 
 /// A new folder in `base` for one edited copy, so copies of files with the
-/// same name never meet.
+/// same name never meet. It's this user's alone: a shared temporary folder
+/// (Linux's `/tmp`) would let others read the copies.
 pub fn folder(base: &Path) -> std::io::Result<PathBuf> {
-    let folder = base.join("tern-edits").join(crate::host::new_id());
-    std::fs::create_dir_all(&folder)?;
+    let folder = base.join(format!("tern-edit-{}", crate::host::new_id()));
+    crate::paths::private_dir(&folder)?;
     Ok(folder)
+}
+
+/// Whether this computer would run a file called `name` when asked to
+/// open it, rather than show it in an editor: scripts, programs, shortcuts
+/// and installers on Windows, Terminal's command files on macOS, launchers
+/// on Linux.
+pub fn runs_when_opened(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    let runs: &[&str] = if cfg!(windows) {
+        &[
+            "application",
+            "appref-ms",
+            "bat",
+            "chm",
+            "cmd",
+            "com",
+            "cpl",
+            "exe",
+            "gadget",
+            "hta",
+            "inf",
+            "jar",
+            "js",
+            "jse",
+            "library-ms",
+            "lnk",
+            "msc",
+            "msi",
+            "msp",
+            "pif",
+            "ps1",
+            "reg",
+            "scf",
+            "scr",
+            "sct",
+            "settingcontent-ms",
+            "url",
+            "vbe",
+            "vbs",
+            "website",
+            "wsc",
+            "wsf",
+            "wsh",
+            "xll",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "app", "command", "fileloc", "inetloc", "jar", "mpkg", "pkg", "terminal", "tool",
+            "webloc", "workflow",
+        ]
+    } else {
+        &["appimage", "desktop", "jar"]
+    };
+    runs.contains(&extension.as_str())
+}
+
+/// The copy at `local` as it's safe to open: renamed `<name>.txt` when
+/// this computer would run it, so it opens in a text editor instead. Saves
+/// still go back to the host's file.
+pub fn openable(local: PathBuf) -> std::io::Result<PathBuf> {
+    let name = local
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !runs_when_opened(&name) {
+        return Ok(local);
+    }
+    let renamed = local.with_file_name(format!("{name}.txt"));
+    std::fs::rename(&local, &renamed)?;
+    Ok(renamed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_that_would_run_open_as_text() {
+        let base = std::env::temp_dir();
+        let folder = folder(&base).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&folder).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let script = if cfg!(windows) {
+            "deploy.CMD"
+        } else if cfg!(target_os = "macos") {
+            "deploy.command"
+        } else {
+            "deploy.desktop"
+        };
+        assert!(runs_when_opened(script));
+        assert!(!runs_when_opened("notes.txt") && !runs_when_opened("Makefile"));
+        let local = folder.join(script);
+        std::fs::write(&local, "echo hi").unwrap();
+        let opened = openable(local).unwrap();
+        assert_eq!(
+            opened.file_name().unwrap(),
+            format!("{script}.txt").as_str()
+        );
+        assert_eq!(std::fs::read_to_string(&opened).unwrap(), "echo hi");
+        let plain = folder.join("notes.md");
+        std::fs::write(&plain, "x").unwrap();
+        assert_eq!(openable(plain.clone()).unwrap(), plain);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
 
     #[test]
     fn a_save_here_goes_back_unless_the_host_changed_too() {

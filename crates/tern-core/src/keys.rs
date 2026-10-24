@@ -287,10 +287,14 @@ pub fn write_pair(path: &Path, private: &[u8], public: &str) -> Result<(), Strin
 
 /// Writes a private key so only its owner can read it, as OpenSSH insists.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        paths::private_dir(dir).map_err(|error| error.to_string())?;
     }
-    std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+    paths::private_file(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|error| error.to_string())?;
     restrict_to_owner(path).map_err(|error| format!("can't restrict {}: {error}", path.display()))
 }
 

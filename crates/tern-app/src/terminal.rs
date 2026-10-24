@@ -52,7 +52,9 @@ use tern_core::ssh::{
 };
 
 use crate::settings;
-use crate::term_input::{MouseReport, encode_key, encode_mouse, hold_paste, wheel_keys};
+use crate::term_input::{
+    MouseReport, clean_paste, encode_key, encode_mouse, hold_paste, wheel_keys,
+};
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::icon;
 
@@ -1231,7 +1233,7 @@ impl TerminalView {
         if !inline.inline {
             return;
         }
-        let Ok(decoded) = image::load_from_memory(&inline.data) else {
+        let Some(decoded) = decode_image(&inline.data) else {
             return;
         };
         let mut pixels = decoded.into_rgba8();
@@ -1248,6 +1250,21 @@ impl TerminalView {
             cell,
             (self.size.cols, self.size.rows),
         );
+        // Kept no larger than it's shown, twice over for sharp zooming.
+        let (width, height) = pixels.dimensions();
+        let fit = f32::min(
+            f32::from(cols) * cell.0 * 2. / width as f32,
+            f32::from(rows) * cell.1 * 2. / height as f32,
+        );
+        if fit < 1. {
+            let size = |side: u32| ((side as f32 * fit).round() as u32).max(1);
+            pixels = image::imageops::resize(
+                &pixels,
+                size(width),
+                size(height),
+                image::imageops::FilterType::Triangle,
+            );
+        }
         // GPUI paints BGRA.
         for pixel in pixels.pixels_mut() {
             pixel.0.swap(0, 2);
@@ -1938,6 +1955,8 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        // What's on the clipboard may come from anywhere, a host included.
+        let text = clean_paste(&text);
         // Broadcast, it also reaches shells that may not take it bracketed.
         let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE) && !self.broadcasting;
         let confirm = settings::current(cx).terminal.confirm_paste;
@@ -1979,7 +1998,7 @@ impl TerminalView {
 
     /// Pastes what another pane was given, while broadcasting.
     pub fn type_paste(&mut self, text: &str, cx: &mut Context<Self>) {
-        let bytes = self.pasted(text);
+        let bytes = self.pasted(&clean_paste(text));
         self.type_text(bytes, cx);
     }
 
@@ -2073,9 +2092,11 @@ impl TerminalView {
         }
         // A wide character's spacer belongs to the character before it.
         let at = cells[cells.iter().rposition(|(_, cell)| *cell <= point)?].0;
+        let local = self.connection.local;
         let range = tern_core::links::find(&text)
             .into_iter()
-            .find(|range| range.contains(&at))?;
+            .find(|range| range.contains(&at))
+            .filter(|range| tern_core::links::may_open(&text[range.clone()], local))?;
         let first = cells.iter().find(|(start, _)| *start == range.start)?.1;
         let last = cells.iter().rev().find(|(start, _)| *start < range.end)?.1;
         Some(Link {
@@ -3203,6 +3224,20 @@ impl Render for TerminalView {
 }
 
 /// alacritty_terminal's configuration from Tern's terminal settings.
+/// Decodes an image a host sent, refusing one over 8,192 pixels a side or
+/// 64 MiB decoded: a few bytes can claim a huge image.
+fn decode_image(data: &[u8]) -> Option<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 << 20);
+    reader.limits(limits);
+    reader.decode().ok()
+}
+
 fn term_config(terminal: &TerminalSettings) -> TermConfig {
     let shape = match terminal.cursor {
         CursorStyle::Block => CursorShape::Block,
@@ -3695,6 +3730,33 @@ mod tests {
             view.on_session_event(Event::Output(download.into_bytes()), cx)
         });
         view.read_with(cx, |view, _| assert_eq!(view.images.len(), 1));
+    }
+
+    #[gpui::test]
+    fn keeps_images_small_and_refuses_huge_ones(cx: &mut TestAppContext) {
+        use base64::Engine as _;
+
+        let png = |width: u32, height: u32| {
+            let mut png = Vec::new();
+            image::RgbaImage::from_pixel(width, height, image::Rgba([20, 90, 200, 255]))
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            png
+        };
+        // A few kilobytes can claim more pixels than are worth holding.
+        assert!(super::decode_image(&png(9000, 1)).is_none());
+        assert!(super::decode_image(&png(8000, 1)).is_some());
+
+        // A big picture shown in five columns is kept about that size.
+        let data = base64::engine::general_purpose::STANDARD.encode(png(2000, 1000));
+        let output = format!("\x1b]1337;File=inline=1;width=5:{data}\x07");
+        let (view, cx) = pane_with(cx, &output);
+        view.read_with(cx, |view, _| {
+            let placed = view.images.values().next().unwrap();
+            let size = placed.image.size(0);
+            assert!(size.width.0 <= 5 * 8 * 2, "{size:?}");
+            assert_eq!(size.width.0 / size.height.0, 2, "its shape kept");
+        });
     }
 
     #[gpui::test]
