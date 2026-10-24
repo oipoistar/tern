@@ -43,7 +43,9 @@ jobs:
           #   runs-on: macos-latest
           # - name: ubuntu
           #   runs-on: ubuntu-latest
-    runs-on: ${{ matrix.runs-on }}
+    # Pull requests from forks run on GitHub's own machines, never on the
+    # self-hosted runner, which runs whatever a workflow says.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'windows-latest' || matrix.runs-on }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

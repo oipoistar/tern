@@ -123,9 +123,11 @@ runner stopped by force (its process ended) leaves its session on GitHub
 for a minute or two, and a run queued meanwhile can stay queued until it's
 re-run.
 
-A self-hosted runner runs whatever a workflow says, on that machine. Before
-the repository goes public, keep pull requests from forks off it (or run
-them on GitHub's machines), or anyone could run code there.
+A self-hosted runner runs whatever a workflow says, on that machine, so
+pull requests from forks run CI on GitHub's own machines instead, and only
+once a maintainer approves them (the repository requires that for every
+outside contributor). A fork's pull request can change the workflow itself:
+read what it changes in `.github` before approving it.
 
 ## Release
 

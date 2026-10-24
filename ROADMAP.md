@@ -352,11 +352,17 @@ claude.ai account). Each item below names the artboard it comes from.
 - [x] Windows releases: a version tag builds `Tern-windows-x64.exe`
       (windowed, with Tern's icon and version) and publishes it as a GitHub
       Release; the README's download link always fetches the latest
+- [x] CI on the project's own machine: Windows checks and release builds
+      run on a self-hosted runner (incremental, about a minute a push);
+      macOS and Linux checks are paused
+- [x] Public: the repository is open; forks' pull requests run CI on
+      GitHub's machines, never the self-hosted runner, and only once a
+      maintainer approves them
 
 ## Known gaps in what's built
 
-- Only tested on Windows so far (item 19); CI builds and tests on macOS and
-  Linux too, but the app itself hasn't been run there.
+- Only tested on Windows so far (item 19); the app hasn't been run on macOS
+  or Linux, and CI there is paused for now.
 - Proxies take no username or password: the vault keeps no secrets, and
   the credential store doesn't hold proxy logins yet.
 - Forwarding rules run without a terminal can't ask for anything: they
@@ -392,9 +398,6 @@ claude.ai account). Each item below names the artboard it comes from.
   AppImage, Flatpak or `.deb`. Both from the release workflow, beside the
   Windows build.
 - Any update check stays serverless (the GitHub releases API).
-
-### 21. Going public
-- Make the repository public.
 
 ## Not planned
 
