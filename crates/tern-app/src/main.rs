@@ -48,6 +48,7 @@ fn main() {
         .with_assets(assets::TernAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            terminal::bind_keys(cx);
             settings::init(cx);
             vaults::init(cx);
             cx.set_global(sync::SecretsStore(std::sync::Arc::new(

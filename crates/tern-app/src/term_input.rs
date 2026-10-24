@@ -175,6 +175,29 @@ pub fn hold_paste(text: &str, bracketed: bool, guarded: bool, confirm: bool) -> 
     guarded || (confirm && !bracketed && lines)
 }
 
+/// How a key pastes, when it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paste {
+    Always,
+    /// Only text: with none on the clipboard, the key goes to the program.
+    IfText,
+}
+
+/// Whether `keystroke` pastes. Ctrl+Shift+V (Cmd+V on macOS) and
+/// Shift+Insert do everywhere; on Windows plain Ctrl+V does too, as Windows'
+/// own terminals have it, but only text: with none on the clipboard (an
+/// image, say), the program gets Ctrl+V, and may paste that itself (Claude
+/// Code does).
+pub fn paste_key(keystroke: &Keystroke, windows: bool) -> Option<Paste> {
+    let m = &keystroke.modifiers;
+    match keystroke.key.as_str() {
+        "v" if (m.control && m.shift) || m.platform => Some(Paste::Always),
+        "insert" if m.shift && !m.control && !m.alt && !m.platform => Some(Paste::Always),
+        "v" if windows && m.control && !m.alt => Some(Paste::IfText),
+        _ => None,
+    }
+}
+
 /// What a turn of the wheel sends a full-screen program that doesn't take
 /// the mouse (less, man): arrow keys, `lines` up when positive, else down.
 pub fn wheel_keys(lines: i32, mode: TermMode) -> Vec<u8> {
@@ -192,7 +215,7 @@ mod tests {
     use alacritty_terminal::term::TermMode;
     use gpui_kit::{Keystroke, Modifiers, MouseButton};
 
-    use super::{MouseReport, encode_key, encode_mouse, wheel_keys};
+    use super::{MouseReport, Paste, encode_key, encode_mouse, paste_key, wheel_keys};
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
@@ -200,6 +223,46 @@ mod tests {
             key: key.into(),
             key_char: key_char.map(Into::into),
         }
+    }
+
+    #[test]
+    fn pastes_as_each_system_does() {
+        let modifiers = |control, shift, alt, platform| Modifiers {
+            control,
+            shift,
+            alt,
+            platform,
+            ..Default::default()
+        };
+        let pastes = |name: &str, modifiers: Modifiers, windows: bool| {
+            paste_key(&key(name, None, modifiers), windows)
+        };
+        for windows in [false, true] {
+            // Ctrl+Shift+V, Cmd+V and Shift+Insert, everywhere.
+            assert_eq!(
+                pastes("v", modifiers(true, true, false, false), windows),
+                Some(Paste::Always)
+            );
+            assert_eq!(
+                pastes("v", modifiers(false, false, false, true), windows),
+                Some(Paste::Always)
+            );
+            assert_eq!(
+                pastes("insert", modifiers(false, true, false, false), windows),
+                Some(Paste::Always)
+            );
+            // Insert alone and plain V are keys.
+            assert_eq!(pastes("insert", Modifiers::default(), windows), None);
+            assert_eq!(pastes("v", Modifiers::default(), windows), None);
+            // AltGr (Ctrl+Alt) never pastes.
+            assert_eq!(
+                pastes("v", modifiers(true, false, true, false), windows),
+                None
+            );
+        }
+        // Ctrl+V pastes text on Windows only; elsewhere it's the program's.
+        assert_eq!(pastes("v", ctrl(), true), Some(Paste::IfText));
+        assert_eq!(pastes("v", ctrl(), false), None);
     }
 
     fn ctrl() -> Modifiers {

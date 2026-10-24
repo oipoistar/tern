@@ -221,7 +221,7 @@ The agent then works in the Tern you have open, in tabs you can watch: it lists 
 | Close a tab, or the others | middle-click it, right-click for more | the same |
 | Full screen | <kbd>F11</kbd> | <kbd>Ctrl</kbd>+<kbd>Cmd</kbd>+<kbd>F</kbd> |
 | Theater mode: the terminal alone | <kbd>Shift</kbd>+<kbd>F11</kbd> | the same |
-| Copy and paste | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> | <kbd>Cmd</kbd>+<kbd>C</kbd>, <kbd>Cmd</kbd>+<kbd>V</kbd> |
+| Copy and paste | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> or <kbd>Shift</kbd>+<kbd>Insert</kbd> (on Windows <kbd>Ctrl</kbd>+<kbd>V</kbd> pastes too) | <kbd>Cmd</kbd>+<kbd>C</kbd>, <kbd>Cmd</kbd>+<kbd>V</kbd> |
 | Find in the terminal | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> | <kbd>Cmd</kbd>+<kbd>F</kbd> |
 | Previous and next command | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> |
 | Bigger, smaller, reset font | <kbd>Ctrl</kbd>+<kbd>=</kbd>, <kbd>Ctrl</kbd>+<kbd>-</kbd>, <kbd>Ctrl</kbd>+<kbd>0</kbd> | <kbd>Cmd</kbd>+<kbd>=</kbd>, <kbd>Cmd</kbd>+<kbd>-</kbd>, <kbd>Cmd</kbd>+<kbd>0</kbd> |

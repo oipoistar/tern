@@ -150,6 +150,13 @@ at startup, for looking at it without clicking.
   command marks are), which moves with the text.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.
+- **Key bindings win over a view's own key handler.** GPUI dispatches a
+  keystroke's bound action first and calls `on_key_down` only if no action
+  took it, and GPUI Kit's `Root` binds Tab and Shift+Tab (move focus) and
+  Ctrl+C (Cmd+C, copy). A terminal pane switches those off for itself with
+  `NoAction` in its `Terminal` key context (`terminal::bind_keys`). Tests
+  that open a view as the window's own root never see `Root`'s bindings:
+  a key test puts the view under a real `Root` (see `pane_in_root`).
 - **Open windows with `gpui_kit::open_window`**, not GPUI's own: it wraps
   the view in GPUI Kit's `Root`, which inputs and popovers rely on. A view
   made in one window keeps what it subscribed to there (`subscribe_in`, a

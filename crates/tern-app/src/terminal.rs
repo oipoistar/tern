@@ -7,7 +7,8 @@
 //!
 //! Dragging selects text (double-click a word, triple-click a line,
 //! Shift+click extends), painted inverted; Ctrl+Shift+C (Cmd+C on macOS)
-//! copies it. Ctrl+Shift+F (Cmd+F) finds text in the scrollback,
+//! copies it. Ctrl+Shift+V (Cmd+V) or Shift+Insert pastes, and on Windows
+//! Ctrl+V too. Ctrl+Shift+F (Cmd+F) finds text in the scrollback,
 //! Ctrl+click (Cmd+click) opens a link, and Ctrl+= / Ctrl+- / Ctrl+0 zoom
 //! the font. Programs that ask for the mouse (vim, htop) get it, except
 //! while Shift is held, which keeps it for selecting.
@@ -54,7 +55,7 @@ use tern_core::ssh::{
 
 use crate::settings;
 use crate::term_input::{
-    MouseReport, clean_paste, encode_key, encode_mouse, hold_paste, wheel_keys,
+    MouseReport, Paste, clean_paste, encode_key, encode_mouse, hold_paste, paste_key, wheel_keys,
 };
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::icon;
@@ -2268,9 +2269,17 @@ impl TerminalView {
             cx.notify();
             return;
         }
+        let pastes = match paste_key(keystroke, cfg!(windows)) {
+            Some(Paste::Always) => true,
+            Some(Paste::IfText) => cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some_and(|text| !text.is_empty()),
+            None => false,
+        };
         match &mut self.phase {
             Phase::Live => {
-                if is_paste(keystroke) {
+                if pastes {
                     self.predictor.other_key(false);
                     self.paste(cx);
                 } else if let Some(bytes) = encode_key(keystroke, *self.term.mode()) {
@@ -2282,9 +2291,7 @@ impl TerminalView {
             }
             // Typed characters arrive through `replace_text_in_range`; a
             // pasted password or code takes its first line.
-            Phase::Password { typed, .. } | Phase::Questions { typed, .. }
-                if is_paste(keystroke) =>
-            {
+            Phase::Password { typed, .. } | Phase::Questions { typed, .. } if pastes => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     typed.push_str(text.lines().next().unwrap_or_default().trim_end());
                 }
@@ -4017,10 +4024,6 @@ fn is_shortcut(keystroke: &Keystroke, key: &str) -> bool {
     keystroke.key == key && ((m.control && m.shift) || m.platform)
 }
 
-fn is_paste(keystroke: &Keystroke) -> bool {
-    is_shortcut(keystroke, "v")
-}
-
 fn is_copy(keystroke: &Keystroke) -> bool {
     is_shortcut(keystroke, "c")
 }
@@ -4049,6 +4052,18 @@ fn zoom_steps(keystroke: &Keystroke) -> Option<Option<i8>> {
 }
 
 /// `text` as a pattern that matches only itself.
+/// Keys GPUI Kit's window root takes for itself go to a terminal pane with
+/// the keyboard instead: Tab and Shift+Tab, which move focus between
+/// controls, are the shell's completion and a program's back-tab, and
+/// Ctrl+C (Cmd+C), which copies text selected on Tern's own screens, is an
+/// interrupt (the terminal's own copy).
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys(
+        ["tab", "shift-tab", "ctrl-c", "cmd-c"]
+            .map(|keys| KeyBinding::new(keys, NoAction, Some("Terminal"))),
+    );
+}
+
 /// A grid row as text: its characters, without the cells wide ones
 /// spill into, its trailing blanks dropped.
 fn row_text(row: &Row<GridCell>, columns: usize) -> String {
@@ -4498,6 +4513,64 @@ mod tests {
             focus.focus(window, cx);
         });
         cx.run_until_parked();
+    }
+
+    /// A live pane in a window as Tern opens them: under GPUI Kit's root,
+    /// which has keys of its own (Tab moves focus between controls).
+    fn pane_in_root(cx: &mut TestAppContext) -> (Entity<TerminalView>, &mut VisualTestContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use gpui_kit::AppContext as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::bind_keys(cx);
+        });
+        let made: Rc<RefCell<Option<Entity<TerminalView>>>> = Rc::default();
+        let pane = made.clone();
+        let window = cx.add_window(move |window, cx| {
+            let view = cx.new(TerminalView::offline);
+            *pane.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = made.borrow_mut().take().expect("the window made its pane");
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn tab_and_interrupt_reach_the_shell_past_the_windows_root(cx: &mut TestAppContext) {
+        let (view, cx) = pane_in_root(cx);
+        focus(&view, cx);
+        // Completion, a program's back-tab and an interrupt.
+        cx.simulate_keystrokes("tab shift-tab ctrl-c");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sent.take()),
+            b"\t\x1b[Z\x03"
+        );
+        // The pane keeps the keyboard.
+        cx.update(|window, cx| assert!(view.read(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn ctrl_v_pastes_text_on_windows_and_shift_insert_everywhere(cx: &mut TestAppContext) {
+        use gpui_kit::ClipboardItem;
+
+        let (view, cx) = pane_in_root(cx);
+        focus(&view, cx);
+        let sent = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.sent.take());
+        // No text to paste: the program gets Ctrl+V, as an image paste
+        // needs.
+        cx.simulate_keystrokes("ctrl-v");
+        assert_eq!(sent(cx), b"\x16");
+        cx.write_to_clipboard(ClipboardItem::new_string("ls".into()));
+        cx.simulate_keystrokes("ctrl-v");
+        let expected: &[u8] = if cfg!(windows) { b"ls" } else { b"\x16" };
+        assert_eq!(sent(cx), expected);
+        cx.simulate_keystrokes("shift-insert");
+        assert_eq!(sent(cx), b"ls");
     }
 
     /// The terminal's own shortcut for `key`: Ctrl+Shift, or Cmd on macOS.
