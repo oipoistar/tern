@@ -161,6 +161,7 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 - Record a session and play it back (asciicast)
 - The host's load, memory and disk, drawn live in the toolbar
 - Tabs mark unseen output, bells and long commands that finished while you were elsewhere
+- Full screen, and a theater mode that shows nothing but the terminal
 
 **Staying safe**
 - Pasting several lines into a shell that would run them asks first, and a paste can't smuggle in control characters
@@ -196,6 +197,9 @@ PS1='\[\e]133;D;$?\a\e]133;A\a\e]7;file://$HOSTNAME$PWD\a\]'"$PS1"'\[\e]133;B\a\
 | Command palette | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
 | New local terminal | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> | <kbd>Cmd</kbd>+<kbd>T</kbd> |
 | Next and previous tab | <kbd>Ctrl</kbd>+<kbd>Tab</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> | the same |
+| Close a tab, or the others | middle-click it, right-click for more | the same |
+| Full screen | <kbd>F11</kbd> | <kbd>Ctrl</kbd>+<kbd>Cmd</kbd>+<kbd>F</kbd> |
+| Theater mode: the terminal alone | <kbd>Shift</kbd>+<kbd>F11</kbd> | the same |
 | Copy and paste | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> | <kbd>Cmd</kbd>+<kbd>C</kbd>, <kbd>Cmd</kbd>+<kbd>V</kbd> |
 | Find in the terminal | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> | <kbd>Cmd</kbd>+<kbd>F</kbd> |
 | Previous and next command | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> |

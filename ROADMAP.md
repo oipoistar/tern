@@ -325,6 +325,12 @@ claude.ai account). Each item below names the artboard it comes from.
       screen can forget (a linked file changes where it lives). Windows
       keeps both in Tern's own folder and only reads `~/.ssh`
 - [x] Licence: MIT, in `LICENSE` and every crate's manifest
+- [x] Settings in a short window: the page scrolls under its tabs instead
+      of running past the dialog
+- [x] Tabs close with the middle button. Full screen (F11, Ctrl+Cmd+F on
+      macOS, or the toolbar) and theater mode (Shift+F11, the toolbar or
+      the palette): a session tab shows its terminals alone, and the way
+      back appears at the window's top edge
 
 ## Known gaps in what's built
 

@@ -56,6 +56,10 @@ pub enum Shortcut {
     PreviousTab,
     /// Ctrl+Shift+P (Cmd+Shift+P on macOS): the command palette.
     Palette,
+    /// F11 (Ctrl+Cmd+F on macOS too): the window fills the screen, or stops.
+    FullScreen,
+    /// Shift+F11: theater mode, a session tab's terminals alone.
+    Theater,
 }
 
 /// The window shortcut `keystroke` is, if any. Panes leave these alone.
@@ -71,6 +75,14 @@ pub fn shortcut(keystroke: &Keystroke) -> Option<Shortcut> {
         } else {
             Shortcut::NextTab
         }),
+        "f11" if !m.control && !m.alt && !m.platform => Some(if m.shift {
+            Shortcut::Theater
+        } else {
+            Shortcut::FullScreen
+        }),
+        "f" if cfg!(target_os = "macos") && m.control && m.platform && !m.shift && !m.alt => {
+            Some(Shortcut::FullScreen)
+        }
         _ => None,
     }
 }
@@ -196,6 +208,8 @@ enum Command {
     /// Show a vault screen, by `--show` name.
     Screen(&'static str),
     Theme,
+    FullScreen,
+    Theater,
 }
 
 /// A command palette entry.
@@ -272,6 +286,12 @@ pub struct Workspace {
     /// The menu a right-click on a tab opened: that tab, by a pane of it
     /// (indexes shift as tabs close), and where.
     tab_menu: Option<(EntityId, Point<Pixels>)>,
+    /// Theater mode: a session tab shows its terminals alone, without the
+    /// header, toolbar or bars.
+    theater: bool,
+    /// In theater mode, the pointer is at the window's top edge, so the way
+    /// out shows.
+    theater_edge: bool,
     tabs: Vec<Tab>,
     /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
@@ -445,6 +465,8 @@ impl Workspace {
             palette: None,
             containers: None,
             tab_menu: None,
+            theater: false,
+            theater_edge: false,
             tabs: Vec::new(),
             active: None,
             live,
@@ -750,7 +772,19 @@ impl Workspace {
                 Command::Screen("known-hosts"),
             ),
             action(IconName::Clock, "History", Command::Screen("history")),
+            action(IconName::Expand, "Full screen", Command::FullScreen),
         ]);
+        if self.active.is_some() {
+            entries.push(action(
+                IconName::RectangleHorizontal,
+                if self.theater {
+                    "Leave theater mode"
+                } else {
+                    "Theater mode"
+                },
+                Command::Theater,
+            ));
+        }
         entries
     }
 
@@ -830,6 +864,8 @@ impl Workspace {
                 });
                 settings::apply_appearance(window, cx);
             }
+            Command::FullScreen => window.toggle_fullscreen(),
+            Command::Theater => self.toggle_theater(cx),
         }
     }
 
@@ -983,8 +1019,20 @@ impl Workspace {
             Shortcut::NewLocal => self.open_local(window, cx),
             Shortcut::NextTab => self.activate(step(1), window, cx),
             Shortcut::PreviousTab => self.activate(step(count - 1), window, cx),
+            Shortcut::FullScreen => window.toggle_fullscreen(),
+            Shortcut::Theater => self.toggle_theater(cx),
         }
         cx.stop_propagation();
+    }
+
+    /// Theater mode on or off; only a session tab has one.
+    fn toggle_theater(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_none() {
+            return;
+        }
+        self.theater = !self.theater;
+        self.theater_edge = false;
+        cx.notify();
     }
 
     fn open_session(
@@ -1596,6 +1644,8 @@ impl Workspace {
             self.filling = None;
         }
         self.tabs.remove(index);
+        // With no session left, the next one opens with the chrome back.
+        self.theater &= !self.tabs.is_empty();
         let next = match self.active {
             Some(active) if active == index => {
                 (!self.tabs.is_empty()).then(|| index.min(self.tabs.len() - 1))
@@ -1825,7 +1875,13 @@ impl Workspace {
 
     /// Over the panes: the focused host with its latency trace, the ports
     /// it opened, the layout and Broadcast.
-    fn toolbar(&self, tab: &Tab, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+    fn toolbar(
+        &self,
+        tab: &Tab,
+        full: bool,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let focused = tab.focused().read(cx);
         let local = focused.connection().local;
         let host = focused.host().map(str::to_string);
@@ -1949,6 +2005,32 @@ impl Workspace {
                         })),
                 )
             })
+            // How the window shows the tab: full screen, and theater mode.
+            .child(
+                div()
+                    .flex()
+                    .gap(px(4.))
+                    .p(px(4.))
+                    .rounded(px(14.))
+                    .bg(theme.card2)
+                    .child(
+                        view_button(
+                            "full-screen",
+                            if full {
+                                IconName::Shrink
+                            } else {
+                                IconName::Expand
+                            },
+                            full,
+                            theme,
+                        )
+                        .on_click(|_, window, _| window.toggle_fullscreen()),
+                    )
+                    .child(
+                        view_button("theater", IconName::RectangleHorizontal, false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theater(cx))),
+                    ),
+            )
             .when(focused.containers().is_some(), |d| {
                 d.child(self.containers_button(theme, cx))
             })
@@ -2499,6 +2581,15 @@ impl Workspace {
                         cx.notify();
                     }),
                 )
+                // The middle button closes it, as in a browser.
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                        if let Some(index) = this.tab_holding(pane) {
+                            this.close_tab(index, window, cx);
+                        }
+                    }),
+                )
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.activate(Some(index), window, cx)),
                 )
@@ -2604,6 +2695,45 @@ impl Workspace {
         )
         .into_any_element()
     }
+
+    /// In theater mode, the way back: the toggle, shown while the pointer
+    /// is at the window's top edge.
+    fn theater_exit(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("theater-edge")
+            .debug_selector(|| "theater-edge".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .w_full()
+            // Once the toggle shows, deep enough to reach it.
+            .h(px(if self.theater_edge { 64. } else { 8. }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.theater_edge = *hovered;
+                cx.notify();
+            }))
+            .when(self.theater_edge, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(12.))
+                        .right(px(12.))
+                        .p(px(4.))
+                        .rounded(px(14.))
+                        .bg(theme.card2)
+                        .shadow(theme.shadow())
+                        .child(
+                            view_button(
+                                "leave-theater",
+                                IconName::RectangleHorizontal,
+                                true,
+                                theme,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theater(cx))),
+                        ),
+                )
+            })
+    }
 }
 
 /// A session's state as a glyph: a solid dot while live, a ring once
@@ -2629,6 +2759,21 @@ fn phase_glyph(phase: u8, theme: &Theme) -> AnyElement {
             .into_any_element(),
         _ => icon(IconName::LoaderCircle, 12., theme.text2).into_any_element(),
     }
+}
+
+/// A toggle in a toolbar group, raised while on, as the chosen layout is.
+fn view_button(id: &'static str, glyph: IconName, on: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .size(px(32.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(10.))
+        .cursor_pointer()
+        .when(on, |d| d.bg(theme.card).shadow(theme.shadow_sm()))
+        .child(icon(glyph, 16., if on { theme.text } else { theme.text2 }))
 }
 
 fn pane_button(id: String, glyph: IconName, theme: &Theme) -> Stateful<Div> {
@@ -2665,9 +2810,17 @@ impl Render for Workspace {
         }
         let theme = theme::current(cx);
         let cached = StyleRefinement::default().size_full();
+        let theater = self.theater && self.active.is_some();
         let body = match self.active {
             None if bench::uncached() => self.vault.clone().into_any_element(),
             None => self.vault.clone().cached(cached).into_any_element(),
+            // The terminals alone, nearly to the window's edges.
+            Some(index) if theater => div()
+                .size_full()
+                .p(px(8.))
+                .flex()
+                .child(self.panes(&self.tabs[index], &theme, cx))
+                .into_any_element(),
             Some(index) => {
                 let tab = &self.tabs[index];
                 div()
@@ -2676,7 +2829,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .child(self.toolbar(tab, &theme, cx))
+                    .child(self.toolbar(tab, window.is_fullscreen(), &theme, cx))
                     .child(
                         div()
                             .flex_1()
@@ -2718,9 +2871,10 @@ impl Render for Workspace {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(self.header(&theme, cx))
+            .when(!theater, |d| d.child(self.header(&theme, cx)))
             .child(div().flex_1().min_h_0().child(body))
             .child(live_layer(&self.live, time))
+            .when(theater, |d| d.child(self.theater_exit(&theme, cx)))
             .when_some(self.palette.as_ref(), |d, palette| {
                 d.child(self.palette_view(palette, &theme, cx))
             })
@@ -2841,6 +2995,88 @@ mod tests {
         assert_eq!(active(cx), None);
         cx.simulate_keystrokes("ctrl-shift-tab");
         assert_eq!(active(cx), Some(2));
+    }
+
+    #[gpui::test]
+    fn the_middle_button_closes_a_tab(cx: &mut TestAppContext) {
+        use gpui::{MouseButton, MouseDownEvent, MouseUpEvent};
+
+        let (workspace, cx) = open_workspace(cx);
+        click(cx, "new-local");
+        let panes = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let panes: Vec<_> = workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.focused().entity_id())
+                    .collect();
+                panes
+            })
+        };
+        let before = panes(cx);
+        let at = cx.debug_bounds("tab-0").unwrap().center();
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Middle,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Middle,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        assert_eq!(panes(cx), [before[1]]);
+    }
+
+    #[gpui::test]
+    fn full_screen_and_theater_mode(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_workspace(cx);
+        cx.update(|window, cx| {
+            let pane = workspace.read(cx).tabs[0].focused().clone();
+            pane.update(cx, |pane, cx| pane.focus(window, cx));
+        });
+        let full = |cx: &mut VisualTestContext| cx.update(|window, _| window.is_fullscreen());
+
+        // F11 fills the screen, and again stops; so does the button.
+        cx.simulate_keystrokes("f11");
+        assert!(full(cx));
+        cx.simulate_keystrokes("f11");
+        assert!(!full(cx));
+        click(cx, "full-screen");
+        assert!(full(cx));
+        click(cx, "full-screen");
+        assert!(!full(cx));
+
+        // Theater mode: the terminals alone, no header, toolbar or bars.
+        click(cx, "theater");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pane-0").is_some());
+        for chrome in ["new-local", "broadcast", "theater"] {
+            assert!(cx.debug_bounds(chrome).is_none(), "{chrome} still shows");
+        }
+        // The way back shows at the top edge.
+        assert!(cx.debug_bounds("leave-theater").is_none());
+        cx.simulate_mouse_move(
+            gpui::point(gpui::px(300.), gpui::px(3.)),
+            None,
+            Modifiers::none(),
+        );
+        click(cx, "leave-theater");
+        assert!(cx.debug_bounds("new-local").is_some());
+
+        // Shift+F11 too, on a session tab only.
+        cx.simulate_keystrokes("shift-f11");
+        assert!(cx.debug_bounds("new-local").is_none());
+        cx.simulate_keystrokes("shift-f11");
+        assert!(cx.debug_bounds("new-local").is_some());
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(workspace.read_with(cx, |w, _| w.active), None);
+        cx.simulate_keystrokes("shift-f11");
+        assert!(!workspace.read_with(cx, |w, _| w.theater));
     }
 
     #[gpui::test]
