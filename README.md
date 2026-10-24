@@ -28,6 +28,14 @@
   </picture>
 </p>
 
+## Get Tern
+
+**[Download Tern for Windows](https://github.com/oipoistar/tern/releases/latest/download/Tern-windows-x64.exe)**: one file, nothing to install. Keep it wherever you like and run it. Your hosts and settings live in your user profile, so a newer download picks up where you left off.
+
+The first time, Windows may say it protected your PC, as Tern isn't signed yet: choose **More info**, then **Run anyway**. Every version is on the [releases page](https://github.com/oipoistar/tern/releases).
+
+macOS and Linux builds are on their way. Until then, Tern builds from source on both; [DEVELOPMENT.md](DEVELOPMENT.md) says how.
+
 <table>
 <tr>
 <td width="33%" valign="top">
@@ -170,15 +178,7 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 - Files from a server that your computer would run, such as scripts, open as text when you edit them
 - Links a server prints can't open programs or file shares on your computer
 
-## Get Tern
-
-**[Download Tern for Windows](https://github.com/oipoistar/tern/releases/latest/download/Tern-windows-x64.exe)**: one file, nothing to install. Keep it wherever you like and run it. Your hosts and settings live in your user profile, so a newer download picks up where you left off.
-
-The first time, Windows may say it protected your PC, as Tern isn't signed yet: choose **More info**, then **Run anyway**. Every version is on the [releases page](https://github.com/oipoistar/tern/releases).
-
-macOS and Linux builds are on their way. Until then, Tern builds from source on both; [DEVELOPMENT.md](DEVELOPMENT.md) says how.
-
-### Shell integration (optional)
+## Shell integration (optional)
 
 With two lines in `~/.bashrc`, the shell tells Tern where each command starts and ends and which folder it's in, the way iTerm2, WezTerm and Windows Terminal read it. That's what lights up command marks and keeps the Files panel in step:
 
@@ -187,7 +187,7 @@ PS0='\e]133;C\a'
 PS1='\[\e]133;D;$?\a\e]133;A\a\e]7;file://$HOSTNAME$PWD\a\]'"$PS1"'\[\e]133;B\a\]'
 ```
 
-### Keyboard
+## Keyboard
 
 | | Windows and Linux | macOS |
 | --- | --- | --- |
