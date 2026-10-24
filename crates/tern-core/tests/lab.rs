@@ -785,22 +785,34 @@ async fn lab() {
     lab.check("copied for OpenSSH, run by OpenSSH", export())
         .await;
 
-    // Last, as it changes the server's key for good.
+    // Last, as it changes the server's key for a moment. Its own keys go
+    // back after, pass or fail, so a key trusted elsewhere (in your own
+    // Tern) still holds.
     lab.check("a changed host key is refused, naming its line", async {
         docker(&[
             "exec",
             "tern-lab-key-1",
             "sh",
             "-c",
-            "rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null && kill -HUP 1",
+            "mkdir -p /root/tern-host-keys && cp -p /etc/ssh/ssh_host_* /root/tern-host-keys/ \
+             && rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null && kill -HUP 1",
         ])?;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        match open_with(request(here(KEY, "lab"), ed25519()), false, |_| None).await {
+        let refused = match open_with(request(here(KEY, "lab"), ed25519()), false, |_| None).await {
             Err(ConnectError::HostKeyChanged { file, line, .. }) => {
                 Ok(format!("refused; {}:{line}", file.display()))
             }
             other => Err(format!("{:?}", other.err())),
-        }
+        };
+        docker(&[
+            "exec",
+            "tern-lab-key-1",
+            "sh",
+            "-c",
+            "cp -p /root/tern-host-keys/ssh_host_* /etc/ssh/ && kill -HUP 1",
+        ])?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        refused
     })
     .await;
 

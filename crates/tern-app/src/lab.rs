@@ -591,18 +591,29 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
         println!("ok    on a slow connection typing shows at once, a hidden answer never");
     }
 
-    // The server's key changed: refused, with the line to look at.
+    // The server's key changed: refused, with the line to look at. Its own
+    // keys go back after, pass or fail, so a key trusted elsewhere (in your
+    // own Tern) still holds.
     {
         docker(&[
             "exec",
             "tern-lab-key-1",
             "sh",
             "-c",
-            "rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null && kill -HUP 1",
+            "mkdir -p /root/tern-host-keys && cp -p /etc/ssh/ssh_host_* /root/tern-host-keys/ \
+             && rm -f /etc/ssh/ssh_host_* && ssh-keygen -A >/dev/null && kill -HUP 1",
         ]);
         std::thread::sleep(Duration::from_secs(1));
         let (view, cx) = pane(cx, here(2202, Some(key())));
         let ended = settled(&view, cx);
+        docker(&[
+            "exec",
+            "tern-lab-key-1",
+            "sh",
+            "-c",
+            "cp -p /root/tern-host-keys/ssh_host_* /etc/ssh/ && kill -HUP 1",
+        ]);
+        std::thread::sleep(Duration::from_secs(1));
         assert!(
             ended.starts_with("ended") && ended.contains("known_hosts"),
             "{ended}"
