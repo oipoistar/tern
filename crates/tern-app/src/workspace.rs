@@ -269,6 +269,9 @@ pub struct Workspace {
     filling: Option<Filling>,
     palette: Option<Palette>,
     containers: Option<ContainersMenu>,
+    /// The menu a right-click on a tab opened: that tab, by a pane of it
+    /// (indexes shift as tabs close), and where.
+    tab_menu: Option<(EntityId, Point<Pixels>)>,
     tabs: Vec<Tab>,
     /// `None` shows the vault; `Some(i)` the i-th session tab.
     active: Option<usize>,
@@ -441,6 +444,7 @@ impl Workspace {
             filling: None,
             palette: None,
             containers: None,
+            tab_menu: None,
             tabs: Vec::new(),
             active: None,
             live,
@@ -1605,6 +1609,18 @@ impl Workspace {
         self.activate(next, window, cx);
     }
 
+    /// Closes every session tab but `keep`, which then shows; with none
+    /// kept, the vault shows.
+    fn close_tabs(&mut self, keep: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        for index in (0..self.tabs.len()).rev() {
+            if Some(index) != keep {
+                self.close_tab(index, window, cx);
+            }
+        }
+        let kept = keep.and(self.tabs.first()).map(|_| 0);
+        self.activate(kept, window, cx);
+    }
+
     /// Types a saved snippet into the focused pane, or every pane while
     /// broadcasting; one with `{{name}}` variables asks for them first.
     fn run_snippet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2414,10 +2430,12 @@ impl Workspace {
                     .get(&focused.entity_id())
                     .cloned()
                     .unwrap_or_else(|| Badge::of(focused.read(cx)));
+                let pane = focused.entity_id();
                 tab(
-                    SharedString::from(format!("tab-{}", focused.entity_id())),
+                    SharedString::from(format!("tab-{pane}")),
                     self.active == Some(index),
                 )
+                .debug_selector(move || format!("tab-{index}"))
                 .pr(px(4.))
                 .child(phase_glyph(badge.phase, theme))
                 .child(div().max_w(px(180.)).truncate().child(badge.title))
@@ -2474,6 +2492,13 @@ impl Workspace {
                             this.close_tab(index, window, cx);
                         })),
                 )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.tab_menu = Some((pane, event.position));
+                        cx.notify();
+                    }),
+                )
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.activate(Some(index), window, cx)),
                 )
@@ -2492,6 +2517,92 @@ impl Workspace {
                     .child(icon(IconName::SquareTerminal, 16., theme.text2))
                     .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx))),
             )
+    }
+
+    /// The session tab holding the pane `id`.
+    fn tab_holding(&self, id: EntityId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.panes.iter().any(|pane| pane.entity_id() == id))
+    }
+
+    /// What a right-click on a session tab offers: closing it, the others,
+    /// or all of them.
+    fn tab_menu_view(
+        &self,
+        pane: EntityId,
+        at: Point<Pixels>,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let item = |id: &'static str, label: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(32.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(9.))
+                .text_color(if enabled { theme.text } else { theme.text3 })
+                .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(theme.card2)))
+                .child(label)
+        };
+        let others = self.tabs.len() > 1;
+        deferred(
+            anchored()
+                .position(at)
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .id("tab-menu")
+                        .occlude()
+                        .w(px(200.))
+                        .p(px(6.))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(14.))
+                        .bg(theme.card)
+                        .border_1()
+                        .border_color(theme.line)
+                        .shadow(theme.shadow())
+                        .text_size(px(13.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.tab_menu = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            item("tab-menu-close", "Close tab", true).on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.tab_menu = None;
+                                    if let Some(index) = this.tab_holding(pane) {
+                                        this.close_tab(index, window, cx);
+                                    }
+                                },
+                            )),
+                        )
+                        .child(item("tab-menu-others", "Close other tabs", others).when(
+                            others,
+                            |d| {
+                                d.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.tab_menu = None;
+                                    if let Some(index) = this.tab_holding(pane) {
+                                        this.close_tabs(Some(index), window, cx);
+                                    }
+                                }))
+                            },
+                        ))
+                        .child(
+                            item("tab-menu-all", "Close all tabs", true).on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.tab_menu = None;
+                                    this.close_tabs(None, window, cx);
+                                },
+                            )),
+                        ),
+                ),
+        )
+        .into_any_element()
     }
 }
 
@@ -2613,6 +2724,11 @@ impl Render for Workspace {
             .when_some(self.palette.as_ref(), |d, palette| {
                 d.child(self.palette_view(palette, &theme, cx))
             })
+            .when_some(
+                self.tab_menu
+                    .filter(|(pane, _)| self.tab_holding(*pane).is_some()),
+                |d, (pane, at)| d.child(self.tab_menu_view(pane, at, &theme, cx)),
+            )
             .when_some(self.settings.clone(), |d, view| {
                 d.child(
                     div()
@@ -2725,6 +2841,54 @@ mod tests {
         assert_eq!(active(cx), None);
         cx.simulate_keystrokes("ctrl-shift-tab");
         assert_eq!(active(cx), Some(2));
+    }
+
+    #[gpui::test]
+    fn a_tabs_menu_closes_the_others_or_all(cx: &mut TestAppContext) {
+        use gpui::{MouseButton, MouseDownEvent};
+
+        let (workspace, cx) = open_workspace(cx);
+        click(cx, "new-local");
+        click(cx, "new-local");
+        let panes = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                let panes: Vec<_> = workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.focused().entity_id())
+                    .collect();
+                (panes, workspace.active)
+            })
+        };
+        let menu = |cx: &mut VisualTestContext, tab: &'static str, item: &'static str| {
+            cx.run_until_parked();
+            let at = cx
+                .debug_bounds(tab)
+                .unwrap_or_else(|| panic!("nothing on screen is tagged {tab}"))
+                .center();
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Right,
+                position: at,
+                modifiers: Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            click(cx, item);
+        };
+        let (before, _) = panes(cx);
+        assert_eq!(before.len(), 3);
+
+        // The others close; the one asked about stays, and shows.
+        menu(cx, "tab-1", "tab-menu-others");
+        assert_eq!(panes(cx), (vec![before[1]], Some(0)));
+        // With no others, there's nothing for that item to do.
+        menu(cx, "tab-0", "tab-menu-others");
+        assert_eq!(panes(cx), (vec![before[1]], Some(0)));
+
+        click(cx, "new-local");
+        menu(cx, "tab-0", "tab-menu-all");
+        assert_eq!(panes(cx), (vec![], None));
+        assert!(cx.debug_bounds("tab-menu-all").is_none());
     }
 
     #[gpui::test]
