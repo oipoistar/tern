@@ -3749,6 +3749,27 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_long_settings_page_scrolls_inside_a_short_window(cx: &mut TestAppContext) {
+        let (_workspace, cx) = open_workspace(cx);
+        let height = gpui::px(600.);
+        cx.simulate_resize(gpui::size(gpui::px(900.), height));
+        click(cx, "open-settings");
+        click(cx, "settings-terminal");
+        let bounds = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("nothing on screen is tagged {selector}"))
+        };
+        let (dialog, page) = (bounds(cx, "settings"), bounds(cx, "settings-page"));
+        assert!(dialog.bottom() <= height, "{dialog:?}");
+        assert!(
+            page.bottom() <= dialog.bottom(),
+            "{page:?} runs past {dialog:?}"
+        );
+        // Taller than the room it has, so it scrolls.
+        assert!(bounds(cx, "settings-card").size.height > page.size.height);
+    }
+
+    #[gpui::test]
     fn settings_change_the_theme_and_terminals(cx: &mut TestAppContext) {
         use tern_core::settings::{Appearance, CursorStyle};
 

@@ -814,13 +814,23 @@ impl Render for SettingsView {
                             }))
                     })),
             )
+            // A page taller than the window scrolls under the tabs.
             .child(
                 div()
-                    .p(px(16.))
-                    .rounded(px(22.))
-                    .bg(t.card)
-                    .shadow(t.shadow())
-                    .child(self.page(&settings, t, cx)),
+                    .id("settings-page")
+                    .debug_selector(|| "settings-page".into())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-card".into())
+                            .p(px(16.))
+                            .rounded(px(22.))
+                            .bg(t.card)
+                            .shadow(t.shadow())
+                            .child(self.page(&settings, t, cx)),
+                    ),
             )
     }
 }
