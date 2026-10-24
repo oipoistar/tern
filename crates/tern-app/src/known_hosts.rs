@@ -1,6 +1,7 @@
 //! The Known hosts screen: every host key Tern trusts, as key art, hosts,
-//! type and fingerprint. Keys trusted in Tern can be forgotten; OpenSSH's
-//! `~/.ssh/known_hosts` is only read, and its entries carry a lock.
+//! type and fingerprint. Keys in a file Tern trusts keys in can be
+//! forgotten: its own, and on Linux and macOS `~/.ssh/known_hosts` too. On
+//! Windows that file is only read, and its entries carry a lock.
 
 use std::path::PathBuf;
 
@@ -14,7 +15,7 @@ use crate::theme::{self, MONO, Theme};
 use crate::ui::{art_tile, button, group_heading, icon, search_field};
 
 pub struct KnownHostsView {
-    /// The files to read, each with whether it is Tern's own.
+    /// The files to read, each with whether Tern writes it.
     files: Vec<(PathBuf, bool)>,
     entries: Vec<KnownHost>,
     search: Entity<InputState>,

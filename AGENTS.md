@@ -117,10 +117,14 @@ at startup, for looking at it without clicking.
   Windows.
 - **Windows ConPTY waits for a reply to its cursor-position query** before
   showing output; a real terminal (alacritty_terminal) answers it.
-- **Host keys:** `~/.ssh/known_hosts` is read only. Trusted keys go to Tern's
-  own file in its data folder. `TERN_DATA_DIR` and `TERN_SYSTEM_KNOWN_HOSTS`
-  redirect both for tests, and `TERN_SSH_DIR` the `~/.ssh` the Keychain
-  lists, so a check never shows your own keys.
+- **Keys and host keys go where each system expects them.** On Linux and
+  macOS, trusted host keys go to `~/.ssh/known_hosts`
+  (`paths::trusted_known_hosts`) and keys Tern makes, imports or receives to
+  `~/.ssh` (`keys::home`); Tern notes those keys in its own folder and
+  deletes no others. On Windows both go to Tern's data folder and `~/.ssh`
+  is only read. `TERN_DATA_DIR`, `TERN_SYSTEM_KNOWN_HOSTS` and `TERN_SSH_DIR`
+  redirect all of it, so a check never shows or touches your own files: set
+  all three before anything trusts or makes a key.
 - **Synced types keep what they don't know.** `Host`, `Snippet`,
   `Identity`, `Proxy`, `Forward` and `TerminalSettings` flatten JSON fields
   they don't know into `unknown`, so an older Tern carries a newer one's

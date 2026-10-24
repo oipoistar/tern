@@ -530,7 +530,11 @@ pub fn scratch(name: &str) -> std::path::PathBuf {
     // (and so any other thread reading these) exists.
     unsafe {
         std::env::set_var("TERN_DATA_DIR", scratch.join("data"));
-        std::env::set_var("TERN_SYSTEM_KNOWN_HOSTS", scratch.join("no-such-file"));
+        // OpenSSH's file, where Linux and macOS trust keys.
+        std::env::set_var(
+            "TERN_SYSTEM_KNOWN_HOSTS",
+            scratch.join("ssh").join("known_hosts"),
+        );
     }
     scratch
 }

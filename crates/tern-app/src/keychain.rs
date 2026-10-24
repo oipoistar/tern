@@ -1,7 +1,7 @@
 //! The Keychain screen: SSH key pairs as cards (art, name, type), the
-//! selected one inverted with its details beside the grid. Keys in `~/.ssh`
-//! are only read; Tern generates and imports keys into its own folder, and
-//! only those can be deleted.
+//! selected one inverted with its details beside the grid. Tern generates
+//! and imports keys into `~/.ssh` on Linux and macOS and into its own folder
+//! on Windows ([`keys::home`]); only the keys it added can be deleted.
 
 use std::path::PathBuf;
 
@@ -106,14 +106,6 @@ impl KeychainView {
         self.keys.iter().find(|key| key.path == *path)
     }
 
-    /// Tern's own key folder.
-    fn our_dir(&self) -> Option<PathBuf> {
-        self.dirs
-            .iter()
-            .find(|(_, ours)| *ours)
-            .map(|(dir, _)| dir.clone())
-    }
-
     fn select(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.selected = Some(path);
         self.confirm_delete = false;
@@ -122,7 +114,7 @@ impl KeychainView {
     }
 
     fn open_generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.our_dir() else {
+        let Some(dir) = keys::home(&self.dirs) else {
             return;
         };
         let suggested = keys::free_name(&dir, "id_ed25519");
@@ -146,15 +138,12 @@ impl KeychainView {
     }
 
     fn create_key(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = self.our_dir() else {
-            return;
-        };
         let Some(form) = &mut self.generate else {
             return;
         };
         let name = form.name.read(cx).value().trim().to_string();
         let passphrase = form.passphrase.read(cx).value().to_string();
-        match keys::generate(&dir, &name, Some(&passphrase), &comment()) {
+        match keys::generate(&self.dirs, &name, Some(&passphrase), &comment()) {
             Ok(pair) => {
                 self.generate = None;
                 self.notice = None;
@@ -166,9 +155,7 @@ impl KeychainView {
     }
 
     fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.our_dir() else {
-            return;
-        };
+        let dirs = self.dirs.clone();
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -180,7 +167,7 @@ impl KeychainView {
                 && let Some(path) = paths.into_iter().next()
             {
                 let _ = this.update(cx, |this, cx| {
-                    match keys::import(&dir, &path) {
+                    match keys::import(&dirs, &path) {
                         Ok(pair) => {
                             this.notice = None;
                             this.reload(Some(pair.path));
@@ -225,7 +212,7 @@ impl KeychainView {
         if !self.confirm_delete {
             self.confirm_delete = true;
         } else {
-            match keys::delete(&pair) {
+            match keys::delete(&self.dirs, &pair) {
                 Ok(()) => {
                     self.notice = None;
                     self.selected = None;
@@ -794,7 +781,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (ssh, ours) = (root.join("ssh"), root.join("ours"));
         std::fs::create_dir_all(&ssh).unwrap();
-        let existing = tern_core::keys::generate(&ssh, "id_ed25519", None, "").unwrap();
+        let existing =
+            tern_core::keys::generate(&[(ssh.clone(), true)], "id_ed25519", None, "").unwrap();
         let mut vault = Vault::default();
         let db = Host {
             auth: Auth::Key(existing.path.clone()),
@@ -822,12 +810,18 @@ mod tests {
         assert!(cx.debug_bounds("key-details").is_some());
         assert!(cx.debug_bounds("delete-key").is_none());
 
-        // Generate a key into Tern's folder under the suggested name.
+        // Generate a key under the suggested name: in ~/.ssh beside the
+        // other on Linux and macOS, in Tern's own folder on Windows.
         click(cx, "generate-key");
         click(cx, "create-key");
         let made = view.read_with(cx, |view, _| view.selected().cloned().unwrap());
-        assert!(made.ours && made.path.starts_with(&ours));
-        assert_eq!(made.name, "id_ed25519");
+        let (home, name) = if cfg!(unix) {
+            (&ssh, "id_ed25519-2")
+        } else {
+            (&ours, "id_ed25519")
+        };
+        assert!(made.ours && made.path.starts_with(home));
+        assert_eq!(made.name, name);
 
         click(cx, "copy-public");
         let copied = cx.read_from_clipboard().and_then(|item| item.text());

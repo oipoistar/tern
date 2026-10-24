@@ -1590,7 +1590,7 @@ impl VaultContent {
             });
         }
         let have = keys::list_in(&keys::dirs());
-        let _ = tern_core::sync::receive_keys(&paths::keys(), &merged.keys, &have);
+        let _ = tern_core::sync::receive_keys(&keys::dirs(), &merged.keys, &have);
         sync::set_state(
             cx,
             SyncState {

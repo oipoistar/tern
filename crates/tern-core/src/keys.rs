@@ -1,6 +1,7 @@
-//! SSH key pairs for the Keychain screen: those in `~/.ssh`, which Tern only
-//! reads (never moves or deletes), and those Tern generates or imports into
-//! its own `keys` folder.
+//! SSH key pairs for the Keychain screen: those in `~/.ssh` and those in
+//! Tern's own `keys` folder. Keys Tern generates, imports or receives go into
+//! `~/.ssh` on Linux and macOS, as `ssh-keygen` does, and into its own folder
+//! on Windows. It deletes only keys it put there itself.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,9 @@ use crate::vault::Vault;
 
 /// RSA keys shorter than this are weak by today's advice.
 const RSA_MIN_BITS: u32 = 3072;
+/// The file in Tern's own folder noting the keys it put in `~/.ssh`, a line
+/// of fingerprint and name each: those are Tern's to delete there.
+const MADE: &str = ".made";
 /// Files in `~/.ssh` that are never keys.
 const NOT_KEYS: [&str; 5] = [
     "known_hosts",
@@ -39,7 +43,8 @@ pub struct KeyPair {
     pub hardware: bool,
     /// RSA under 3072 bits, or DSA: worth replacing.
     pub weak: bool,
-    /// In Tern's own folder, so it can be deleted.
+    /// Tern's, so it can be deleted: in Tern's own folder, or put in
+    /// `~/.ssh` by Tern.
     pub ours: bool,
 }
 
@@ -78,8 +83,68 @@ pub fn dirs() -> Vec<(PathBuf, bool)> {
     dirs
 }
 
+/// Where the keys Tern makes, imports or receives go: `~/.ssh` on Linux and
+/// macOS, so ssh and git find them too; Tern's own folder on Windows, or
+/// when `dirs` has no `~/.ssh`.
+pub fn home(dirs: &[(PathBuf, bool)]) -> Option<PathBuf> {
+    let find = |ours: bool| {
+        dirs.iter()
+            .find(|(_, is_ours)| *is_ours == ours)
+            .map(|(dir, _)| dir.clone())
+    };
+    if cfg!(unix) {
+        find(false).or_else(|| find(true))
+    } else {
+        find(true)
+    }
+}
+
+/// Tern's own key folder among `dirs`.
+fn own(dirs: &[(PathBuf, bool)]) -> Option<&Path> {
+    dirs.iter()
+        .find(|(_, ours)| *ours)
+        .map(|(dir, _)| dir.as_path())
+}
+
+/// The keys noted as put in `~/.ssh` by Tern: fingerprint and name.
+fn made(dirs: &[(PathBuf, bool)]) -> Vec<(String, String)> {
+    let Some(own) = own(dirs) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(own.join(MADE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(fingerprint, name)| (fingerprint.to_string(), name.to_string()))
+        .collect()
+}
+
+fn write_made(dirs: &[(PathBuf, bool)], made: &[(String, String)]) -> Result<(), String> {
+    let Some(own) = own(dirs) else {
+        return Ok(());
+    };
+    let text: String = made
+        .iter()
+        .map(|(fingerprint, name)| format!("{fingerprint} {name}\n"))
+        .collect();
+    paths::write_atomically(&own.join(MADE), text.as_bytes()).map_err(|error| error.to_string())
+}
+
+/// `pair`, just written by Tern, as Tern's: noted as such when it went
+/// somewhere other than Tern's own folder.
+fn claim(dirs: &[(PathBuf, bool)], mut pair: KeyPair) -> Result<KeyPair, String> {
+    pair.ours = true;
+    if pair.path.parent() != own(dirs) {
+        let mut made = made(dirs);
+        made.push((pair.fingerprint.clone(), pair.name.clone()));
+        write_made(dirs, &made)?;
+    }
+    Ok(pair)
+}
+
 /// Every key pair in `dirs`, by folder, then by name.
 pub fn list_in(dirs: &[(PathBuf, bool)]) -> Vec<KeyPair> {
+    let made = made(dirs);
     let mut pairs = Vec::new();
     for (dir, ours) in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -89,6 +154,12 @@ pub fn list_in(dirs: &[(PathBuf, bool)]) -> Vec<KeyPair> {
             .flatten()
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .filter_map(|entry| read_pair(&entry.path(), *ours))
+            .map(|mut pair| {
+                pair.ours |= made.iter().any(|(fingerprint, name)| {
+                    *fingerprint == pair.fingerprint && *name == pair.name
+                });
+                pair
+            })
             .collect();
         found.sort_by(|a, b| a.name.cmp(&b.name));
         pairs.extend(found);
@@ -187,15 +258,30 @@ pub fn free_name(dir: &Path, base: &str) -> String {
         .expect("a free name")
 }
 
-/// Makes a new Ed25519 key pair in `dir`, encrypted when a passphrase is
-/// given. The private key is readable by its owner only.
+/// `name` made fit for a key's file name, so a free one can be found from
+/// it: no path separators, colons or leading dots, and no `.pub` ending.
+fn usable_name(name: &str) -> String {
+    let name = name.trim().replace(['/', '\\', ':'], "-");
+    let name = name.trim_start_matches('.');
+    let name = name.strip_suffix(".pub").unwrap_or(name);
+    if name.is_empty() {
+        "key".into()
+    } else {
+        name.into()
+    }
+}
+
+/// Makes a new Ed25519 key pair where Tern puts keys ([`home`]), encrypted
+/// when a passphrase is given. The private key is readable by its owner
+/// only.
 pub fn generate(
-    dir: &Path,
+    dirs: &[(PathBuf, bool)],
     name: &str,
     passphrase: Option<&str>,
     comment: &str,
 ) -> Result<KeyPair, String> {
-    check_name(dir, name)?;
+    let dir = home(dirs).ok_or("There's no folder for keys")?;
+    check_name(&dir, name)?;
     let mut rng = rand::rng();
     let mut key =
         PrivateKey::random(&mut rng, Algorithm::Ed25519).map_err(|error| error.to_string())?;
@@ -214,22 +300,38 @@ pub fn generate(
         .to_openssh(LineEnding::LF)
         .map_err(|error| error.to_string())?;
     let path = dir.join(name.trim());
-    write_private(&path, text.as_bytes())?;
-    std::fs::write(public_path(&path), format!("{public}\n")).map_err(|error| error.to_string())?;
-    read_pair(&path, true).ok_or_else(|| "the new key can't be read back".into())
+    write_pair(&path, text.as_bytes(), &public)?;
+    let pair = read_pair(&path, true).ok_or("the new key can't be read back")?;
+    claim(dirs, pair)
 }
 
-/// Copies the private key at `from` (and its `.pub`, if any) into `dir`,
-/// under a name not taken yet.
-pub fn import(dir: &Path, from: &Path) -> Result<KeyPair, String> {
+/// Copies the private key at `from` (and its public half) to where Tern
+/// puts keys, under a name not taken yet.
+pub fn import(dirs: &[(PathBuf, bool)], from: &Path) -> Result<KeyPair, String> {
     let original =
         read_pair(from, true).ok_or("That file isn't an SSH private key Tern can read")?;
-    let path = dir.join(free_name(dir, &original.name));
+    let dir = home(dirs).ok_or("There's no folder for keys")?;
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    if from.parent().and_then(canonical) == canonical(&dir) {
+        return Err(format!("{} is already in {}", original.name, dir.display()));
+    }
     let private = std::fs::read(from).map_err(|error| error.to_string())?;
-    write_private(&path, &private)?;
-    std::fs::write(public_path(&path), format!("{}\n", original.public))
-        .map_err(|error| error.to_string())?;
-    read_pair(&path, true).ok_or_else(|| "the imported key can't be read back".into())
+    add(dirs, &original.name, &private, &original.public)
+}
+
+/// Writes a key pair where Tern puts keys ([`home`]), as Tern's, under
+/// `name` or the first free name after it.
+pub fn add(
+    dirs: &[(PathBuf, bool)],
+    name: &str,
+    private: &[u8],
+    public: &str,
+) -> Result<KeyPair, String> {
+    let dir = home(dirs).ok_or("There's no folder for keys")?;
+    let path = dir.join(free_name(&dir, &usable_name(name)));
+    write_pair(&path, private, public)?;
+    let pair = read_pair(&path, true).ok_or("the key can't be read back")?;
+    claim(dirs, pair)
 }
 
 /// Copies a key pair into the folder `to`, never over an existing file.
@@ -246,16 +348,22 @@ pub fn export(pair: &KeyPair, to: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Deletes one of Tern's own key pairs. Keys in `~/.ssh` are never
-/// deleted.
-pub fn delete(pair: &KeyPair) -> Result<(), String> {
+/// Deletes a key pair that's Tern's ([`KeyPair::ours`]). Other keys in
+/// `~/.ssh` are never deleted.
+pub fn delete(dirs: &[(PathBuf, bool)], pair: &KeyPair) -> Result<(), String> {
     if !pair.ours {
-        return Err("Keys in ~/.ssh are only read".into());
+        return Err("Tern deletes only keys it added".into());
     }
     std::fs::remove_file(&pair.path).map_err(|error| error.to_string())?;
     let public = public_path(&pair.path);
     if public.exists() {
         std::fs::remove_file(public).map_err(|error| error.to_string())?;
+    }
+    let mut made = made(dirs);
+    let noted = made.len();
+    made.retain(|(fingerprint, name)| *fingerprint != pair.fingerprint || *name != pair.name);
+    if made.len() != noted {
+        write_made(dirs, &made)?;
     }
     Ok(())
 }
@@ -272,17 +380,10 @@ pub fn install_command(public: &str) -> String {
 
 /// Writes a key pair: the private key readable by its owner only, the
 /// public half beside it.
-pub fn write_pair(path: &Path, private: &[u8], public: &str) -> Result<(), String> {
+fn write_pair(path: &Path, private: &[u8], public: &str) -> Result<(), String> {
     write_private(path, private)?;
-    std::fs::write(
-        public_path(path),
-        format!(
-            "{}
-",
-            public.trim()
-        ),
-    )
-    .map_err(|error| error.to_string())
+    std::fs::write(public_path(path), format!("{}\n", public.trim()))
+        .map_err(|error| error.to_string())
 }
 
 /// Writes a private key so only its owner can read it, as OpenSSH insists.
@@ -334,11 +435,16 @@ mod tests {
 
     const RSA_2048: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDCx/wi6QiCzaJnLo5+/N5/gFeq8j3snfGj74PO9kwQHot1iA70yIoXHhzXQ7JhkeTWLVsoAXU2QYbLCbZPTK2FtBUp7sYNCedtyyA/tj8DNXm3CWP/kotBULqeKuCAVNcmGAWolHjzDPbfK9J4rIeMErZ2FH4l9M7be3RCW0xvpsTTbK6FbRDdfmivyJ0WzlAb9QZ1snQrbSwxoxlask1OgGL8bX3WisKFY92lalJV2M1WFDwUwAs6EGJNp5+16JzjhtrpJuc49OPRXEKBhd8WI+9zYaM2lPbgkh+ylx/y5kat7EDg/yXOMWrQQ5o/8Qlzzke91FfnVX7+EK/iSoW/";
 
+    /// Just `dir`, as Tern's own folder: keys made there go nowhere else.
+    fn only(dir: &Path) -> [(PathBuf, bool); 1] {
+        [(dir.to_path_buf(), true)]
+    }
+
     #[test]
     fn generates_lists_and_deletes_terns_keys() {
         let (ssh, ours) = (scratch("list-ssh"), scratch("list-ours"));
-        let plain = generate(&ours, "id_tern", None, "me@laptop").unwrap();
-        let locked = generate(&ours, "locked", Some("hunter2"), "me@laptop").unwrap();
+        let plain = generate(&only(&ours), "id_tern", None, "me@laptop").unwrap();
+        let locked = generate(&only(&ours), "locked", Some("hunter2"), "me@laptop").unwrap();
         assert_eq!(plain.kind, "ed25519");
         assert!(plain.public.ends_with("me@laptop"));
         assert!(!plain.weak && !plain.hardware && plain.ours);
@@ -360,7 +466,8 @@ mod tests {
         std::fs::write(ssh.join("known_hosts"), "").unwrap();
         std::fs::write(ssh.join("notes.txt"), "hello").unwrap();
 
-        let pairs = list_in(&[(ssh.clone(), false), (ours.clone(), true)]);
+        let dirs = [(ssh.clone(), false), (ours.clone(), true)];
+        let pairs = list_in(&dirs);
         let names: Vec<(&str, bool)> = pairs
             .iter()
             .map(|pair| (pair.name.as_str(), pair.ours))
@@ -377,9 +484,9 @@ mod tests {
         assert!(pairs[1].weak && pairs[1].kind == "rsa");
         assert_eq!(pairs[0].fingerprint, fingerprint(lone.public_key()));
 
-        assert!(delete(&pairs[0]).is_err(), "~/.ssh is only read");
+        assert!(delete(&dirs, &pairs[0]).is_err(), "not Tern's");
         assert!(ssh.join("id_lone").exists());
-        delete(&pairs[2]).unwrap();
+        delete(&dirs, &pairs[2]).unwrap();
         assert!(!ours.join("id_tern").exists() && !ours.join("id_tern.pub").exists());
         for dir in [ssh, ours] {
             std::fs::remove_dir_all(dir).unwrap();
@@ -392,19 +499,30 @@ mod tests {
         assert!(check_name(&ours, " ").is_err());
         assert!(check_name(&ours, "../evil").is_err());
         assert!(check_name(&ours, "id.pub").is_err());
-        let first = generate(&ours, "work", None, "").unwrap();
+        let first = generate(&only(&ours), "work", None, "").unwrap();
         assert_eq!(
             check_name(&ours, "work"),
             Err("A key by that name already exists".into())
         );
-        assert!(generate(&ours, "work", None, "").is_err());
+        assert!(generate(&only(&ours), "work", None, "").is_err());
 
         // Importing the same file twice keeps both copies apart.
-        let outside = generate(&elsewhere, "work", None, "").unwrap();
-        let imported = import(&ours, &outside.path).unwrap();
+        let outside = generate(&only(&elsewhere), "work", None, "").unwrap();
+        let imported = import(&only(&ours), &outside.path).unwrap();
         assert_eq!(imported.name, "work-2");
         assert_eq!(imported.fingerprint, outside.fingerprint);
-        assert!(import(&ours, &elsewhere.join("work.pub")).is_err());
+        assert!(import(&only(&ours), &elsewhere.join("work.pub")).is_err());
+        // A key already where keys go isn't copied beside itself.
+        assert!(import(&only(&ours), &first.path).is_err());
+
+        // A name from elsewhere that can't be a file name here still finds
+        // one, as a synced key's might.
+        let private = std::fs::read(&first.path).unwrap();
+        let odd = add(&only(&ours), "work:prod/x.pub", &private, &first.public).unwrap();
+        assert_eq!(odd.name, "work-prod-x");
+        assert_eq!(usable_name(" ci:prod/key "), "ci-prod-key");
+        assert_eq!(usable_name("..hidden.pub"), "hidden");
+        assert_eq!(usable_name("."), "key");
 
         let out = scratch("names-out");
         assert_eq!(export(&first, &out).unwrap(), out.join("work"));
@@ -416,9 +534,50 @@ mod tests {
     }
 
     #[test]
+    fn makes_keys_where_openssh_looks_and_deletes_only_its_own() {
+        let (ssh, ours, elsewhere) = (
+            scratch("home-ssh"),
+            scratch("home-ours"),
+            scratch("home-elsewhere"),
+        );
+        let dirs = [(ssh.clone(), false), (ours.clone(), true)];
+        // In ~/.ssh on Linux and macOS, as ssh-keygen would; in Tern's own
+        // folder on Windows.
+        let home = if cfg!(unix) { &ssh } else { &ours };
+        assert_eq!(super::home(&dirs).as_ref(), Some(home));
+        let made = generate(&dirs, "id_made", None, "").unwrap();
+        let outside = generate(&only(&elsewhere), "id_outside", None, "").unwrap();
+        let imported = import(&dirs, &outside.path).unwrap();
+        for pair in [&made, &imported] {
+            assert!(pair.ours && pair.path.starts_with(home), "{pair:?}");
+        }
+        // The user's own key beside them stays theirs.
+        generate(&only(&ssh), "id_theirs", None, "").unwrap();
+        let listed = list_in(&dirs);
+        let find = |name: &str| listed.iter().find(|pair| pair.name == name).unwrap();
+        assert!(find("id_made").ours && find("id_outside").ours);
+        assert!(!find("id_theirs").ours);
+        assert!(delete(&dirs, find("id_theirs")).is_err());
+        assert!(ssh.join("id_theirs").exists());
+
+        delete(&dirs, find("id_made")).unwrap();
+        assert!(!made.path.exists());
+        // Another key by that name later is the user's, not Tern's.
+        generate(&only(&ssh), "id_made", None, "").unwrap();
+        let again = list_in(&dirs)
+            .into_iter()
+            .find(|pair| pair.name == "id_made" && pair.path.starts_with(&ssh))
+            .unwrap();
+        assert!(!again.ours);
+        for dir in [ssh, ours, elsewhere] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn knows_which_hosts_use_a_key() {
         let ours = scratch("users");
-        let pair = generate(&ours, "deploy", None, "").unwrap();
+        let pair = generate(&only(&ours), "deploy", None, "").unwrap();
         let mut vault = Vault::sample();
         let mut db = vault.find("prod-db-01").unwrap().clone();
         db.auth = Auth::Key(pair.path.clone());

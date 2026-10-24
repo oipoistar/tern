@@ -37,8 +37,10 @@ sudo apt-get install libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev lib
 
 Tern keeps its files in `%APPDATA%\Tern`, `~/Library/Application
 Support/Tern` or `~/.local/share/tern`. `TERN_DATA_DIR` points it elsewhere,
-which also keeps a test run away from your real vault; `TERN_THEME=light|dark`
-forces an appearance.
+which also keeps a test run away from your real vault; on Linux and macOS,
+where Tern writes keys to `~/.ssh` and trusted hosts to
+`~/.ssh/known_hosts`, `TERN_SSH_DIR` and `TERN_SYSTEM_KNOWN_HOSTS` move those
+too. `TERN_THEME=light|dark` forces an appearance.
 
 ## Develop
 

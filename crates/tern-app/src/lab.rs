@@ -158,10 +158,13 @@ fn the_app_against_the_lab(cx: &mut TestAppContext) {
     let scratch = std::env::temp_dir().join(format!("tern-app-lab-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
+    // A copy of the lab's: Linux and macOS write keys they trust there.
+    let known_hosts = scratch.join("known_hosts");
+    std::fs::copy(keys().join("known_hosts"), &known_hosts).unwrap();
     // SAFETY: set before any session, and so any other thread, starts.
     unsafe {
         std::env::set_var("TERN_DATA_DIR", scratch.join("data"));
-        std::env::set_var("TERN_SYSTEM_KNOWN_HOSTS", keys().join("known_hosts"));
+        std::env::set_var("TERN_SYSTEM_KNOWN_HOSTS", &known_hosts);
         std::env::set_var("TERN_SSH_DIR", scratch.join("ssh"));
     }
     // Sessions answer on their own threads.

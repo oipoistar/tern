@@ -318,11 +318,14 @@ async fn lab() {
     let scratch = std::env::temp_dir().join(format!("tern-lab-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
+    // Trusts the certificate server's host CA. A copy: Linux and macOS
+    // write keys they trust there.
+    let known_hosts = scratch.join("known_hosts");
+    std::fs::copy(keys().join("known_hosts"), &known_hosts).unwrap();
     // SAFETY: set before any session, and so any other thread, starts.
     unsafe {
         std::env::set_var("TERN_DATA_DIR", scratch.join("data"));
-        // Trusts the certificate server's host CA.
-        std::env::set_var("TERN_SYSTEM_KNOWN_HOSTS", keys().join("known_hosts"));
+        std::env::set_var("TERN_SYSTEM_KNOWN_HOSTS", &known_hosts);
         // No one's own keys are tried.
         std::env::set_var("TERN_SSH_DIR", scratch.join("ssh"));
     }

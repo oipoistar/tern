@@ -1,6 +1,7 @@
 //! The host keys the user trusts, for the Known hosts screen: OpenSSH's
-//! `~/.ssh/known_hosts`, which Tern only reads, and Tern's own file, whose
-//! entries can be forgotten.
+//! `~/.ssh/known_hosts` and Tern's own file. Entries of a file Tern trusts
+//! keys in can be forgotten: its own, and on Linux and macOS OpenSSH's too.
+//! On Windows OpenSSH's is only read.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ pub struct KnownHost {
     pub file: PathBuf,
     /// Counted from 1, as editors and OpenSSH's messages do.
     pub line: usize,
-    /// In Tern's own file, so it can be forgotten.
+    /// In a file Tern writes, so it can be forgotten.
     pub ours: bool,
 }
 
@@ -47,12 +48,12 @@ impl KnownHost {
     }
 }
 
-/// The known_hosts files, each with whether it is Tern's own: OpenSSH's
-/// first, then Tern's.
+/// The known_hosts files, each with whether Tern writes it: OpenSSH's first
+/// (written on Linux and macOS), then Tern's.
 pub fn files() -> Vec<(PathBuf, bool)> {
     let mut files: Vec<(PathBuf, bool)> = paths::system_known_hosts()
         .into_iter()
-        .map(|file| (file, false))
+        .map(|file| (file, cfg!(unix)))
         .collect();
     files.push((paths::known_hosts(), true));
     files
@@ -181,8 +182,8 @@ fn shown_pattern(pattern: &str) -> String {
         )
 }
 
-/// Removes `entry` from Tern's own file, provided its line still holds the
-/// same key. OpenSSH's file is never written.
+/// Removes `entry` from its file, as `ssh-keygen -R` would, provided its line
+/// still holds the same key and Tern writes that file.
 pub fn forget(entry: &KnownHost) -> Result<(), String> {
     if !entry.ours {
         return Err("OpenSSH's known_hosts is only read".into());
@@ -191,7 +192,10 @@ pub fn forget(entry: &KnownHost) -> Result<(), String> {
 }
 
 fn forget_in(file: &Path, line: usize, expected: &str) -> Result<(), String> {
-    let text = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
+    // A linked file (dotfiles kept elsewhere) changes where it lives, and
+    // the link stays.
+    let file = std::fs::canonicalize(file).map_err(|error| error.to_string())?;
+    let text = std::fs::read_to_string(&file).map_err(|error| error.to_string())?;
     let mut lines: Vec<&str> = text.lines().collect();
     let found = line
         .checked_sub(1)
@@ -206,7 +210,7 @@ fn forget_in(file: &Path, line: usize, expected: &str) -> Result<(), String> {
     if !rest.is_empty() {
         rest.push('\n');
     }
-    paths::write_atomically(file, rest.as_bytes()).map_err(|error| error.to_string())
+    paths::write_atomically(&file, rest.as_bytes()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -358,6 +362,31 @@ mod tests {
         // The list is stale now: line 2 is gone, so nothing is removed.
         assert!(forget(&known[1]).is_err());
         assert_eq!(list_in(&[(ours, true)]).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forgets_in_a_linked_file_and_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("tern-known-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (key(), key());
+        let kept = dir.join("dotfiles-known_hosts");
+        let text = format!(
+            "one {}\ntwo {}\n",
+            a.to_openssh().unwrap(),
+            b.to_openssh().unwrap()
+        );
+        std::fs::write(&kept, text).unwrap();
+        let link = dir.join("known_hosts");
+        std::os::unix::fs::symlink(&kept, &link).unwrap();
+
+        forget(&list_in(&[(link.clone(), true)])[0]).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        let left = list_in(&[(kept, true)]);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].hosts.as_deref(), Some("two"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

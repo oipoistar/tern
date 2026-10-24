@@ -315,6 +315,13 @@ claude.ai account). Each item below names the artboard it comes from.
       always were, the others' go to vaults/<id>/ in the data folder, and
       the list to vaults.json, which never syncs. Tabs reopened at start
       find their hosts in whichever vault has them
+- [x] `~/.ssh` as each system expects: on Linux and macOS, keys Tern
+      generates, imports or receives through sync go into `~/.ssh` (the
+      folder 0700, keys 0600, never over a file there), noted in Tern's own
+      folder as its own, the only ones there it deletes; hosts trusted in
+      Tern go into `~/.ssh/known_hosts`, whose entries the Known hosts
+      screen can forget (a linked file changes where it lives). Windows
+      keeps both in Tern's own folder and only reads `~/.ssh`
 
 ## Known gaps in what's built
 

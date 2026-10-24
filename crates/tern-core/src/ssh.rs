@@ -965,10 +965,11 @@ fn other(error: impl std::fmt::Display) -> ConnectError {
     ConnectError::Other(error.to_string())
 }
 
-/// Checks the server's host key against `~/.ssh/known_hosts` (read only) and
-/// Tern's own known hosts, learning a key the user explicitly trusted, or
-/// its host certificate against the authorities they name. Also answers
-/// the channels the server opens for remote forwarding rules.
+/// Checks the server's host key against `~/.ssh/known_hosts` and Tern's own
+/// known hosts, learning a key the user explicitly trusted (see
+/// [`paths::trusted_known_hosts`]), or its host certificate against the
+/// authorities they name. Also answers the channels the server opens for
+/// remote forwarding rules.
 struct Verifier {
     host: String,
     port: u16,
@@ -1059,7 +1060,6 @@ pub fn check_host_key(
     key: &PublicKey,
     trust: Option<&PublicKey>,
 ) -> Result<(), ConnectError> {
-    let ours = paths::known_hosts();
     for file in &known_hosts_files() {
         match known_hosts::check_known_hosts_path(host, port, key, file) {
             Ok(true) => return Ok(()),
@@ -1075,12 +1075,19 @@ pub fn check_host_key(
         }
     }
     if trust == Some(key) {
-        known_hosts::learn_known_hosts_path(host, port, key, &ours).map_err(|error| {
+        let file = paths::trusted_known_hosts();
+        let saved = |error: &dyn std::fmt::Display| {
             other(format!(
                 "can't save the host key to {}: {error}",
-                ours.display()
+                file.display()
             ))
-        })?;
+        };
+        // A missing ~/.ssh is made the user's alone, as OpenSSH makes it.
+        if let Some(dir) = file.parent() {
+            paths::private_dir(dir).map_err(|error| saved(&error))?;
+        }
+        known_hosts::learn_known_hosts_path(host, port, key, &file)
+            .map_err(|error| saved(&error))?;
         return Ok(());
     }
     Err(ConnectError::UnknownHostKey {
@@ -1091,7 +1098,7 @@ pub fn check_host_key(
     })
 }
 
-/// The OpenSSH user's file (read only), then Tern's own.
+/// The OpenSSH user's file, then Tern's own.
 fn known_hosts_files() -> Vec<PathBuf> {
     paths::system_known_hosts()
         .into_iter()

@@ -449,16 +449,20 @@ pub fn keys_to_sync(pairs: &[KeyPair], fingerprints: &[String]) -> Vec<SyncedKey
         .collect()
 }
 
-/// Writes synced keys this device lacks into Tern's key folder `dir`, under
-/// free names. Returns how many it wrote.
-pub fn receive_keys(dir: &Path, synced: &[SyncedKey], have: &[KeyPair]) -> Result<usize, String> {
+/// Writes synced keys this device lacks where Tern puts keys
+/// ([`keys::home`] among `dirs`), under free names. Returns how many it
+/// wrote.
+pub fn receive_keys(
+    dirs: &[(PathBuf, bool)],
+    synced: &[SyncedKey],
+    have: &[KeyPair],
+) -> Result<usize, String> {
     let mut written = 0;
     for key in synced
         .iter()
         .filter(|key| !have.iter().any(|pair| pair.fingerprint == key.fingerprint))
     {
-        let path = dir.join(keys::free_name(dir, &key.name));
-        keys::write_pair(&path, key.private.as_bytes(), &key.public)?;
+        keys::add(dirs, &key.name, key.private.as_bytes(), &key.public)?;
         written += 1;
     }
     Ok(written)
@@ -924,16 +928,17 @@ mod tests {
         for dir in [&ours, &theirs] {
             let _ = std::fs::remove_dir_all(dir);
         }
-        let chosen = keys::generate(&ours, "deploy", None, "").unwrap();
-        keys::generate(&ours, "private", None, "").unwrap();
-        let pairs = keys::list_in(&[(ours.clone(), true)]);
+        let (here, there) = ([(ours.clone(), true)], [(theirs.clone(), true)]);
+        let chosen = keys::generate(&here, "deploy", None, "").unwrap();
+        keys::generate(&here, "private", None, "").unwrap();
+        let pairs = keys::list_in(&here);
         let synced = keys_to_sync(&pairs, std::slice::from_ref(&chosen.fingerprint));
         assert_eq!(synced.len(), 1);
 
-        assert_eq!(receive_keys(&theirs, &synced, &[]).unwrap(), 1);
-        let arrived = keys::list_in(&[(theirs.clone(), true)]);
+        assert_eq!(receive_keys(&there, &synced, &[]).unwrap(), 1);
+        let arrived = keys::list_in(&there);
         assert_eq!(arrived[0].fingerprint, chosen.fingerprint);
-        assert_eq!(receive_keys(&theirs, &synced, &arrived).unwrap(), 0);
+        assert_eq!(receive_keys(&there, &synced, &arrived).unwrap(), 0);
         for dir in [ours, theirs] {
             std::fs::remove_dir_all(dir).unwrap();
         }

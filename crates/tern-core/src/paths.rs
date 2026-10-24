@@ -76,14 +76,27 @@ pub fn keys() -> PathBuf {
     data_dir().join("keys")
 }
 
-/// Host keys the user accepted in Tern. Kept apart from `~/.ssh/known_hosts`,
-/// which Tern reads but never writes.
+/// Tern's own known hosts: where it trusts host keys on Windows, kept apart
+/// from `~/.ssh/known_hosts`, which it only reads there.
 pub fn known_hosts() -> PathBuf {
     data_dir().join("known_hosts")
 }
 
-/// OpenSSH's per-user folder, `~/.ssh`, whose keys the Keychain lists.
-/// `TERN_SSH_DIR` overrides it so checks never show the developer's keys.
+/// Where a host key the user trusts in Tern goes: OpenSSH's own file on
+/// Linux and macOS, so `ssh` in a terminal trusts it too; Tern's on Windows,
+/// or when there's no home folder.
+pub fn trusted_known_hosts() -> PathBuf {
+    if cfg!(unix)
+        && let Some(file) = system_known_hosts()
+    {
+        return file;
+    }
+    known_hosts()
+}
+
+/// OpenSSH's per-user folder, `~/.ssh`, whose keys the Keychain lists (and
+/// where Tern puts keys on Linux and macOS). `TERN_SSH_DIR` overrides it so
+/// checks never show or touch the developer's keys.
 pub fn ssh_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TERN_SSH_DIR") {
         return Some(dir.into());
