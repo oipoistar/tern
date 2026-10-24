@@ -337,6 +337,18 @@ claude.ai account). Each item below names the artboard it comes from.
       window and closes with its last tab. History, the vault's open
       sessions and the tabs reopened at the next start (in the main window)
       count every window's; closing the main window quits
+- [x] MCP server for agents: Settings, General, MCP server lets AI agents
+      (Claude Code, Claude Desktop, any MCP client) drive the running Tern
+      through `tern --mcp`, which they start: list, add, change and remove
+      hosts (checked as the editor checks them, passwords to the
+      credential store), open sessions to a saved host, a typed
+      destination or this computer in tabs the user sees, type text and
+      keys (answering host-key, password and sign-in prompts as the
+      keyboard does), read what each command printed since the agent's
+      last read or the whole screen, and close them. A guarded host holds
+      an agent's typing for the user's yes. The relay starts Tern when it
+      isn't running; Tern takes calls on a loopback port with a token kept
+      in `mcp.json` in its data folder, only while the switch is on
 - [x] Windows releases: a version tag builds `Tern-windows-x64.exe`
       (windowed, with Tern's icon and version) and publishes it as a GitHub
       Release; the README's download link always fetches the latest

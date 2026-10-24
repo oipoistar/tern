@@ -325,6 +325,9 @@ pub struct Workspace {
     /// The tab being dragged, while the pointer is outside the window:
     /// let go there, it moves to a window of its own.
     dragged_out: Option<EntityId>,
+    /// The window this is the root of, for acting on it from outside, as
+    /// agents do.
+    window: AnyWindowHandle,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -379,6 +382,7 @@ impl Workspace {
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
         let mut workspace = Self::with(vault, live, TerminalView::new, window, cx);
         workspace.record_when_closed(window, cx);
+        crate::mcp::attach(cx.weak_entity(), cx);
         // A plain start opens the tabs open when Tern last quit, and from
         // then on keeps track of them. Flags are for checks and leave both
         // alone.
@@ -528,9 +532,19 @@ impl Workspace {
             main: None,
             others: Vec::new(),
             dragged_out: None,
+            window: window.window_handle(),
             _ticker: ticker,
             _subscriptions: vec![appearance, focus_lost],
         }
+    }
+
+    /// A window around `vault` whose panes don't connect, for other
+    /// modules' tests.
+    #[cfg(test)]
+    pub fn offline(vault: tern_core::Vault, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let live = LiveSlots::default();
+        let vault = cx.new(|cx| VaultContent::new(vault, None, live.clone(), window, cx));
+        Self::with(vault, live, TerminalView::offline_to, window, cx)
     }
 
     /// A window for `tab`, moved out of `main`'s window: no vault tab of
@@ -1214,6 +1228,57 @@ impl Workspace {
     }
 
     /// A tab with a shell on this computer.
+    /// The vault open.
+    pub fn vault(&self) -> &Entity<VaultContent> {
+        &self.vault
+    }
+
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window
+    }
+
+    /// Each tab's panes, in order, and the tab showing.
+    pub fn tab_panes(&self) -> (Vec<Vec<Entity<TerminalView>>>, Option<usize>) {
+        let tabs = self.tabs.iter().map(|tab| tab.panes.clone()).collect();
+        (tabs, self.active)
+    }
+
+    /// The windows the main window's tabs moved out to.
+    pub fn other_windows(&self) -> Vec<Entity<Workspace>> {
+        self.others.iter().filter_map(WeakEntity::upgrade).collect()
+    }
+
+    /// Opens a tab for `connection`, as opening a host does, and gives its
+    /// pane: for an agent.
+    pub fn open_for_agent(
+        &mut self,
+        connection: Connection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
+        self.open_session(connection, window, cx);
+        self.tabs.last().expect("a tab was just added").panes[0].clone()
+    }
+
+    /// Closes `pane`, in whichever of this window's tabs it is, as its
+    /// close button would. Whether it was here.
+    pub fn close_session(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let found = self.tabs.iter().enumerate().find_map(|(index, tab)| {
+            let at = tab.panes.iter().position(|open| open == pane)?;
+            Some((index, at))
+        });
+        let Some((index, at)) = found else {
+            return false;
+        };
+        self.close_pane_of(index, at, window, cx);
+        true
+    }
+
     fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_session(Connection::local(), window, cx);
     }
@@ -1838,9 +1903,19 @@ impl Workspace {
 
     /// Closes one pane of the active tab; the last one closes the tab.
     fn close_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.active else {
-            return;
-        };
+        if let Some(index) = self.active {
+            self.close_pane_of(index, pane, window, cx);
+        }
+    }
+
+    /// Closes one pane of tab `index`; the last one closes the tab.
+    fn close_pane_of(
+        &mut self,
+        index: usize,
+        pane: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.tabs[index].panes.len() == 1 {
             return self.close_tab(index, window, cx);
         }
@@ -1866,7 +1941,13 @@ impl Workspace {
                 self.show_files(index, cx);
             }
         }
-        self.activate(Some(index), window, cx);
+        // The tab on screen gives the keyboard to the pane that takes it;
+        // one behind another stays there.
+        if self.active == Some(index) {
+            self.activate(Some(index), window, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

@@ -19,6 +19,7 @@ pub mod keys;
 pub mod known_hosts;
 pub mod links;
 pub mod local;
+pub mod mcp;
 pub mod openssh;
 pub mod paths;
 pub mod predict;

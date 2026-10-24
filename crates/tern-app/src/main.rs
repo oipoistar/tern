@@ -16,6 +16,7 @@ mod known_hosts;
 mod lab;
 mod live;
 mod marks;
+mod mcp;
 mod settings;
 mod snippets;
 mod sync;
@@ -30,6 +31,16 @@ mod workspace;
 use gpui_kit::*;
 
 fn main() {
+    // `tern --mcp`: the MCP server an agent starts, speaking MCP on standard
+    // input and output and handing tool calls to the Tern running here. No
+    // window, and nothing else on standard output.
+    if std::env::args().nth(1).as_deref() == Some("--mcp") {
+        if let Err(error) = tern_core::mcp::serve_stdio() {
+            eprintln!("tern --mcp: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(windows)]
     attach_console();
     bench::note_start();

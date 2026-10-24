@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Row, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
@@ -40,6 +40,7 @@ use tern_core::containers::{self, Container};
 use tern_core::forward::{Forward, ForwardKind, ForwardState};
 use tern_core::history::{self, Visit};
 use tern_core::images;
+use tern_core::mcp::Key;
 use tern_core::predict::{self, Predictor};
 use tern_core::probe::{self, Listening, Vitals};
 use tern_core::reconnect;
@@ -185,6 +186,58 @@ enum Held {
     Run(Vec<u8>),
 }
 
+/// Where each agent's reads of a session (Tern's MCP server) got to: its
+/// bookmark, and how many chunks of output it had seen.
+#[derive(Default)]
+struct AgentReads {
+    bookmarks: HashMap<String, Bookmark>,
+    seen: HashMap<String, u64>,
+}
+
+/// Where an agent's next read starts: below the line its last read
+/// stopped above, which carries its mark (`None` while that's the top).
+#[derive(Clone, Copy)]
+struct Bookmark {
+    mark: u8,
+    placed: bool,
+}
+
+/// An agent's bookmark in the grid: the underline colour of a cell of the
+/// line its last read stopped above, so that it moves with the text as
+/// shell integration's marks do. Tern never draws it.
+fn bookmark_colour(mark: u8) -> Rgb {
+    Rgb {
+        r: 0x13,
+        g: 0x3d,
+        b: mark,
+    }
+}
+
+/// How far a session has got, for an agent waiting on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// Chunks of output so far, and when the last arrived.
+    pub outputs: u64,
+    pub last_output: Option<Instant>,
+    /// Commands shell integration said finished, and the last one's
+    /// status.
+    pub finished: u64,
+    pub status: Option<i32>,
+    /// Input held for a yes that the user refused.
+    pub refused: u64,
+}
+
+/// Where a session stands, for an agent waiting on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Connecting, or reconnecting.
+    Connecting,
+    /// Asking to trust a key, for a password or the server's questions.
+    Asking,
+    Live,
+    Ended,
+}
+
 /// The rule forwarding a port the host opened to the same port here.
 fn port_forward(open: &Listening) -> Option<Forward> {
     let to = format!("{}:{}", open.host, open.port);
@@ -318,6 +371,9 @@ pub struct TerminalView {
     pub unseen: bool,
     /// The bell rang since then.
     pub rang: bool,
+    /// Where agents' reads of the session got to.
+    agents: AgentReads,
+    activity: Activity,
     /// Everything sent to the session, for tests to look at.
     #[cfg(test)]
     pub sent: RefCell<Vec<u8>>,
@@ -1041,6 +1097,355 @@ impl TerminalView {
         }
     }
 
+    /// The key `key` at what the pane asks before its shell is live, as
+    /// the keyboard has it: Enter gives a password or an answer, trusts a
+    /// host key or reconnects, and Escape says no. Whether the pane took
+    /// it.
+    fn answer_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        match &mut self.phase {
+            Phase::Password { typed, .. } => match key {
+                "enter" => {
+                    self.password = Some(std::mem::take(typed));
+                    self.connect(cx);
+                }
+                "backspace" => {
+                    typed.pop();
+                }
+                "escape" => self.end("Cancelled".into(), cx),
+                _ => return false,
+            },
+            Phase::Questions {
+                prompts,
+                answers,
+                typed,
+            } => match key {
+                "enter" => {
+                    answers.push(std::mem::take(typed));
+                    if answers.len() >= prompts.questions.len() {
+                        let answers = std::mem::take(answers);
+                        #[cfg(test)]
+                        {
+                            self.answered = answers.clone();
+                        }
+                        if let Some(input) = &self.input {
+                            input.answer(answers);
+                        }
+                        self.phase = Phase::Connecting;
+                    }
+                }
+                "backspace" => {
+                    typed.pop();
+                }
+                "escape" => {
+                    // Closing the session ends the sign-in.
+                    self.input = None;
+                    self._events = None;
+                    self.end("Cancelled".into(), cx);
+                }
+                _ => return false,
+            },
+            Phase::Trust { .. } => match key {
+                "enter" => self.trust_and_connect(cx),
+                "escape" => self.end("Not trusted".into(), cx),
+                _ => return false,
+            },
+            Phase::Ended(_) if key == "enter" => self.connect(cx),
+            Phase::Connecting if self.reconnect.is_some() => match key {
+                "enter" => self.reconnect_now(cx),
+                "escape" => self.stop_reconnecting(cx),
+                _ => return false,
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// How the session stands, in a line, for agents.
+    pub fn agent_state(&self) -> String {
+        if self.played {
+            return "a recording playing".into();
+        }
+        match &self.phase {
+            Phase::Connecting => match self.reconnect {
+                Some(attempt) => {
+                    format!("reconnecting, attempt {attempt}; enter tries again now, escape stops")
+                }
+                None => "connecting".into(),
+            },
+            Phase::Trust {
+                shown, fingerprint, ..
+            } => format!(
+                "asking whether to trust the host key of {shown}, {fingerprint}: enter trusts it, escape refuses"
+            ),
+            Phase::Password { rejected, .. } => {
+                let target = &self.connection.target;
+                let again = if *rejected {
+                    ", the last one was refused"
+                } else {
+                    ""
+                };
+                format!(
+                    "asking for the password of {}@{}{again}: type it with a newline; escape cancels",
+                    target.user, target.host
+                )
+            }
+            Phase::Questions {
+                prompts, answers, ..
+            } => match prompts.questions.get(answers.len()) {
+                Some((question, _)) => format!(
+                    "asking {:?} to sign in: type the answer with a newline; escape cancels",
+                    question.trim()
+                ),
+                None => "connecting".into(),
+            },
+            Phase::Live if self.held.is_some() => {
+                "live, with typed input waiting for the user's yes in Tern".into()
+            }
+            Phase::Live => "live".into(),
+            Phase::Ended(reason) => format!("ended: {reason}; enter reconnects"),
+        }
+    }
+
+    pub fn stage(&self) -> Stage {
+        match self.phase {
+            Phase::Connecting => Stage::Connecting,
+            Phase::Trust { .. } | Phase::Password { .. } | Phase::Questions { .. } => Stage::Asking,
+            Phase::Live => Stage::Live,
+            Phase::Ended(_) => Stage::Ended,
+        }
+    }
+
+    pub fn activity(&self) -> Activity {
+        self.activity
+    }
+
+    /// Whether input waits for the user's yes.
+    pub fn holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Whether the cursor is past the start of its line, as after a
+    /// prompt, or a full-screen program has the screen: either way, what's
+    /// on it waits for typing.
+    pub fn awaits_typing(&self) -> bool {
+        self.term.grid().cursor.point.column.0 > 0
+            || self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Agents' typing: `text` as it is (a newline is Enter), then `keys`,
+    /// as at the pane's keyboard: into the shell once it's live, and into
+    /// what the pane asks before then. A guarded host's shell gets it once
+    /// the user says so. Whether it waits for that, or why none of it was
+    /// taken.
+    pub fn agent_input(
+        &mut self,
+        text: &str,
+        keys: &[Key],
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        if self.played {
+            return Err("This tab plays a recording, which takes no typing".into());
+        }
+        let text = text.replace("\r\n", "\n");
+        if let Phase::Live = self.phase {
+            if self.held.is_some() {
+                return Err("Input typed before still waits for the user's yes in Tern".into());
+            }
+            let mode = *self.term.mode();
+            let mut bytes = text.replace('\n', "\r").into_bytes();
+            for key in keys {
+                bytes.extend(
+                    key_bytes(key, mode)
+                        .ok_or_else(|| format!("{} sends nothing to a terminal", key.name))?,
+                );
+            }
+            if self.guarded() {
+                self.held = Some(Held::Run(bytes));
+                cx.notify();
+                return Ok(true);
+            }
+            self.type_text(bytes, cx);
+            return Ok(false);
+        }
+        // Before the shell, what the pane asks takes it key by key, for as
+        // long as it asks.
+        let state = self.agent_state();
+        let pressed = text
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' => "enter".to_string(),
+                c => c.to_string(),
+            })
+            .chain(keys.iter().map(|key| match key.ctrl || key.alt {
+                true => String::new(),
+                false => key.name.clone(),
+            }));
+        let mut taken = false;
+        for key in pressed {
+            let took = match &mut self.phase {
+                Phase::Password { typed, .. } | Phase::Questions { typed, .. }
+                    if key.chars().count() == 1 =>
+                {
+                    typed.push_str(&key);
+                    true
+                }
+                _ => self.answer_key(&key, cx),
+            };
+            if !took {
+                break;
+            }
+            taken = true;
+        }
+        cx.notify();
+        match taken {
+            true => Ok(false),
+            false => Err(format!("Nothing was typed: the session is {state}")),
+        }
+    }
+
+    /// Follows the session for `client`, if it didn't: its reads start at
+    /// the line at the cursor. Whether this was its first look.
+    pub fn agent_follow(&mut self, client: &str) -> bool {
+        if self.agents.bookmarks.contains_key(client) {
+            return false;
+        }
+        let mark = (self.agents.bookmarks.len() % 255 + 1) as u8;
+        let placed = self.place_bookmark(mark);
+        self.agents
+            .bookmarks
+            .insert(client.to_string(), Bookmark { mark, placed });
+        self.agents
+            .seen
+            .insert(client.to_string(), self.activity.outputs);
+        true
+    }
+
+    /// What `client` hasn't read: at its first look, the last `max` lines
+    /// up to the cursor; then the lines from where its last read stopped,
+    /// the line at the cursor read again as it ends up. The last `max` of
+    /// them, and how many earlier ones were left out: `None` when where
+    /// the last read stopped is gone (the screen was cleared), and these
+    /// are the last lines.
+    pub fn agent_read(&mut self, client: &str, max: usize) -> (String, Option<usize>) {
+        if self.agent_follow(client) {
+            return (self.lines_to_cursor(max).join("\n"), Some(0));
+        }
+        let bookmark = self.agents.bookmarks[client];
+        let start = match bookmark.placed {
+            true => self
+                .take_bookmark(bookmark.mark)
+                .map(|line| Line(line.0 + 1)),
+            false => Some(self.term.topmost_line()),
+        };
+        let read = match start {
+            Some(start) => {
+                let mut lines = self.lines_between(start);
+                let skipped = lines.len().saturating_sub(max);
+                lines.drain(..skipped);
+                (lines.join("\n"), Some(skipped))
+            }
+            None => (self.lines_to_cursor(max).join("\n"), None),
+        };
+        let placed = self.place_bookmark(bookmark.mark);
+        self.agents.bookmarks.insert(
+            client.to_string(),
+            Bookmark {
+                mark: bookmark.mark,
+                placed,
+            },
+        );
+        self.agents
+            .seen
+            .insert(client.to_string(), self.activity.outputs);
+        read
+    }
+
+    /// Whether the session printed what `client` hasn't read.
+    pub fn agent_unread(&self, client: &str) -> bool {
+        self.agents
+            .seen
+            .get(client)
+            .is_none_or(|&seen| self.activity.outputs > seen)
+    }
+
+    /// Marks the line above the cursor's as where a read stopped, in a cell
+    /// of its own per mark; whether there's such a line.
+    fn place_bookmark(&mut self, mark: u8) -> bool {
+        let above = Line(self.term.grid().cursor.point.line.0 - 1);
+        if above < self.term.topmost_line() {
+            return false;
+        }
+        let last = self.term.last_column().0;
+        let column = Column(last - usize::from(mark - 1) % (last + 1));
+        self.term.grid_mut()[above][column]
+            .set_underline_color(Some(AnsiColor::Spec(bookmark_colour(mark))));
+        true
+    }
+
+    /// Finds the line carrying `mark`, from the cursor's up, and takes the
+    /// mark off it.
+    fn take_bookmark(&mut self, mark: u8) -> Option<Line> {
+        let wanted = AnsiColor::Spec(bookmark_colour(mark));
+        let columns = self.term.grid().columns();
+        let top = self.term.topmost_line().0;
+        let cursor = self.term.grid().cursor.point.line.0;
+        let (line, column) = (top..=cursor).rev().find_map(|line| {
+            let row = &self.term.grid()[Line(line)];
+            (0..columns)
+                .rev()
+                .find(|&column| row[Column(column)].underline_color() == Some(wanted))
+                .map(|column| (Line(line), Column(column)))
+        })?;
+        self.term.grid_mut()[line][column].set_underline_color(None);
+        Some(line)
+    }
+
+    /// The lines from `start` to the cursor's, a line wrapped on screen as
+    /// one, blank ones at the end left out.
+    fn lines_between(&self, start: Line) -> Vec<String> {
+        let cursor = self.term.grid().cursor.point.line;
+        let text = self.term.bounds_to_string(
+            GridPoint::new(start.min(cursor), Column(0)),
+            GridPoint::new(cursor, self.term.last_column()),
+        );
+        let mut lines: Vec<String> = text
+            .replace(PLACEHOLDER, " ")
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// The last `max` lines up to the cursor's, scrollback included, a
+    /// line wrapped on screen as one.
+    fn lines_to_cursor(&self, max: usize) -> Vec<String> {
+        let cursor = self.term.grid().cursor.point.line;
+        // Wrapped rows join, so look back further than `max` rows.
+        let top = (cursor.0 - (max as i32).saturating_mul(4)).max(self.term.topmost_line().0);
+        let mut lines = self.lines_between(Line(top));
+        lines.drain(..lines.len().saturating_sub(max));
+        lines
+    }
+
+    /// The screen as text: its rows top to bottom, those after the last
+    /// with anything on it (or the cursor) left out; the cursor's row and
+    /// column; and the screen's size.
+    pub fn screen_text(&self) -> (Vec<String>, (usize, usize), TermSize) {
+        let grid = self.term.grid();
+        let columns = grid.columns();
+        let mut rows: Vec<String> = (0..grid.screen_lines())
+            .map(|row| row_text(&grid[Line(row as i32)], columns))
+            .collect();
+        let cursor = grid.cursor.point;
+        let cursor_row = cursor.line.0.max(0) as usize;
+        let last = rows.iter().rposition(|row| !row.is_empty()).unwrap_or(0);
+        rows.truncate(last.max(cursor_row) + 1);
+        (rows, (cursor_row, cursor.column.0), self.size)
+    }
+
     /// A pane for `connection` that hasn't started connecting.
     fn idle(mut connection: Connection, cx: &mut Context<Self>) -> Self {
         let size = TermSize {
@@ -1106,6 +1511,8 @@ impl TerminalView {
             menu: None,
             unseen: false,
             rang: false,
+            agents: AgentReads::default(),
+            activity: Activity::default(),
             #[cfg(test)]
             sent: RefCell::default(),
             #[cfg(test)]
@@ -1313,6 +1720,8 @@ impl TerminalView {
                 self.command_since = Some(Instant::now());
             }
             Mark::Finished(status) => {
+                self.activity.finished += 1;
+                self.activity.status = status;
                 let failed = status.is_some_and(|status| status != 0);
                 let top = self.term.topmost_line();
                 let mut line = self.term.grid().cursor.point.line;
@@ -1568,6 +1977,8 @@ impl TerminalView {
             }
             Event::Output(bytes) => {
                 self.unseen = true;
+                self.activity.outputs += 1;
+                self.activity.last_output = Some(cx.background_executor().now());
                 if let Some(recorder) = &mut self.recording
                     && recorder.output(&bytes).is_err()
                 {
@@ -1850,7 +2261,7 @@ impl TerminalView {
         if self.held.is_some() {
             match keystroke.key.as_str() {
                 "enter" => self.release(cx),
-                "escape" => self.held = None,
+                "escape" => self.refuse_held(),
                 _ => {}
             }
             cx.stop_propagation();
@@ -1878,59 +2289,11 @@ impl TerminalView {
                     typed.push_str(text.lines().next().unwrap_or_default().trim_end());
                 }
             }
-            Phase::Password { typed, .. } => match keystroke.key.as_str() {
-                "enter" => {
-                    self.password = Some(std::mem::take(typed));
-                    self.connect(cx);
+            _ => {
+                if !self.answer_key(&keystroke.key, cx) {
+                    return;
                 }
-                "backspace" => {
-                    typed.pop();
-                }
-                "escape" => self.end("Cancelled".into(), cx),
-                _ => return,
-            },
-            Phase::Questions {
-                prompts,
-                answers,
-                typed,
-            } => match keystroke.key.as_str() {
-                "enter" => {
-                    answers.push(std::mem::take(typed));
-                    if answers.len() >= prompts.questions.len() {
-                        let answers = std::mem::take(answers);
-                        #[cfg(test)]
-                        {
-                            self.answered = answers.clone();
-                        }
-                        if let Some(input) = &self.input {
-                            input.answer(answers);
-                        }
-                        self.phase = Phase::Connecting;
-                    }
-                }
-                "backspace" => {
-                    typed.pop();
-                }
-                "escape" => {
-                    // Closing the session ends the sign-in.
-                    self.input = None;
-                    self._events = None;
-                    self.end("Cancelled".into(), cx);
-                }
-                _ => return,
-            },
-            Phase::Trust { .. } => match keystroke.key.as_str() {
-                "enter" => self.trust_and_connect(cx),
-                "escape" => self.end("Not trusted".into(), cx),
-                _ => return,
-            },
-            Phase::Ended(_) if keystroke.key == "enter" => self.connect(cx),
-            Phase::Connecting if self.reconnect.is_some() => match keystroke.key.as_str() {
-                "enter" => self.reconnect_now(cx),
-                "escape" => self.stop_reconnecting(cx),
-                _ => return,
-            },
-            _ => return,
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -1966,6 +2329,13 @@ impl TerminalView {
             return;
         }
         self.paste_text(text, cx);
+    }
+
+    /// Lets go of what was held for a yes, without giving it.
+    fn refuse_held(&mut self) {
+        if self.held.take().is_some() {
+            self.activity.refused += 1;
+        }
     }
 
     /// Gives the shell what was held for a yes.
@@ -3000,7 +3370,7 @@ impl TerminalView {
                                 )))
                                 .child(button("paste-cancel", "Cancel", false).on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.held = None;
+                                        this.refuse_held();
                                         cx.notify();
                                     }),
                                 )),
@@ -3679,6 +4049,53 @@ fn zoom_steps(keystroke: &Keystroke) -> Option<Option<i8>> {
 }
 
 /// `text` as a pattern that matches only itself.
+/// A grid row as text: its characters, without the cells wide ones
+/// spill into, its trailing blanks dropped.
+fn row_text(row: &Row<GridCell>, columns: usize) -> String {
+    let mut text = String::new();
+    for column in 0..columns {
+        let cell = &row[Column(column)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        text.push(if cell.c == PLACEHOLDER { ' ' } else { cell.c });
+        if let Some(marks) = cell.zerowidth() {
+            text.extend(marks);
+        }
+    }
+    text.trim_end().to_string()
+}
+
+/// The bytes the key `key` sends from a terminal's keyboard in `mode`.
+fn key_bytes(key: &Key, mode: TermMode) -> Option<Vec<u8>> {
+    if !key.ctrl && !key.alt {
+        if key.name == "space" {
+            return Some(b" ".to_vec());
+        }
+        if key.name.chars().count() == 1 {
+            let text = match key.shift {
+                true => key.name.to_uppercase(),
+                false => key.name.clone(),
+            };
+            return Some(text.into_bytes());
+        }
+    }
+    let keystroke = Keystroke {
+        modifiers: Modifiers {
+            control: key.ctrl,
+            alt: key.alt,
+            shift: key.shift,
+            ..Modifiers::default()
+        },
+        key: key.name.clone(),
+        key_char: None,
+    };
+    encode_key(&keystroke, mode)
+}
+
 fn literal(text: &str) -> String {
     let mut pattern = String::with_capacity(text.len());
     for c in text.chars() {

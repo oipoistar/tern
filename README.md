@@ -155,6 +155,7 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 - Run when it's back: queue a command for a host that's down, and it runs the moment the host answers
 - Wake-on-LAN for machines that sleep
 - Local terminal tabs for this computer's own shell
+- AI agents (Claude Code, Claude Desktop, any MCP client) can drive it, in tabs you watch
 
 **Organising**
 - Groups, tags and filters; cards or a compact list
@@ -186,6 +187,29 @@ With two lines in `~/.bashrc`, the shell tells Tern where each command starts an
 PS0='\e]133;C\a'
 PS1='\[\e]133;D;$?\a\e]133;A\a\e]7;file://$HOSTNAME$PWD\a\]'"$PS1"'\[\e]133;B\a\]'
 ```
+
+## Let an agent drive Tern (optional)
+
+Tern can be driven by an AI agent such as Claude Code or Claude Desktop, through the Model Context Protocol (MCP). Switch on **MCP server** in Settings, under General, and give your agent the command shown there:
+
+```sh
+claude mcp add tern -- "C:\path\to\Tern-windows-x64.exe" --mcp
+```
+
+Apps that take a JSON config want the same command:
+
+```json
+{
+  "mcpServers": {
+    "tern": { "command": "C:\\path\\to\\Tern-windows-x64.exe", "args": ["--mcp"] }
+  }
+}
+```
+
+The agent then works in the Tern you have open, in tabs you can watch: it lists your hosts and adds, changes or removes them, opens sessions (to a saved host, any `user@host`, or a local shell), types commands and reads what they print, reads the whole screen of programs like `top` or `vim`, and answers what a server asks before the shell starts, as you would at the keyboard. If Tern isn't running, the agent starts it.
+
+- An agent's typing into a guarded host's session waits for your yes in Tern.
+- Agents get in only through that command, only from this computer, and only while the switch is on.
 
 ## Keyboard
 

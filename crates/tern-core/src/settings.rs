@@ -23,6 +23,9 @@ pub struct Settings {
     /// Open the tabs that were open when Tern last quit; this device's
     /// own, not synced.
     pub reopen_tabs: bool,
+    /// Agents may drive Tern through its MCP server (`tern --mcp`, see
+    /// [`crate::mcp`]); this device's own, not synced.
+    pub mcp: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +36,7 @@ impl Default for Settings {
             sync: SyncSettings::default(),
             updated: 0,
             reopen_tabs: true,
+            mcp: false,
         }
     }
 }

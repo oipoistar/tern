@@ -27,7 +27,7 @@ russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "io-std", "fs"] }
 
 [features]
 # Sample hosts for other crates' tests (`Vault::sample`).
@@ -37,7 +37,7 @@ test-support = []
 russh-sftp = "3"
 # Its SFTP server, for the end-to-end tests.
 tern-devserver = { path = "../tern-devserver" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }
 
 # Reading PuTTY's saved sessions, which live in the registry on Windows,
 # and reaching Pageant for agent forwarding.

@@ -51,7 +51,9 @@ events as an SSH session), SSH sessions (`ssh.rs`,
 russh on its own Tokio runtime, talking to callers through channels; a
 `Connection` resolves a saved host into what to dial, jump hosts included),
 host-key art (`randomart.rs`), both known_hosts files (`known_hosts.rs`),
-OpenSSH certificates (`certs.rs`),
+OpenSSH certificates (`certs.rs`), the MCP server for agents (`mcp.rs`:
+the protocol and tools, `tern --mcp`'s relay, and the loopback port the
+app takes calls on),
 key pairs (`keys.rs`), snippets (`snippet.rs`), recent connections
 (`history.rs`), the vault's filter (`filter.rs`), terminal colour schemes (`schemes.rs`), the command palette's fuzzy matching (`fuzzy.rs`), links in terminal
 text (`links.rs`), proxies (`proxy.rs`), Wake-on-LAN (`wol.rs`), port forwarding
@@ -65,7 +67,8 @@ layer, and the vault open, replaced when another opens; a window of tabs
 moved out of the main one is a workspace with `main` set and no vault tab), `files.rs` is a
 session tab's SFTP panel, `settings.rs` holds the settings in effect and
 their dialog, `vaults.rs` the list of vaults and how the open one syncs,
-`sync.rs` sync's state and runs,
+`sync.rs` sync's state and runs, `mcp.rs` agents' tool calls acted on
+in the main window,
 `vault.rs` is the
 vault tab (sidebar and the hosts screen), `keychain.rs`, `snippets.rs`,
 `forwarding.rs`, `known_hosts.rs` and `history.rs` are its other screens, `terminal.rs` is a
@@ -135,6 +138,16 @@ at startup, for looking at it without clicking.
   variant, a field inside another type, a new meaning) raises
   `sync::FORMAT`: a device that reads a newer format stops syncing, with a
   one-line reason, until it's updated.
+- **`tern --mcp` owns standard output.** It speaks MCP there, so nothing
+  else may print to it; it opens no window and never attaches a console.
+  It reaches the app through the port and token in `mcp.json` in the data
+  folder, so `TERN_DATA_DIR` picks which Tern an agent drives: point a
+  check at a scratch folder with `"mcp": true` in its `settings.json`.
+- **Agents read the terminal's grid, not its output.** Windows' console and
+  shells that redraw lines move the cursor instead of printing newlines,
+  so only the rendered text reads right. Where an agent's last read
+  stopped is a mark in a cell's underline colour (as shell integration's
+  command marks are), which moves with the text.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.
 - **Open windows with `gpui_kit::open_window`**, not GPUI's own: it wraps

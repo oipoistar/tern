@@ -597,7 +597,7 @@ pub(crate) fn spawn<T: Send + 'static>(
     async move { rx.await.unwrap_or_else(|_| Err("the work stopped".into())) }
 }
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

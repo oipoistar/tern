@@ -7592,6 +7592,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "image",
+ "serde_json",
  "tern-core",
 ]
 

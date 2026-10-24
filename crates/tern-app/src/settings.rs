@@ -124,6 +124,9 @@ pub struct SettingsView {
     /// wasn't kept.
     passphrase_saved: bool,
     passphrase_problem: Option<&'static str>,
+    /// The MCP command was just copied: a moment's "Copied".
+    copied: bool,
+    _copied: Option<Task<()>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -203,6 +206,8 @@ impl SettingsView {
             device,
             passphrase_saved,
             passphrase_problem: None,
+            copied: false,
+            _copied: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -444,6 +449,61 @@ impl SettingsView {
         self.font_size.clone()
     }
 
+    /// The command agents start Tern's MCP server with, to copy into an
+    /// agent's settings; or why agents can't get in.
+    fn mcp_command(&self, t: &Theme, cx: &Context<Self>) -> Div {
+        let row = div().flex_1().min_w_0().flex().items_center().gap(px(8.));
+        if let Some(problem) = crate::mcp::problem(cx) {
+            return row.child(
+                div()
+                    .debug_selector(|| "mcp-problem".into())
+                    .text_size(px(13.))
+                    .text_color(t.danger)
+                    .child(problem),
+            );
+        }
+        let command = crate::mcp::command();
+        row.child(
+            div()
+                .debug_selector(|| "mcp-command".into())
+                .flex_1()
+                .min_w_0()
+                .font_family(MONO)
+                .text_size(px(12.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_start()
+                .child(command.clone()),
+        )
+        .child(
+            button("copy-mcp-command", t)
+                .child(icon(
+                    if self.copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    },
+                    14.,
+                    t.text,
+                ))
+                .child(if self.copied { "Copied" } else { "Copy" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                    this.copied = true;
+                    this._copied = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(1500))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.copied = false;
+                            cx.notify();
+                        });
+                    }));
+                    cx.notify();
+                })),
+        )
+    }
+
     /// A labelled row: the control's name, then the control.
     fn row(label: &'static str, control: impl IntoElement, t: &Theme) -> Div {
         div()
@@ -589,6 +649,19 @@ impl SettingsView {
                             })),
                         t,
                     ))
+                    .child(Self::row(
+                        "MCP server",
+                        switch("mcp", settings.mcp, t)
+                            .debug_selector(|| "mcp".into())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                update(cx, |settings| settings.mcp = !settings.mcp);
+                                crate::mcp::apply(cx);
+                            })),
+                        t,
+                    ))
+                    .when(settings.mcp, |page| {
+                        page.child(Self::row("MCP command", self.mcp_command(t, cx), t))
+                    })
                     .child(Self::row(
                         "Data folder",
                         div()

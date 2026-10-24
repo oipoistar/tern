@@ -590,6 +590,62 @@ impl VaultContent {
         cx.notify();
     }
 
+    /// The saved hosts, groups, snippets and identities.
+    pub fn vault(&self) -> &Vault {
+        &self.vault
+    }
+
+    /// What the last check of `host`'s first hop found.
+    pub fn status_of(&self, host: &Host) -> HostStatus {
+        self.monitor.status(&self.vault.first_hop(host))
+    }
+
+    /// Saves `host` into `group`, in place of the host called `replacing`
+    /// when it's a change: from the editor, or from an agent.
+    pub fn save_host(
+        &mut self,
+        replacing: Option<&str>,
+        host: Host,
+        group: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let name = host.name.clone();
+        self.vault.save(replacing, host, group);
+        // Rules run without a terminal go by the host's name.
+        if let Some(old) = replacing.filter(|old| *old != name) {
+            self.end_alone(old, cx);
+        }
+        self.persist(cx);
+        self.refresh_keys(cx);
+        // A host changed to match an import makes it redundant.
+        self.refresh_imports();
+        cx.notify();
+    }
+
+    /// Deletes the saved host `name`, with its saved password. Refused
+    /// while other hosts go through it; the error names them.
+    pub fn delete_host(&mut self, name: &str, cx: &mut Context<Self>) -> Result<(), Vec<String>> {
+        let id = self.vault.find(name).map(|host| host.id.clone());
+        self.vault.delete(name)?;
+        self.end_alone(name, cx);
+        if let Some(id) = id {
+            let _ = sync::secrets(cx).forget(&tern_core::secrets::host_password(&id));
+        }
+        self.persist(cx);
+        if self.selected == name {
+            self.selected = self
+                .vault
+                .hosts()
+                .next()
+                .map(|host| host.name.clone())
+                .unwrap_or_default();
+        }
+        // A deleted import can come back.
+        self.refresh_imports();
+        cx.notify();
+        Ok(())
+    }
+
     /// The trace of the saved host called `name`, for a session's toolbar.
     pub fn host_trace(&self, name: &str) -> Option<Trace> {
         self.vault.find(name).map(|host| self.trace(host))
@@ -2512,44 +2568,17 @@ impl VaultContent {
                 group,
                 checked,
             } => {
-                self.vault
-                    .save(replacing.as_deref(), (**host).clone(), group);
-                // Rules run without a terminal go by the host's name.
-                if let Some(old) = replacing.as_deref().filter(|old| *old != host.name) {
-                    self.end_alone(old, cx);
-                }
-                self.persist(cx);
+                self.save_host(replacing.as_deref(), (**host).clone(), group, cx);
                 if let Some((place, latency_ms)) = checked {
                     self.monitor
                         .record(place, Some(*latency_ms), Instant::now());
                 }
                 self.selected = host.name.clone();
-                self.refresh_keys(cx);
             }
             EditorEvent::Delete(name) => {
-                let id = self.vault.find(name).map(|host| host.id.clone());
-                if self.vault.delete(name).is_ok() {
-                    self.end_alone(name, cx);
-                    if let Some(id) = id {
-                        let _ = sync::secrets(cx).forget(&tern_core::secrets::host_password(&id));
-                    }
-                    self.persist(cx);
-                    if self.selected == *name {
-                        self.selected = self
-                            .vault
-                            .hosts()
-                            .next()
-                            .map(|host| host.name.clone())
-                            .unwrap_or_default();
-                    }
-                }
+                let _ = self.delete_host(name, cx);
             }
             EditorEvent::Close => {}
-        }
-        // A deleted import can come back; a host edited to match a session
-        // makes it redundant.
-        if !matches!(event, EditorEvent::Close) {
-            self.refresh_imports();
         }
         self.editor = None;
         self._editor_events = None;

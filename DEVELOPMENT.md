@@ -46,6 +46,15 @@ where Tern writes keys to `~/.ssh` and trusted hosts to
 `~/.ssh/known_hosts`, `TERN_SSH_DIR` and `TERN_SYSTEM_KNOWN_HOSTS` move those
 too. `TERN_THEME=light|dark` forces an appearance.
 
+`tern --mcp` is the MCP server an agent starts: it speaks MCP on its
+standard input and output and hands each tool call to the Tern running with
+the same data folder (starting one if none is), once Settings has the MCP
+server on. Point an agent at a build from source the same way:
+
+```sh
+claude mcp add tern-dev -- C:\path\to\tern\target\debug\tern.exe --mcp
+```
+
 On Windows Tern is a windowed program, with no console of its own, and
 carries Tern's icon and version (`crates/tern-app/build.rs`;
 `resources/tern.ico` is `docs/images/mark.svg` at each icon size). Started
