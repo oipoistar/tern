@@ -136,3 +136,7 @@ at startup, for looking at it without clicking.
   one-line reason, until it's updated.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.
+- **A release build on Windows has no console** (`windows_subsystem`), so
+  a download opens no console window. Started from a terminal it attaches to
+  that one (`attach_console` in `main.rs`), so `--bench` still prints; from
+  Explorer, what it prints goes nowhere. Debug builds keep their console.

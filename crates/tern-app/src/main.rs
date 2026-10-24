@@ -1,3 +1,7 @@
+// A release build on Windows is a windowed program, so no console opens
+// behind Tern; debug builds keep theirs for what they log.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod assets;
 mod bench;
 mod files;
@@ -25,6 +29,8 @@ mod workspace;
 use gpui_kit::*;
 
 fn main() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    attach_console();
     bench::note_start();
     gpui_kit::application()
         .with_assets(assets::TernAssets)
@@ -69,4 +75,17 @@ fn main() {
                 cx.activate(true);
             }
         });
+}
+
+/// A windowed release build started from a console (`--bench` prints its
+/// results there) writes to that console.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_console() {
+    unsafe extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+    }
+    // ATTACH_PARENT_PROCESS; started from Explorer, there's none to join.
+    unsafe {
+        AttachConsole(u32::MAX);
+    }
 }

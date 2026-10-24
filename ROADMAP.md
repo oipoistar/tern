@@ -331,6 +331,9 @@ claude.ai account). Each item below names the artboard it comes from.
       macOS, or the toolbar) and theater mode (Shift+F11, the toolbar or
       the palette): a session tab shows its terminals alone, and the way
       back appears at the window's top edge
+- [x] Windows releases: a version tag builds `Tern-windows-x64.exe`
+      (windowed, with Tern's icon and version) and publishes it as a GitHub
+      Release; the README's download link always fetches the latest
 
 ## Known gaps in what's built
 
@@ -366,10 +369,11 @@ claude.ai account). Each item below names the artboard it comes from.
   - fonts (`theme::MONO`) and the data folder paths.
 
 ### 20. Installers and releases
-- Windows: MSI or winget. macOS: a signed, notarised universal `.dmg`.
-  Linux: AppImage, Flatpak or `.deb`.
-- Published as GitHub Releases. Any update check stays serverless (the GitHub
-  releases API).
+- Windows: an installer (MSI or winget) and code signing, so SmartScreen
+  stops warning. macOS: a signed, notarised universal `.dmg`. Linux:
+  AppImage, Flatpak or `.deb`. Both from the release workflow, beside the
+  Windows build.
+- Any update check stays serverless (the GitHub releases API).
 
 ### 21. Going public
 - Make the repository public.

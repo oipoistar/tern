@@ -1,0 +1,52 @@
+# Publishes a GitHub Release for a version tag (v0.1.0, …): Tern for
+# Windows as one file, Tern-windows-x64.exe, which the README's download
+# link points at. macOS and Linux builds come later (ROADMAP item 20).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The exe carries Cargo.toml's version; a tag that says otherwise is
+      # a mistake.
+      - name: Check the tag matches the version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag is $GITHUB_REF_NAME, but Cargo.toml says $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p tern-app --release --locked
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/tern.exe Tern-windows-x64.exe
+          gh release create "$GITHUB_REF_NAME" Tern-windows-x64.exe \
+            --title "Tern ${GITHUB_REF_NAME#v}" \
+            --notes "Download **Tern-windows-x64.exe** below and run it: one file, nothing to install. The first time, Windows may say it protected your PC, as Tern isn't signed yet: choose **More info**, then **Run anyway**." \
+            --generate-notes

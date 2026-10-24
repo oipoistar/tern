@@ -17,7 +17,11 @@ terminal emulation is [alacritty_terminal](https://crates.io/crates/alacritty_te
 
 ## Run
 
+Clone the repository and, with [Rust](https://rustup.rs) installed (and on
+Linux the libraries below):
+
 ```sh
+cargo run -p tern-app --release            # the app, as it's released
 cargo run -p tern-app                      # the app
 cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at start
 cargo run -p tern-app -- --connect prod-db-01                 # or one to a saved host
@@ -41,6 +45,11 @@ which also keeps a test run away from your real vault; on Linux and macOS,
 where Tern writes keys to `~/.ssh` and trusted hosts to
 `~/.ssh/known_hosts`, `TERN_SSH_DIR` and `TERN_SYSTEM_KNOWN_HOSTS` move those
 too. `TERN_THEME=light|dark` forces an appearance.
+
+A release build on Windows is a windowed program, with no console of its
+own, and carries Tern's icon and version (`crates/tern-app/build.rs`;
+`resources/tern.ico` is `docs/images/mark.svg` at each icon size). Started
+from a terminal it still prints there, as `--bench` needs.
 
 ## Develop
 
@@ -82,3 +91,18 @@ cargo test -p tern-core --test lab -- --ignored --nocapture   # Tern's SSH again
 cargo test -p tern-app lab -- --ignored --nocapture           # the app's panes, keyboard only
 docker compose -f dev/lab/compose.yaml down                   # stop it
 ```
+
+## Release
+
+`.github/workflows/release.yml` builds and publishes a release when a
+version tag is pushed. Set `version` in the root `Cargo.toml`, commit, then
+tag that commit and push the tag:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow checks the tag matches the version, builds Tern for Windows and
+publishes the release with `Tern-windows-x64.exe`, the file the README's
+download link always fetches from the latest release.

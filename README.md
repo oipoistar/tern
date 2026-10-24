@@ -9,7 +9,7 @@
 
 <p align="center">
   Every server you look after, in one calm, fast window.<br>
-  Free and open source for Windows, macOS and Linux. No account, no Tern cloud:<br>
+  Free and open source. No account, no Tern cloud:<br>
   your hosts, your keys, your storage.
 </p>
 
@@ -171,15 +171,11 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 
 ## Get Tern
 
-Tern is young and moving fast; installers for each system are [on the roadmap](ROADMAP.md). Until then, build it with [Rust](https://rustup.rs):
+**[Download Tern for Windows](https://github.com/oipoistar/tern/releases/latest/download/Tern-windows-x64.exe)**: one file, nothing to install. Keep it wherever you like and run it. Your hosts and settings live in your user profile, so a newer download picks up where you left off.
 
-```sh
-git clone https://github.com/oipoistar/tern.git
-cd tern
-cargo run -p tern-app --release
-```
+The first time, Windows may say it protected your PC, as Tern isn't signed yet: choose **More info**, then **Run anyway**. Every version is on the [releases page](https://github.com/oipoistar/tern/releases).
 
-On Linux, install the few system libraries GPUI needs first ([DEVELOPMENT.md](DEVELOPMENT.md) lists them). Tern is used daily on Windows; macOS and Linux build and pass their tests on every change.
+macOS and Linux builds are on their way. Until then, Tern builds from source on both; [DEVELOPMENT.md](DEVELOPMENT.md) says how.
 
 ### Shell integration (optional)
 
