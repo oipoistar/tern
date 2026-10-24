@@ -2856,7 +2856,9 @@ impl TerminalView {
         frame
     }
 
-    fn overlay(&self, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
+    /// The card over the pane while it isn't a terminal yet, or anymore;
+    /// `focused` is whether the pane has the keyboard, which a field shows.
+    fn overlay(&self, focused: bool, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
         let card = |title: SharedString, body: Option<AnyElement>| {
             div()
                 .absolute()
@@ -2906,6 +2908,38 @@ impl TerminalView {
                 .font_weight(FontWeight::SEMIBOLD)
                 .cursor_pointer()
                 .child(label)
+        };
+        // A field the pane's typing goes to: an ink ring and a caret while
+        // the pane has the keyboard, a hairline when not, red once refused.
+        let field = |shown: String, refused: bool| {
+            div()
+                .w(px(360.))
+                .h(px(40.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .rounded(px(10.))
+                .bg(theme.card2)
+                .border_1()
+                .border_color(if refused {
+                    theme.danger
+                } else if focused {
+                    theme.text
+                } else {
+                    theme.line
+                })
+                .font_family(MONO)
+                .child(shown)
+                .when(focused, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "field-caret".into())
+                            .ml(px(1.))
+                            .w(px(2.))
+                            .h(px(18.))
+                            .bg(theme.text),
+                    )
+                })
         };
         let target = format!(
             "{}@{}:{}",
@@ -3036,21 +3070,7 @@ impl TerminalView {
             ),
             Phase::Password { typed, rejected } => card(
                 format!("Password for {target}").into(),
-                Some(
-                    div()
-                        .w(px(360.))
-                        .h(px(40.))
-                        .px(px(12.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(10.))
-                        .bg(theme.card2)
-                        .border_1()
-                        .border_color(if *rejected { theme.danger } else { theme.card2 })
-                        .font_family(MONO)
-                        .child("•".repeat(typed.chars().count()))
-                        .into_any_element(),
-                ),
+                Some(field("•".repeat(typed.chars().count()), *rejected).into_any_element()),
             ),
             Phase::Questions {
                 prompts,
@@ -3080,22 +3100,16 @@ impl TerminalView {
                                 )
                             })
                             .child(
-                                div()
-                                    .id("question")
-                                    .debug_selector(|| "question".into())
-                                    .w(px(360.))
-                                    .h(px(40.))
-                                    .px(px(12.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(10.))
-                                    .bg(theme.card2)
-                                    .font_family(MONO)
-                                    .child(if echo {
+                                field(
+                                    if echo {
                                         typed.clone()
                                     } else {
                                         "•".repeat(typed.chars().count())
-                                    }),
+                                    },
+                                    false,
+                                )
+                                .id("question")
+                                .debug_selector(|| "question".into()),
                             )
                             .into_any_element(),
                     ),
@@ -3226,7 +3240,7 @@ impl Render for TerminalView {
                     .as_ref()
                     .map(|replay| self.replay_bar(replay, &theme, cx)),
             )
-            .children(self.overlay(&theme, cx))
+            .children(self.overlay(focused, &theme, cx))
             .children(self.menu.map(|at| self.context_menu(at, &theme, cx)))
     }
 }
@@ -4244,6 +4258,30 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.reconnect.is_none());
             assert!(matches!(&view.phase, Phase::Ended(message) if message == "Connection lost"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_password_field_shows_it_takes_typing(cx: &mut TestAppContext) {
+        let (view, cx) = pane_with(cx, "");
+        view.update(cx, |view, cx| {
+            view.phase = super::Phase::Password {
+                typed: String::new(),
+                rejected: false,
+            };
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Without the keyboard: no caret, only a hairline.
+        assert!(cx.debug_bounds("field-caret").is_none());
+        focus(&view, cx);
+        assert!(cx.debug_bounds("field-caret").is_some());
+        cx.simulate_input("hunter2");
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                &view.phase,
+                super::Phase::Password { typed, .. } if typed == "hunter2"
+            ))
         });
     }
 

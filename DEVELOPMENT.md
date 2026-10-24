@@ -46,8 +46,8 @@ where Tern writes keys to `~/.ssh` and trusted hosts to
 `~/.ssh/known_hosts`, `TERN_SSH_DIR` and `TERN_SYSTEM_KNOWN_HOSTS` move those
 too. `TERN_THEME=light|dark` forces an appearance.
 
-A release build on Windows is a windowed program, with no console of its
-own, and carries Tern's icon and version (`crates/tern-app/build.rs`;
+On Windows Tern is a windowed program, with no console of its own, and
+carries Tern's icon and version (`crates/tern-app/build.rs`;
 `resources/tern.ico` is `docs/images/mark.svg` at each icon size). Started
 from a terminal it still prints there, as `--bench` needs.
 
