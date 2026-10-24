@@ -3,7 +3,9 @@
 //! to add or change hosts, and saves every change to the vault file. While
 //! it shows in the active window it checks in the background that the hosts
 //! answer, and their traces draw what the checks measured. A group can be
-//! filled by a command run here, and refreshed from it.
+//! filled by a command run here, and refreshed from it. The sidebar's
+//! switcher opens another vault, which the workspace shows in place of this
+//! one ([`VaultEvent::Switch`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,7 @@ use tern_core::history::{History, Visit};
 use tern_core::randomart::Randomart;
 use tern_core::reach::{Monitor, Place};
 use tern_core::restore::OpenTabs;
-use tern_core::secrets::SYNC_PASSPHRASE;
+use tern_core::secrets;
 use tern_core::snippet::Snippet;
 use tern_core::sources::{self, Sources};
 use tern_core::ssh::{
@@ -29,6 +31,7 @@ use tern_core::ssh::{
     known_host_key, probe, quick_destination,
 };
 use tern_core::sync::{Merged, Syncer};
+use tern_core::vaults::{FIRST, VaultEntry};
 use tern_core::waiting::Waiting;
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
 use tern_core::{keys, known_hosts};
@@ -50,6 +53,7 @@ use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{
     Ui, art_tile, button, group_heading, icon, ink_button, search_field, status_dot, switch,
 };
+use crate::vaults;
 
 /// The line for filling a group from a command run here.
 struct SourceForm {
@@ -86,6 +90,15 @@ struct Background {
     _events: Task<()>,
 }
 
+/// What the vault switcher's line names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VaultLine {
+    /// A new vault.
+    New,
+    /// The open vault, renamed.
+    Rename,
+}
+
 pub enum VaultEvent {
     Connect(Connection),
     /// Show the session for this connection's saved host, opening one if
@@ -102,6 +115,8 @@ pub enum VaultEvent {
     },
     /// Open these side by side, as split panes.
     OpenTogether(Vec<Connection>),
+    /// Another vault is open now: show it in place of this one.
+    Switch,
     /// A host came back: open a tab for it, out of the way, running the
     /// connection's one-off command.
     Run(Connection),
@@ -209,6 +224,12 @@ pub struct VaultContent {
     waiting: Waiting,
     waiting_file: Option<PathBuf>,
     wait_line: Option<(String, Entity<InputState>, Subscription)>,
+    /// The list of vaults is open under the switcher; the line for a
+    /// vault's name being typed there; the vault asked about before it's
+    /// deleted.
+    vaults_open: bool,
+    vault_line: Option<(VaultLine, Entity<InputState>, Subscription)>,
+    deleting: Option<String>,
     /// Groups whose command is running, and why a group's failed last.
     refreshing: HashSet<String>,
     source_problems: HashMap<String, SharedString>,
@@ -243,19 +264,20 @@ impl VaultContent {
             bench::fill(&mut content.monitor, &content.vault);
             return content;
         }
-        let opened = tern_core::vault::open(&paths::vault());
+        let id = vaults::current(cx);
+        let opened = tern_core::vault::open(&paths::vault(&id));
         let mut vault = opened.vault;
-        if opened.fresh && Path::new(DEV_KEY).exists() {
+        if opened.fresh && id == FIRST && Path::new(DEV_KEY).exists() {
             vault.groups.insert(0, dev_server_group());
         }
         let mut content = Self::new(vault, opened.path, live, window, cx);
         content.notice = opened.notice.map(Into::into);
-        content.history = History::load(&paths::history());
-        content.history_file = Some(paths::history());
-        content.sources = Sources::load(&paths::sources());
-        content.sources_file = Some(paths::sources());
-        content.waiting = Waiting::load(&paths::waiting());
-        content.waiting_file = Some(paths::waiting());
+        content.history = History::load(&paths::history(&id));
+        content.history_file = Some(paths::history(&id));
+        content.sources = Sources::load(&paths::sources(&id));
+        content.sources_file = Some(paths::sources(&id));
+        content.waiting = Waiting::load(&paths::waiting(&id));
+        content.waiting_file = Some(paths::waiting(&id));
         content.start_checks(window, cx);
         // Sync at start, then every minute for other devices' changes.
         content._sync_loop = Some(cx.spawn(async move |this, cx| {
@@ -277,8 +299,24 @@ impl VaultContent {
 
     /// The connections that open `open`'s tabs again, and where the tab
     /// on screen ends up.
-    pub fn reopened(&self, open: &OpenTabs) -> (Vec<Vec<Connection>>, Option<usize>) {
-        open.connections(&self.vault)
+    pub fn reopened(&self, open: &OpenTabs, cx: &App) -> (Vec<Vec<Connection>>, Option<usize>) {
+        // Other vaults are read only for tabs this one doesn't have.
+        let here = [&self.vault];
+        let elsewhere = open.tabs.iter().flatten().any(|pane| {
+            matches!(pane, tern_core::restore::Opened::Host { .. })
+                && pane.connection(&here).is_none()
+        });
+        if !elsewhere {
+            return open.connections(&here);
+        }
+        let others: Vec<Vault> = vaults::list(cx)
+            .vaults
+            .iter()
+            .filter(|vault| vault.id != vaults::current(cx))
+            .filter_map(|vault| tern_core::vault::read(&paths::vault(&vault.id)))
+            .collect();
+        let all: Vec<&Vault> = std::iter::once(&self.vault).chain(&others).collect();
+        open.connections(&all)
     }
 
     /// Every saved host's name and `user@address`, in vault order.
@@ -304,9 +342,10 @@ impl VaultContent {
     /// read them again, for changes made meanwhile.
     /// Shows the screen called `name` (`keychain`, `identities`,
     /// `snippets`, `forwarding`, `known-hosts`, `history`; anything else is
-    /// Hosts).
+    /// Hosts, `vaults` with the list of vaults open).
     pub fn show_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.show_identities = name == "identities";
+        self.vaults_open = name == "vaults";
         let section = match name {
             "keychain" | "identities" => Section::Keychain,
             "snippets" => Section::Snippets,
@@ -636,6 +675,9 @@ impl VaultContent {
             waiting: Waiting::default(),
             waiting_file: None,
             wait_line: None,
+            vaults_open: false,
+            vault_line: None,
+            deleting: None,
             refreshing: HashSet::new(),
             source_problems: HashMap::new(),
             openssh: Vec::new(),
@@ -654,6 +696,336 @@ impl VaultContent {
         content.refresh_keys();
         content.refresh_imports();
         content
+    }
+
+    /// Opens the vault `id` in place of this one.
+    fn open_vault(&mut self, id: String, cx: &mut Context<Self>) {
+        vaults::update(cx, |vaults| vaults.current = id);
+        cx.emit(VaultEvent::Switch);
+    }
+
+    /// Opens the switcher's line for a new vault's name, or the open
+    /// vault's.
+    fn open_vault_line(&mut self, line: VaultLine, window: &mut Window, cx: &mut Context<Self>) {
+        let name = match line {
+            VaultLine::New => String::new(),
+            VaultLine::Rename => vaults::list(cx).current().name.clone(),
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Name")
+                .default_value(name)
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let enter = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.take_vault_line(cx);
+            }
+        });
+        self.deleting = None;
+        self.vault_line = Some((line, input, enter));
+        cx.notify();
+    }
+
+    /// Makes the vault named on the line and opens it, or renames the
+    /// open one.
+    fn take_vault_line(&mut self, cx: &mut Context<Self>) {
+        let Some((line, input, _)) = self.vault_line.take() else {
+            return;
+        };
+        let name = input.read(cx).value().to_string();
+        match line {
+            VaultLine::New => {
+                let mut id = String::new();
+                vaults::update(cx, |vaults| id = vaults.add(&name));
+                self.open_vault(id, cx);
+            }
+            VaultLine::Rename => {
+                let open = vaults::current(cx);
+                vaults::update(cx, |vaults| vaults.rename(&open, &name));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Deletes the vault `id`, which isn't open (nor the first): its
+    /// files, its sync passphrase and its hosts' saved passwords. Devices
+    /// it synced with keep their copies.
+    fn delete_vault(&mut self, id: String, cx: &mut Context<Self>) {
+        self.deleting = None;
+        if id == vaults::current(cx) {
+            return;
+        }
+        let mut removed = false;
+        vaults::update(cx, |vaults| removed = vaults.remove(&id));
+        if !removed {
+            return;
+        }
+        let store = sync::secrets(cx);
+        let _ = store.forget(&secrets::sync_passphrase(&id));
+        if let Some(deleted) = tern_core::vault::read(&paths::vault(&id)) {
+            for host in deleted.hosts() {
+                let _ = store.forget(&secrets::host_password(&host.id));
+            }
+        }
+        let _ = std::fs::remove_dir_all(paths::vault_dir(&id));
+        cx.notify();
+    }
+
+    /// The open vault's name, which opens the list of vaults under it:
+    /// each opens with a click, the open one renames, others delete, and a
+    /// new one starts at the end.
+    fn vault_switcher(&self, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
+        let vaults = vaults::list(cx);
+        let open = vaults.current().clone();
+        let header = div()
+            .id("vaults")
+            .debug_selector(|| "vaults".into())
+            .h(px(42.))
+            .px(px(14.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .rounded(px(14.))
+            .border_1()
+            .border_color(t.line)
+            .cursor_pointer()
+            .child(icon(IconName::Vault, 18., t.text))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(open.name.clone()),
+            )
+            .child(icon(IconName::ChevronsUpDown, 14., t.text2))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.vaults_open = !this.vaults_open;
+                this.vault_line = None;
+                this.deleting = None;
+                cx.notify();
+            }));
+        let new_line = matches!(&self.vault_line, Some((VaultLine::New, ..)));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(header)
+            .when(self.vaults_open, |d| {
+                d.children(
+                    vaults
+                        .vaults
+                        .iter()
+                        .map(|vault| self.vault_row(vault, vault.id == open.id, t, cx)),
+                )
+                .child(if new_line {
+                    self.vault_name_line(t, cx)
+                } else {
+                    div()
+                        .id("vault-new")
+                        .debug_selector(|| "vault-new".into())
+                        .h(px(36.))
+                        .px(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .rounded(px(12.))
+                        .text_color(t.text2)
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.card2))
+                        .child(icon(IconName::Plus, 16., t.text2))
+                        .child("New vault")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_vault_line(VaultLine::New, window, cx)
+                        }))
+                        .into_any_element()
+                })
+            })
+    }
+
+    /// A vault in the switcher's list: the open one as a card that
+    /// renames, others to open with a click or delete.
+    fn vault_row(
+        &self,
+        vault: &VaultEntry,
+        open: bool,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if open && matches!(&self.vault_line, Some((VaultLine::Rename, ..))) {
+            return self.vault_name_line(t, cx);
+        }
+        let id = vault.id.clone();
+        let tag = format!("vault-{}", vault.name);
+        let name = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .child(vault.name.clone());
+        if self.deleting.as_deref() == Some(id.as_str()) {
+            let (keep, gone) = (id.clone(), id);
+            return div()
+                .h(px(36.))
+                .pl(px(14.))
+                .pr(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(t.danger)
+                .child(name)
+                .child(
+                    div()
+                        .id("vault-delete-confirm")
+                        .debug_selector(|| "vault-delete-confirm".into())
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(9.))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.danger)
+                        .cursor_pointer()
+                        .child("Delete")
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.delete_vault(gone.clone(), cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("vault-keep-{keep}")))
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.card2))
+                        .child(icon(IconName::Close, 12., t.text2))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.deleting = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
+        }
+        let action = if open {
+            Some(("vault-rename".to_string(), IconName::Pencil))
+        } else if id != FIRST {
+            Some((format!("vault-delete-{}", vault.name), IconName::Trash))
+        } else {
+            None
+        };
+        div()
+            .id(SharedString::from(tag.clone()))
+            .debug_selector(move || tag)
+            .h(px(36.))
+            .pl(px(14.))
+            .pr(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(12.))
+            .map(|d| {
+                if open {
+                    d.bg(t.card)
+                        .shadow(t.shadow())
+                        .font_weight(FontWeight::SEMIBOLD)
+                } else {
+                    d.text_color(t.text2)
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.card2))
+                }
+            })
+            .child(name)
+            .when_some(action, |d, (action, glyph)| {
+                let (id, selector) = (id.clone(), action.clone());
+                d.child(
+                    div()
+                        .id(SharedString::from(action))
+                        .debug_selector(move || selector)
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.card2))
+                        .child(icon(glyph, 13., t.text2))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if open {
+                                this.open_vault_line(VaultLine::Rename, window, cx);
+                            } else {
+                                this.vault_line = None;
+                                this.deleting = Some(id.clone());
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+            .when(!open, |d| {
+                d.on_click(cx.listener(move |this, _, _, cx| this.open_vault(id.clone(), cx)))
+            })
+            .into_any_element()
+    }
+
+    /// The switcher's line for a vault's name, with a way out.
+    fn vault_name_line(&self, t: &Theme, cx: &Context<Self>) -> AnyElement {
+        let Some((_, input, _)) = &self.vault_line else {
+            return div().into_any_element();
+        };
+        div()
+            .h(px(36.))
+            .pl(px(12.))
+            .pr(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(12.))
+            .bg(t.card2)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(input).appearance(false)),
+            )
+            .child(
+                div()
+                    .id("vault-line-ok")
+                    .debug_selector(|| "vault-line-ok".into())
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(9.))
+                    .bg(t.text)
+                    .cursor_pointer()
+                    .child(icon(IconName::Check, 13., t.card))
+                    .on_click(cx.listener(|this, _, _, cx| this.take_vault_line(cx))),
+            )
+            .child(
+                div()
+                    .id("vault-line-cancel")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.card2))
+                    .child(icon(IconName::Close, 12., t.text2))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.vault_line = None;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 
     /// Runs what waited for the hosts reached through `place`, which
@@ -1102,7 +1474,7 @@ impl VaultContent {
     /// Saves a change made here, and syncs it shortly.
     fn persist(&mut self, cx: &mut Context<Self>) {
         self.write_vault();
-        if settings::current(cx).sync.folder.is_some() {
+        if vaults::sync_settings(cx).folder.is_some() {
             self._sync_soon = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SYNC_SETTLE).await;
                 let _ = this.update(cx, |this, cx| this.sync_now(cx));
@@ -1113,7 +1485,7 @@ impl VaultContent {
     /// Syncs now, if a folder and passphrase are set and no sync is
     /// running already.
     pub fn sync_now(&mut self, cx: &mut Context<Self>) {
-        let settings = settings::current(cx);
+        let settings = vaults::sync_view(cx);
         if settings.sync.folder.is_none() {
             if sync::state(cx).status != Status::Off {
                 sync::set_state(cx, SyncState::default());
@@ -1124,7 +1496,7 @@ impl VaultContent {
             return;
         }
         let devices = sync::state(cx).devices;
-        let Some(passphrase) = sync::secrets(cx).load(SYNC_PASSPHRASE) else {
+        let Some(passphrase) = sync::secrets(cx).load(&vaults::passphrase(cx)) else {
             sync::set_state(
                 cx,
                 SyncState {
@@ -1185,7 +1557,7 @@ impl VaultContent {
                 return;
             }
         };
-        let settings = settings::current(cx);
+        let settings = vaults::sync_view(cx);
         // Changes made here while the sync ran are newer than what it read.
         let synced = tern_core::sync::snapshot(&merged.vault, &settings, Vec::new());
         let vault = tern_core::sync::merge(&self.vault, &settings, &[synced]).vault;
@@ -1734,7 +2106,18 @@ impl VaultContent {
     }
 
     /// Adds a finished connection to History and saves it.
-    pub fn record_visit(&mut self, visit: Visit, cx: &mut Context<Self>) {
+    pub fn record_visit(&mut self, visit: Visit, host_id: Option<&str>, cx: &mut Context<Self>) {
+        // A session from another vault, still open after a switch.
+        if let Some(id) = host_id
+            && !self.vault.hosts().any(|host| host.id == id)
+            && let Some(other) = vaults::list(cx).holding(id)
+        {
+            let path = paths::history(&other);
+            let mut history = History::load(&path);
+            history.record(visit);
+            let _ = history.save(&path);
+            return;
+        }
         self.history.record(visit);
         if let Some(path) = &self.history_file {
             // History is a convenience; failing to save it isn't worth a
@@ -2845,7 +3228,16 @@ impl Render for VaultContent {
             .bg(theme.win)
             .text_color(theme.text)
             .text_size(px(14.))
-            .child(sidebar(self.section, &theme, cx))
+            .child(
+                div()
+                    .w(px(220.))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .child(self.vault_switcher(&theme, cx))
+                    .child(sidebar(self.section, &theme, cx)),
+            )
             .map(|d| match screen {
                 Some(view) => d.child(view),
                 None => d
@@ -3639,8 +4031,8 @@ mod tests {
             ended: "Exited with status 0".into(),
         };
         vault.update(cx, |vault, cx| {
-            vault.record_visit(visit(None, "10.0.0.9"), cx);
-            vault.record_visit(visit(Some("bastion"), "old.example.com"), cx);
+            vault.record_visit(visit(None, "10.0.0.9"), None, cx);
+            vault.record_visit(visit(Some("bastion"), "old.example.com"), None, cx);
         });
         click(cx, "nav-history");
         assert!(cx.debug_bounds("reconnect-1").is_some());
@@ -3760,7 +4152,10 @@ mod tests {
                     .borrow_mut()
                     .push((connection.host.clone().unwrap_or_default(), *files)),
                 VaultEvent::Forward { on, .. } => seen_switch.borrow_mut().push(*on),
-                VaultEvent::Connect(_) | VaultEvent::OpenTogether(_) | VaultEvent::Run(_) => {}
+                VaultEvent::Connect(_)
+                | VaultEvent::OpenTogether(_)
+                | VaultEvent::Run(_)
+                | VaultEvent::Switch => {}
             })
             .detach()
         });

@@ -13,8 +13,17 @@ pub trait Secrets: Send + Sync {
     fn forget(&self, name: &str) -> Result<(), String>;
 }
 
-/// The name the sync passphrase is kept under.
+/// The name the first vault's sync passphrase is kept under.
 pub const SYNC_PASSPHRASE: &str = "sync passphrase";
+
+/// The name the vault `id`'s sync passphrase is kept under.
+pub fn sync_passphrase(id: &str) -> String {
+    if id == crate::vaults::FIRST {
+        SYNC_PASSPHRASE.into()
+    } else {
+        format!("{SYNC_PASSPHRASE} {id}")
+    }
+}
 
 /// The name a saved host's password is kept under, by the host's id so a
 /// rename keeps it.
@@ -85,5 +94,7 @@ mod tests {
         secrets.forget(SYNC_PASSPHRASE).unwrap();
         assert_eq!(secrets.load(SYNC_PASSPHRASE), None);
         assert_eq!(host_password("abc"), "password abc");
+        assert_eq!(sync_passphrase(crate::vaults::FIRST), SYNC_PASSPHRASE);
+        assert_eq!(sync_passphrase("0123abcd"), "sync passphrase 0123abcd");
     }
 }

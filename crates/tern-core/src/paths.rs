@@ -25,9 +25,24 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
-/// The saved hosts.
-pub fn vault() -> PathBuf {
-    data_dir().join("vault.json")
+/// The vaults Tern keeps, and which is open.
+pub fn vaults() -> PathBuf {
+    data_dir().join("vaults.json")
+}
+
+/// Where the vault `id` keeps its own files: the data folder itself for
+/// the first vault, `vaults/<id>/` in it for others.
+pub fn vault_dir(id: &str) -> PathBuf {
+    if id == crate::vaults::FIRST {
+        data_dir()
+    } else {
+        data_dir().join("vaults").join(id)
+    }
+}
+
+/// The saved hosts of the vault `id`.
+pub fn vault(id: &str) -> PathBuf {
+    vault_dir(id).join("vault.json")
 }
 
 /// How Tern looks and its terminals behave.
@@ -35,9 +50,9 @@ pub fn settings() -> PathBuf {
     data_dir().join("settings.json")
 }
 
-/// Recent connections.
-pub fn history() -> PathBuf {
-    data_dir().join("history.json")
+/// The vault `id`'s recent connections.
+pub fn history(id: &str) -> PathBuf {
+    vault_dir(id).join("history.json")
 }
 
 /// The tabs open when Tern last quit.
@@ -45,14 +60,15 @@ pub fn tabs() -> PathBuf {
     data_dir().join("tabs.json")
 }
 
-/// The commands waiting for hosts to come back, which never sync.
-pub fn waiting() -> PathBuf {
-    data_dir().join("waiting.json")
+/// The commands waiting for the vault `id`'s hosts to come back, which
+/// never sync.
+pub fn waiting(id: &str) -> PathBuf {
+    vault_dir(id).join("waiting.json")
 }
 
-/// The commands that fill groups here, which never sync.
-pub fn sources() -> PathBuf {
-    data_dir().join("sources.json")
+/// The commands that fill the vault `id`'s groups here, which never sync.
+pub fn sources(id: &str) -> PathBuf {
+    vault_dir(id).join("sources.json")
 }
 
 /// Key pairs Tern generated or imported.

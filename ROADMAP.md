@@ -302,6 +302,19 @@ claude.ai account). Each item below names the artboard it comes from.
       question for a password; a wrong guess drops them all, and
       full-screen programs aren't guessed. Predict typing in the
       terminal settings turns it off
+- [x] More than one vault: the sidebar's switcher names the vault open
+      and lists the others; a click opens one in place of the other (tabs
+      stay open, and their endings go to their own vault's History), New
+      vault adds one, the pencil renames the open one and the bin deletes
+      another, after a second click (its files, sync passphrase and saved
+      passwords; devices it synced with keep their copies). Each vault
+      has its own hosts, snippets, identities, rules, History, commands
+      that fill groups and wait for hosts, and syncs through a folder and
+      passphrase of its own, shown in the Sync page; settings sync with
+      the first vault only. The first vault's files stay where they
+      always were, the others' go to vaults/<id>/ in the data folder, and
+      the list to vaults.json, which never syncs. Tabs reopened at start
+      find their hosts in whichever vault has them
 
 ## Known gaps in what's built
 

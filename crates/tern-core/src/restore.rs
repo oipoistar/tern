@@ -1,6 +1,7 @@
 //! The tabs open when Tern last quit, in `tabs.json` in the data folder,
 //! so the next start can open them again. A saved host is kept by its id
 //! and name, a typed connection by what was typed, and never a password.
+//! Tabs from every vault come back, whichever is open.
 
 use std::path::{Path, PathBuf};
 
@@ -52,17 +53,25 @@ impl Opened {
         }
     }
 
-    /// The connection that opens it again; `None` for a saved host that's
+    /// The connection that opens it again, from the vault in `vaults` that
+    /// has its host (the open one first); `None` for a saved host that's
     /// gone, or can't be connected to as it's saved now.
-    pub fn connection(&self, vault: &Vault) -> Option<Connection> {
+    pub fn connection(&self, vaults: &[&Vault]) -> Option<Connection> {
         match self {
             Self::Local => Some(Connection::local()),
             Self::Host { id, name } => {
-                // The id survives a rename synced in from elsewhere.
-                let host = id
-                    .as_ref()
-                    .and_then(|id| vault.hosts().find(|host| &host.id == id))
-                    .or_else(|| vault.find(name))?;
+                // The id survives a rename synced in from elsewhere; a name
+                // only means a host in the open vault.
+                let by_id = id.as_ref().and_then(|id| {
+                    vaults.iter().find_map(|vault| {
+                        let host = vault.hosts().find(|host| &host.id == id)?;
+                        Some((vault, host))
+                    })
+                });
+                let (vault, host) = by_id.or_else(|| {
+                    let vault = vaults.first()?;
+                    Some((vault, vault.find(name)?))
+                })?;
                 vault.connection(host).ok()
             }
             Self::Typed {
@@ -106,15 +115,16 @@ impl OpenTabs {
         paths::write_atomically(path, json.as_bytes())
     }
 
-    /// Each tab's connections, without panes whose hosts are gone or tabs
-    /// left with none, and where the tab on screen ends up.
-    pub fn connections(&self, vault: &Vault) -> (Vec<Vec<Connection>>, Option<usize>) {
+    /// Each tab's connections, from the vaults in `vaults` (the open one
+    /// first), without panes whose hosts are gone or tabs left with none,
+    /// and where the tab on screen ends up.
+    pub fn connections(&self, vaults: &[&Vault]) -> (Vec<Vec<Connection>>, Option<usize>) {
         let mut tabs = Vec::new();
         let mut active = None;
         for (index, panes) in self.tabs.iter().enumerate() {
             let connections: Vec<Connection> = panes
                 .iter()
-                .filter_map(|pane| pane.connection(vault))
+                .filter_map(|pane| pane.connection(vaults))
                 .collect();
             if connections.is_empty() {
                 continue;
@@ -166,8 +176,27 @@ mod tests {
         );
         assert_eq!(Opened::of(&Connection::local()), Opened::Local);
         for connection in [db, typed(), Connection::local()] {
-            assert_eq!(Opened::of(&connection).connection(&vault), Some(connection));
+            assert_eq!(
+                Opened::of(&connection).connection(&[&vault]),
+                Some(connection)
+            );
         }
+    }
+
+    #[test]
+    fn finds_hosts_in_vaults_not_open() {
+        let work = vault();
+        let db = Opened::of(&work.connection(work.find("db").unwrap()).unwrap());
+        let open = Vault::default();
+        let found = db.connection(&[&open, &work]).unwrap();
+        assert_eq!(found.target.host, "10.0.0.5");
+        // By name, only in the vault open.
+        let named = Opened::Host {
+            id: None,
+            name: "db".into(),
+        };
+        assert_eq!(named.connection(&[&open, &work]), None);
+        assert!(named.connection(&[&work, &open]).is_some());
     }
 
     #[test]
@@ -187,7 +216,7 @@ mod tests {
             active: Some(2),
         };
         vault.groups[0].hosts[0].name = "database".into();
-        let (tabs, active) = open.connections(&vault);
+        let (tabs, active) = open.connections(&[&vault]);
         let hosts: Vec<Vec<Option<&str>>> = tabs
             .iter()
             .map(|panes| panes.iter().map(|pane| pane.host.as_deref()).collect())
@@ -201,7 +230,7 @@ mod tests {
             active: Some(1),
             ..open
         };
-        assert_eq!(open.connections(&vault).1, None);
+        assert_eq!(open.connections(&[&vault]).1, None);
     }
 
     #[test]

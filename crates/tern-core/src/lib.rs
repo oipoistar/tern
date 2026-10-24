@@ -40,6 +40,7 @@ pub mod sources;
 pub mod ssh;
 pub mod sync;
 pub mod vault;
+pub mod vaults;
 pub mod waiting;
 pub mod wol;
 

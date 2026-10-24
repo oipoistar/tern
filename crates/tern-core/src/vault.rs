@@ -546,6 +546,12 @@ enum Unusable {
     Broken(String),
 }
 
+/// The vault at `path` as it is, for looking in a vault that isn't open:
+/// nothing when it's missing or can't be read, and nothing is moved.
+pub fn read(path: &Path) -> Option<Vault> {
+    parse(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn parse(text: &str) -> Result<Vault, Unusable> {
     // Some Windows editors start UTF-8 files with a byte-order mark.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);

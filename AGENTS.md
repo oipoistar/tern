@@ -41,7 +41,8 @@ Performance-sensitive changes: compare `--bench 10` with and without them
 ## Architecture in one breath
 
 `tern-core` has no UI: hosts and the `Vault` with its `vault.json`
-(`host.rs`, `vault.rs`), the bookkeeping of background reachability checks
+(`host.rs`, `vault.rs`), the list of vaults and where each keeps its files
+(`vaults.rs`), the bookkeeping of background reachability checks
 (`reach.rs`), the host editor's checks (`draft.rs`), identities (`identity.rs`), environment variables (`env.rs`), when to reconnect a
 dropped session (`reconnect.rs`), the tabs to reopen at the next start (`restore.rs`), local shells (`local.rs`, the same
 events as an SSH session), SSH sessions (`ssh.rs`,
@@ -58,8 +59,10 @@ text (`links.rs`), proxies (`proxy.rs`), Wake-on-LAN (`wol.rs`), port forwarding
 PuTTY's saved sessions (`putty.rs`) and OpenSSH's config (`openssh.rs`) and paths and safe writes
 (`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
 root (header, tabs, a session tab's panes, toolbar and snippet bar, live
-layer), `files.rs` is a session tab's SFTP panel, `settings.rs` holds the
-settings in effect and their dialog, `sync.rs` sync's state and runs,
+layer, and the vault open, replaced when another opens), `files.rs` is a
+session tab's SFTP panel, `settings.rs` holds the settings in effect and
+their dialog, `vaults.rs` the list of vaults and how the open one syncs,
+`sync.rs` sync's state and runs,
 `vault.rs` is the
 vault tab (sidebar and the hosts screen), `keychain.rs`, `snippets.rs`,
 `forwarding.rs`, `known_hosts.rs` and `history.rs` are its other screens, `terminal.rs` is a

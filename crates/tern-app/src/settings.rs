@@ -9,13 +9,14 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tern_core::paths;
-use tern_core::secrets::SYNC_PASSPHRASE;
 use tern_core::settings::{Appearance, Bell, CursorStyle, Settings, TerminalSettings};
-use tern_core::sync::SyncedSettings;
+use tern_core::sync::{SyncSettings, SyncedSettings};
+use tern_core::vaults::FIRST;
 
 use crate::sync::{self, Status, SyncState};
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{button, icon, ink_button, switch};
+use crate::vaults;
 
 /// The settings in effect, and where they're saved (`None` in tests).
 struct Current {
@@ -128,8 +129,8 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(page: Page, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let terminal = current(cx).terminal;
-        let device_name = current(cx).sync.device;
-        let passphrase_saved = sync::secrets(cx).load(SYNC_PASSPHRASE).is_some();
+        let device_name = vaults::sync_settings(cx).device;
+        let passphrase_saved = sync::secrets(cx).load(&vaults::passphrase(cx)).is_some();
         let input = |value: String,
                      placeholder: &'static str,
                      window: &mut Window,
@@ -181,7 +182,7 @@ impl SettingsView {
                 if let InputEvent::Change = event {
                     let name = input.read(cx).value().trim().to_string();
                     if !name.is_empty() {
-                        update(cx, |settings| settings.sync.device = name);
+                        vaults::update_sync(cx, |sync| sync.device = name);
                     }
                 }
             }),
@@ -214,7 +215,10 @@ impl SettingsView {
         if typed.is_empty() {
             return;
         }
-        if sync::secrets(cx).store(SYNC_PASSPHRASE, &typed).is_ok() {
+        if sync::secrets(cx)
+            .store(&vaults::passphrase(cx), &typed)
+            .is_ok()
+        {
             self.passphrase_saved = true;
             cx.emit(SettingsEvent::SyncNow);
         }
@@ -233,9 +237,9 @@ impl SettingsView {
                 && let Some(folder) = paths.into_iter().next()
             {
                 let _ = this.update(cx, |_, cx| {
-                    update(cx, |settings| {
-                        settings.sync.folder = Some(folder);
-                        settings.sync.ensure_device_id();
+                    vaults::update_sync(cx, |sync| {
+                        sync.folder = Some(folder);
+                        sync.ensure_device_id();
                     });
                     cx.emit(SettingsEvent::SyncNow);
                 });
@@ -247,15 +251,17 @@ impl SettingsView {
     /// Turns sync off here and forgets the passphrase; the folder and the
     /// other devices keep their files.
     fn stop_syncing(&mut self, cx: &mut Context<Self>) {
-        update(cx, |settings| settings.sync.folder = None);
-        let _ = sync::secrets(cx).forget(SYNC_PASSPHRASE);
+        vaults::update_sync(cx, |sync| sync.folder = None);
+        let _ = sync::secrets(cx).forget(&vaults::passphrase(cx));
         self.passphrase_saved = false;
         sync::set_state(cx, SyncState::default());
         cx.notify();
     }
 
-    fn sync_page(&self, settings: &Settings, t: &Theme, cx: &Context<Self>) -> Div {
-        let sync_settings = &settings.sync;
+    /// How the open vault syncs; settings sync with the first vault only.
+    fn sync_page(&self, t: &Theme, cx: &Context<Self>) -> Div {
+        let sync_settings = vaults::sync_settings(cx);
+        let vaults = vaults::list(cx);
         let state = sync::state(cx);
         let folder = div()
             .flex_1()
@@ -295,12 +301,12 @@ impl SettingsView {
                     .on_click(cx.listener(|this, _, _, cx| this.save_passphrase(cx))),
             );
         let switch_row =
-            |label: &'static str, id: &'static str, on: bool, set: fn(&mut Settings)| {
+            |label: &'static str, id: &'static str, on: bool, set: fn(&mut SyncSettings)| {
                 Self::row(
                     label,
                     switch(id, on, t)
                         .debug_selector(move || id.into())
-                        .on_click(move |_, _, cx| update(cx, set)),
+                        .on_click(move |_, _, cx| vaults::update_sync(cx, set)),
                     t,
                 )
             };
@@ -322,6 +328,16 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
+            .when(vaults.vaults.len() > 1, |d| {
+                d.child(Self::row(
+                    "Vault",
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(vaults.current().name.clone()),
+                    t,
+                ))
+            })
             .child(Self::row("Folder", folder, t))
             .child(Self::row("Passphrase", passphrase, t))
             .when(sync_settings.folder.is_some(), |d| {
@@ -334,26 +350,28 @@ impl SettingsView {
                     "Hosts and groups",
                     "sync-hosts",
                     sync_settings.hosts,
-                    |settings| settings.sync.hosts = !settings.sync.hosts,
+                    |sync| sync.hosts = !sync.hosts,
                 ))
                 .child(switch_row(
                     "Snippets",
                     "sync-snippets",
                     sync_settings.snippets,
-                    |settings| settings.sync.snippets = !settings.sync.snippets,
+                    |sync| sync.snippets = !sync.snippets,
                 ))
                 .child(switch_row(
                     "Port forwards",
                     "sync-forwards",
                     sync_settings.forwards,
-                    |settings| settings.sync.forwards = !settings.sync.forwards,
+                    |sync| sync.forwards = !sync.forwards,
                 ))
-                .child(switch_row(
-                    "Settings",
-                    "sync-settings",
-                    sync_settings.settings,
-                    |settings| settings.sync.settings = !settings.sync.settings,
-                ))
+                .when(vaults.current == FIRST, |d| {
+                    d.child(switch_row(
+                        "Settings",
+                        "sync-settings",
+                        sync_settings.settings,
+                        |sync| sync.settings = !sync.settings,
+                    ))
+                })
                 .when(!state.devices.is_empty(), |d| {
                     d.child(Self::row(
                         "Devices",
@@ -661,7 +679,7 @@ impl SettingsView {
                         })),
                     t,
                 )),
-            Page::Sync => self.sync_page(settings, t, cx),
+            Page::Sync => self.sync_page(t, cx),
             Page::Appearance => div().child(Self::row(
                 "Theme",
                 Self::choice(

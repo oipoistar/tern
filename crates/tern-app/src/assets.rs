@@ -12,6 +12,7 @@ gpui_kit::assets::icon_assets!(
         Clock,
         Cloud,
         CodeXml,
+        ChevronsUpDown,
         CircleDot,
         Columns2,
         Container,
@@ -44,6 +45,7 @@ gpui_kit::assets::icon_assets!(
         Trash,
         Upload,
         Usb,
+        Vault,
         Zap
     ]
 );

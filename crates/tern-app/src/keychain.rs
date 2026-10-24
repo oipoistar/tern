@@ -12,9 +12,9 @@ use gpui_kit::*;
 use tern_core::Vault;
 use tern_core::keys::{self, KeyPair};
 
-use crate::settings;
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{art_tile, button, group_heading, icon, ink_button, search_field, switch};
+use crate::vaults;
 
 /// Wide enough for a key's file name; three fit beside the details.
 const CARD_WIDTH: f32 = 250.;
@@ -541,9 +541,9 @@ impl KeychainView {
             })
             // Only while sync is set up; private keys stay off it unless
             // chosen one by one.
-            .when(settings::current(cx).sync.folder.is_some(), |d| {
+            .when(vaults::sync_settings(cx).folder.is_some(), |d| {
                 let fingerprint = pair.fingerprint.clone();
-                let on = settings::current(cx).sync.keys.contains(&fingerprint);
+                let on = vaults::sync_settings(cx).keys.contains(&fingerprint);
                 d.child(
                     div()
                         .flex()
@@ -560,8 +560,8 @@ impl KeychainView {
                             switch("key-sync", on, t)
                                 .debug_selector(|| "key-sync".into())
                                 .on_click(move |_, _, cx| {
-                                    settings::update(cx, |settings| {
-                                        let keys = &mut settings.sync.keys;
+                                    vaults::update_sync(cx, |sync| {
+                                        let keys = &mut sync.keys;
                                         match keys.iter().position(|have| *have == fingerprint) {
                                             Some(index) => {
                                                 keys.remove(index);

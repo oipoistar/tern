@@ -40,7 +40,9 @@ const SIZE: TermSize = TermSize {
 };
 
 fn main() -> Result<(), String> {
-    let path = paths::vault();
+    // The vault open in Tern.
+    let open = tern_core::vaults::Vaults::load(&paths::vaults()).current;
+    let path = paths::vault(&open);
     let opened = vault::open(&path);
     if let Some(notice) = opened.notice {
         return Err(notice);

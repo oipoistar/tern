@@ -19,6 +19,7 @@ mod terminal;
 mod theme;
 mod ui;
 mod vault;
+mod vaults;
 mod workspace;
 
 use gpui_kit::*;
@@ -29,6 +30,7 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             settings::init(cx);
+            vaults::init(cx);
             cx.set_global(sync::SecretsStore(std::sync::Arc::new(
                 tern_core::secrets::SystemSecrets,
             )));

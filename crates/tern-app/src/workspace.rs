@@ -26,7 +26,7 @@ use crate::files::FilesPanel;
 use crate::live::{LiveSlots, live_layer};
 use crate::marks::{self, Trace};
 use crate::settings::{self, Page, SettingsEvent, SettingsView};
-use crate::sync::{self, Status};
+use crate::sync::{self, Status, SyncState};
 use crate::terminal::{Phase, TerminalEvent, TerminalView};
 use crate::theme::{self, MONO, Theme};
 use crate::ui::{button, icon, ink_button, status_dot, tern_mark};
@@ -40,6 +40,10 @@ const MAX_PANES: usize = 4;
 /// Makes a terminal pane for a connection: [`TerminalView::new`], or one
 /// that doesn't connect, in tests.
 type NewTerminal = fn(Connection, &mut Context<TerminalView>) -> TerminalView;
+
+/// Opens the vault open in the list: [`VaultContent::open`], or one kept
+/// in memory, in tests.
+type NewVault = fn(LiveSlots, &mut Window, &mut Context<VaultContent>) -> VaultContent;
 
 /// What the window's own keyboard shortcuts do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,7 +237,9 @@ struct ContainersMenu {
 }
 
 pub struct Workspace {
+    /// The vault open, and what it asks for.
     vault: Entity<VaultContent>,
+    _vault_events: Subscription,
     filling: Option<Filling>,
     palette: Option<Palette>,
     containers: Option<ContainersMenu>,
@@ -244,6 +250,7 @@ pub struct Workspace {
     live: LiveSlots,
     started: Instant,
     new_terminal: NewTerminal,
+    new_vault: NewVault,
     /// The Settings dialog, while open.
     settings: Option<Entity<SettingsView>>,
     _settings_events: Option<Subscription>,
@@ -341,8 +348,8 @@ impl Workspace {
             };
             workspace.open_settings(page, window, cx);
         }
-        // `tern --show [keychain|identities|snippets|forwarding|known-hosts|history]`
-        // opens the vault at that screen.
+        // `tern --show [keychain|identities|snippets|forwarding|known-hosts|history|vaults]`
+        // opens the vault at that screen (or the list of vaults).
         let mut args = std::env::args().skip_while(|arg| arg != "--show");
         if args.next().is_some()
             && let Some(screen) = args.next()
@@ -376,35 +383,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let connect =
-            cx.subscribe_in(
-                &vault,
-                window,
-                |this, _, event: &VaultEvent, window, cx| match event {
-                    VaultEvent::Connect(connection) => {
-                        this.open_session(connection.clone(), window, cx)
-                    }
-                    VaultEvent::Open { connection, files } => {
-                        this.show_session(connection.clone(), *files, window, cx)
-                    }
-                    VaultEvent::OpenTogether(connections) => {
-                        this.open_together(connections.clone(), window, cx)
-                    }
-                    // Out of the way: a tab at the end, not shown.
-                    VaultEvent::Run(connection) => {
-                        this.push_tab(std::slice::from_ref(connection), cx);
-                        cx.notify();
-                    }
-                    VaultEvent::Forward { host, forward, on } => {
-                        for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
-                            let terminal = pane.read(cx);
-                            if terminal.is_live() && terminal.host() == Some(host.as_str()) {
-                                terminal.set_forward(forward.clone(), *on);
-                            }
-                        }
-                    }
-                },
-            );
+        let vault_events = Self::follow_vault(&vault, window, cx);
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(FRAME).await;
@@ -430,6 +409,7 @@ impl Workspace {
             cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx));
         Self {
             vault,
+            _vault_events: vault_events,
             filling: None,
             palette: None,
             containers: None,
@@ -438,14 +418,70 @@ impl Workspace {
             live,
             started: Instant::now(),
             new_terminal,
+            new_vault: VaultContent::open,
             settings: None,
             _settings_events: None,
             tabs_file: None,
             remembered: (None, Vec::new()),
             quitting: false,
             _ticker: ticker,
-            _subscriptions: vec![connect, appearance, focus_lost],
+            _subscriptions: vec![appearance, focus_lost],
         }
+    }
+
+    /// Does what `vault` asks: open sessions, start rules, open another
+    /// vault.
+    fn follow_vault(
+        vault: &Entity<VaultContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            vault,
+            window,
+            |this, _, event: &VaultEvent, window, cx| match event {
+                VaultEvent::Connect(connection) => {
+                    this.open_session(connection.clone(), window, cx)
+                }
+                VaultEvent::Open { connection, files } => {
+                    this.show_session(connection.clone(), *files, window, cx)
+                }
+                VaultEvent::OpenTogether(connections) => {
+                    this.open_together(connections.clone(), window, cx)
+                }
+                // Out of the way: a tab at the end, not shown.
+                VaultEvent::Run(connection) => {
+                    this.push_tab(std::slice::from_ref(connection), cx);
+                    cx.notify();
+                }
+                VaultEvent::Forward { host, forward, on } => {
+                    for pane in this.tabs.iter().flat_map(|tab| &tab.panes) {
+                        let terminal = pane.read(cx);
+                        if terminal.is_live() && terminal.host() == Some(host.as_str()) {
+                            terminal.set_forward(forward.clone(), *on);
+                        }
+                    }
+                }
+                VaultEvent::Switch => this.switch_vault(window, cx),
+            },
+        )
+    }
+
+    /// Shows the vault now open in place of the one that was, with its
+    /// own checks, rules and sync. Open tabs stay as they are.
+    fn switch_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        sync::set_state(cx, SyncState::default());
+        let new_vault = self.new_vault;
+        let vault = cx.new(|cx| new_vault(self.live.clone(), window, cx));
+        self._vault_events = Self::follow_vault(&vault, window, cx);
+        self.vault = vault;
+        let showing = self.active.is_none();
+        self.vault.update(cx, |vault, _| vault.set_showing(showing));
+        self.share_sessions(cx);
+        if showing {
+            self.vault.update(cx, |vault, cx| vault.focus(window, cx));
+        }
+        cx.notify();
     }
 
     /// Opens `connections` side by side, four panes to a tab, and shows
@@ -489,7 +525,7 @@ impl Workspace {
     /// are left out.
     fn reopen(&mut self, open: &OpenTabs, window: &mut Window, cx: &mut Context<Self>) {
         let first = self.tabs.len();
-        let (tabs, active) = self.vault.read(cx).reopened(open);
+        let (tabs, active) = self.vault.read(cx).reopened(open, cx);
         for connections in &tabs {
             self.push_tab(connections, cx);
         }
@@ -1008,11 +1044,12 @@ impl Workspace {
             |this, terminal, event: &TerminalEvent, cx| match event {
                 TerminalEvent::Finished(visit) => {
                     let visit = visit.clone();
+                    let host_id = terminal.read(cx).connection().host_id.clone();
                     this.vault.update(cx, |vault, cx| {
                         if let Some(host) = &visit.host {
                             vault.clear_forward_states(host, cx);
                         }
-                        vault.record_visit(visit, cx);
+                        vault.record_visit(visit, host_id.as_deref(), cx);
                     });
                     this.share_sessions(cx);
                 }
@@ -1437,8 +1474,10 @@ impl Workspace {
             let terminal = pane.read(cx);
             if terminal.is_live() && !terminal.connection().local && !terminal.replaying() {
                 let visit = terminal.visit("Closed");
-                self.vault
-                    .update(cx, |vault, cx| vault.record_visit(visit, cx));
+                let host_id = terminal.connection().host_id.clone();
+                self.vault.update(cx, |vault, cx| {
+                    vault.record_visit(visit, host_id.as_deref(), cx)
+                });
             }
         }
     }
@@ -1450,11 +1489,12 @@ impl Workspace {
         let terminal = terminal.read(cx);
         if terminal.is_live() && !terminal.connection().local {
             let visit = terminal.visit("Closed");
+            let host_id = terminal.connection().host_id.clone();
             self.vault.update(cx, |vault, cx| {
                 if let Some(host) = &visit.host {
                     vault.clear_forward_states(host, cx);
                 }
-                vault.record_visit(visit, cx);
+                vault.record_visit(visit, host_id.as_deref(), cx);
             });
         }
     }
@@ -2814,6 +2854,74 @@ mod tests {
             assert_eq!(files.following(), Some("/srv/my app"));
             assert_eq!(pane.read(cx).folder(), Some("/srv/my app"));
         });
+    }
+
+    #[gpui::test]
+    fn switches_between_vaults_keeping_tabs_open(cx: &mut TestAppContext) {
+        use gpui::{Context, Window};
+
+        use crate::vaults;
+
+        /// The first vault is the sample, any other starts empty.
+        fn in_memory(
+            live: LiveSlots,
+            window: &mut Window,
+            cx: &mut Context<VaultContent>,
+        ) -> VaultContent {
+            let vault = if vaults::current(cx) == tern_core::vaults::FIRST {
+                Vault::sample()
+            } else {
+                Vault::default()
+            };
+            VaultContent::new(vault, None, live, window, cx)
+        }
+
+        let (workspace, cx) = open_workspace(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.new_vault = in_memory;
+            workspace.activate(None, window, cx);
+        });
+        let hosts = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.vault.read(cx).host_entries().len()
+            })
+        };
+        let open =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| vaults::list(cx).current().name.clone());
+        let sample = hosts(cx);
+        assert!(sample > 0);
+
+        // A new vault opens, empty, and the session tab stays.
+        click(cx, "vaults");
+        click(cx, "vault-new");
+        cx.simulate_input("Work");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(open(cx), "Work");
+        assert_eq!(hosts(cx), 0);
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.tabs.len(), 1));
+
+        // Back to the first, renamed.
+        click(cx, "vaults");
+        click(cx, "vault-Personal");
+        assert_eq!((open(cx), hosts(cx)), ("Personal".to_string(), sample));
+        click(cx, "vaults");
+        click(cx, "vault-rename");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input("Home");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(open(cx), "Home");
+
+        // The other one deleted, after a second click.
+        click(cx, "vault-delete-Work");
+        assert_eq!(cx.update(|_, cx| vaults::list(cx).vaults.len()), 2);
+        click(cx, "vault-delete-confirm");
+        assert_eq!(cx.update(|_, cx| vaults::list(cx).vaults.len()), 1);
+        assert!(cx.debug_bounds("vault-Work").is_none());
     }
 
     #[gpui::test]
