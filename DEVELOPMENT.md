@@ -108,14 +108,20 @@ machine, a self-hosted GitHub Actions runner in `C:\actions-runner`; the
 macOS and Linux checks are paused (bring them back in
 `.github/workflows/ci.yml`). The runner works in a clean environment, the
 machine's and user's variables as a fresh sign-in has them (those named like
-secrets left out), never that of whatever started it, with its own Rust (`cargo` and `rustup` in its
-folder) and its build output in `target`, there too, which a run's checkout
-doesn't clean, so builds stay incremental. Start it, hidden, with its
-`start.ps1` (`dev/runner/start.ps1` here, copied into the runner's folder):
+secrets left out), never that of whatever started it, with its own Rust
+(`cargo` and `rustup` in its folder) and its build output in `target`, there
+too, which a run's checkout doesn't clean, so builds stay incremental. Start
+it, hidden, with its `start.ps1` (`dev/runner/start.ps1` here, copied into
+the runner's folder):
 
 ```sh
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\actions-runner\start.ps1
 ```
+
+A shortcut in that machine's Startup folder runs the same at sign-in. A
+runner stopped by force (its process ended) leaves its session on GitHub
+for a minute or two, and a run queued meanwhile can stay queued until it's
+re-run.
 
 A self-hosted runner runs whatever a workflow says, on that machine. Before
 the repository goes public, keep pull requests from forks off it (or run
