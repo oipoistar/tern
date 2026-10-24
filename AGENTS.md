@@ -61,7 +61,8 @@ text (`links.rs`), proxies (`proxy.rs`), Wake-on-LAN (`wol.rs`), port forwarding
 PuTTY's saved sessions (`putty.rs`) and OpenSSH's config (`openssh.rs`) and paths and safe writes
 (`paths.rs`). `tern-app` is GPUI: `workspace.rs` is the window
 root (header, tabs, a session tab's panes, toolbar and snippet bar, live
-layer, and the vault open, replaced when another opens), `files.rs` is a
+layer, and the vault open, replaced when another opens; a window of tabs
+moved out of the main one is a workspace with `main` set and no vault tab), `files.rs` is a
 session tab's SFTP panel, `settings.rs` holds the settings in effect and
 their dialog, `vaults.rs` the list of vaults and how the open one syncs,
 `sync.rs` sync's state and runs,
@@ -136,6 +137,10 @@ at startup, for looking at it without clicking.
   one-line reason, until it's updated.
 - **OS CPU-time counters are useless for frame costs** (Windows counts in
   15.6 ms ticks); `--bench` times frames with the high-resolution clock.
+- **Open windows with `gpui_kit::open_window`**, not GPUI's own: it wraps
+  the view in GPUI Kit's `Root`, which inputs and popovers rely on. A view
+  made in one window keeps what it subscribed to there (`subscribe_in`, a
+  find bar's field), so a pane moving windows drops those first.
 - **A release build on Windows has no console** (`windows_subsystem`), so
   a download opens no console window. Started from a terminal it attaches to
   that one (`attach_console` in `main.rs`), so `--bench` still prints; from

@@ -2496,6 +2496,14 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Drops the find bar without touching focus, as the pane moves to
+    /// another window: the bar's field belongs to the one it leaves.
+    pub fn drop_find(&mut self, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Closes the find bar, leaving the match it was on selected.
     fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find = None;

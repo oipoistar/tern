@@ -279,7 +279,7 @@ struct ContainersMenu {
 pub struct Workspace {
     /// The vault open, and what it asks for.
     vault: Entity<VaultContent>,
-    _vault_events: Subscription,
+    _vault_events: Option<Subscription>,
     filling: Option<Filling>,
     palette: Option<Palette>,
     containers: Option<ContainersMenu>,
@@ -312,8 +312,65 @@ pub struct Workspace {
     quitting: bool,
     /// What each pane's tab showed when the window last heard from it.
     badges: HashMap<EntityId, Badge>,
+    /// What this window follows of each pane, let go when the pane moves to
+    /// another window.
+    watching: HashMap<EntityId, Vec<Subscription>>,
+    /// In a window holding tabs moved out of the main one, the main
+    /// window's workspace: such a window has no vault tab, leaves the
+    /// vault's requests to the main window and closes with its last tab.
+    main: Option<WeakEntity<Workspace>>,
+    /// In the main window, the windows its tabs moved out to, whose tabs
+    /// are written down with its own.
+    others: Vec<WeakEntity<Workspace>>,
+    /// The tab being dragged, while the pointer is outside the window:
+    /// let go there, it moves to a window of its own.
+    dragged_out: Option<EntityId>,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A tab on its way to another window, by a pane of it.
+#[derive(Clone)]
+struct DraggedTab {
+    pane: EntityId,
+    title: SharedString,
+}
+
+/// What follows the pointer while a tab is dragged: the tab's title.
+struct TabPreview(SharedString);
+
+impl Render for TabPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current(cx);
+        div()
+            .h(px(34.))
+            .px(px(14.))
+            .flex()
+            .items_center()
+            .rounded(px(12.))
+            .bg(theme.card)
+            .border_1()
+            .border_color(theme.line)
+            .shadow(theme.shadow())
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.text)
+            .child(self.0.clone())
+    }
+}
+
+/// How Tern's windows open: titled, no smaller than its layouts need.
+pub fn window_options(bounds: WindowBounds, focus: bool) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(bounds),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Tern".into()),
+            ..Default::default()
+        }),
+        window_min_size: Some(size(px(720.), px(480.))),
+        focus,
+        ..Default::default()
+    }
 }
 
 impl Workspace {
@@ -321,19 +378,7 @@ impl Workspace {
         let live = LiveSlots::default();
         let vault = cx.new(|cx| VaultContent::open(live.clone(), window, cx));
         let mut workspace = Self::with(vault, live, TerminalView::new, window, cx);
-        // Sessions still open as Tern closes go into History too: as its
-        // window closes, or as it quits without that (Cmd+Q on macOS).
-        let this = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = this.update(cx, |workspace, cx| workspace.record_open_sessions(cx));
-            true
-        });
-        workspace
-            ._subscriptions
-            .push(cx.on_app_quit(|workspace, cx| {
-                workspace.record_open_sessions(cx);
-                async {}
-            }));
+        workspace.record_when_closed(window, cx);
         // A plain start opens the tabs open when Tern last quit, and from
         // then on keeps track of them. Flags are for checks and leave both
         // alone.
@@ -460,7 +505,7 @@ impl Workspace {
             cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx));
         Self {
             vault,
-            _vault_events: vault_events,
+            _vault_events: Some(vault_events),
             filling: None,
             palette: None,
             containers: None,
@@ -479,9 +524,163 @@ impl Workspace {
             remembered: (None, Vec::new()),
             quitting: false,
             badges: HashMap::new(),
+            watching: HashMap::new(),
+            main: None,
+            others: Vec::new(),
+            dragged_out: None,
             _ticker: ticker,
             _subscriptions: vec![appearance, focus_lost],
         }
+    }
+
+    /// A window for `tab`, moved out of `main`'s window: no vault tab of
+    /// its own, the vault's requests left to the main window.
+    fn holding(
+        tab: Tab,
+        main: WeakEntity<Workspace>,
+        vault: Entity<VaultContent>,
+        new_terminal: NewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut workspace = Self::with(vault, LiveSlots::default(), new_terminal, window, cx);
+        workspace._vault_events = None;
+        workspace.main = Some(main);
+        workspace.record_when_closed(window, cx);
+        workspace.adopt_tab(tab, window, cx);
+        // Its tabs are written down with the main window's.
+        cx.observe_self(|this, cx| {
+            if let Some(main) = this.main.as_ref().and_then(WeakEntity::upgrade) {
+                main.update(cx, |main, cx| main.remember_tabs(cx));
+            }
+        })
+        .detach();
+        workspace
+    }
+
+    /// Sessions still open as a window closes go into History too: as it
+    /// closes, or as Tern quits without that (Cmd+Q on macOS). The main
+    /// window takes the others with it.
+    fn record_when_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = this.update(cx, |workspace, cx| {
+                if workspace.main.is_some() {
+                    // Closing a window of moved tabs closes its tabs.
+                    let panes: Vec<_> = workspace
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| tab.panes.clone())
+                        .collect();
+                    for pane in panes {
+                        workspace.record_closed(&pane, cx);
+                    }
+                } else {
+                    workspace.record_open_sessions(cx);
+                    if workspace
+                        .others
+                        .iter()
+                        .any(|other| other.upgrade().is_some())
+                    {
+                        cx.defer(|cx| cx.quit());
+                    }
+                }
+            });
+            true
+        });
+        self._subscriptions.push(cx.on_app_quit(|workspace, cx| {
+            workspace.record_open_sessions(cx);
+            async {}
+        }));
+    }
+
+    /// Takes in `tab`, moved here from another window, and shows it.
+    fn adopt_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        for pane in &tab.panes {
+            self.watch(pane, cx);
+        }
+        let files_open = tab.files_open;
+        // Its Files panel is made again, for this window.
+        self.tabs.push(Tab {
+            files: None,
+            files_open: false,
+            ..tab
+        });
+        let index = self.tabs.len() - 1;
+        self.activate(Some(index), window, cx);
+        if files_open {
+            self.show_files(index, cx);
+        }
+        self.share_sessions(cx);
+    }
+
+    /// Moves tab `index` to a window of its own, at `at` on the screen or
+    /// else just beside this one. Its sessions carry on there.
+    fn detach_tab(
+        &mut self,
+        index: usize,
+        at: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = window.bounds();
+        let tab = self.tabs.remove(index);
+        for pane in &tab.panes {
+            self.unwatch(pane);
+            // A find bar's field belongs to this window.
+            pane.update(cx, |pane, cx| pane.drop_find(cx));
+        }
+        if self
+            .filling
+            .as_ref()
+            .is_some_and(|filling| tab.panes.contains(&filling.pane))
+        {
+            self.filling = None;
+        }
+        if self
+            .containers
+            .as_ref()
+            .is_some_and(|menu| tab.panes.contains(&menu.pane))
+        {
+            self.containers = None;
+        }
+        let main = self.main.clone().unwrap_or_else(|| cx.entity().downgrade());
+        let (vault, new_terminal) = (self.vault.clone(), self.new_terminal);
+        let origin = at.unwrap_or(bounds.origin + point(px(48.), px(48.)));
+        let options = window_options(
+            WindowBounds::Windowed(Bounds::new(origin, bounds.size)),
+            true,
+        );
+        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| Workspace::holding(tab, main, vault, new_terminal, window, cx))
+        });
+        if let Ok((_, new)) = opened {
+            match self.main.as_ref().and_then(WeakEntity::upgrade) {
+                Some(main) => main.update(cx, |main, cx| main.adopt_window(&new, cx)),
+                None => self.adopt_window(&new, cx),
+            }
+        }
+        self.after_removing(index, window, cx);
+        self.share_sessions(cx);
+    }
+
+    /// Keeps track of a window this one's tabs moved out to: its tabs are
+    /// written down with these, and once it closes its sessions no longer
+    /// count as open.
+    fn adopt_window(&mut self, other: &Entity<Workspace>, cx: &mut Context<Self>) {
+        self.others.push(other.downgrade());
+        let id = other.entity_id();
+        cx.observe_release(other, move |this, _, cx| {
+            this.others.retain(|other| other.entity_id() != id);
+            this.vault.update(cx, |vault, cx| {
+                vault.set_open_sessions(id, HashMap::new(), cx)
+            });
+            cx.notify();
+        })
+        .detach();
+        // Written down once nothing is mid-change: the window a tab left
+        // may be another moved-out one, still being updated.
+        cx.notify();
     }
 
     /// Does what `vault` asks: open sessions, start rules, open another
@@ -528,7 +727,14 @@ impl Workspace {
         sync::set_state(cx, SyncState::default());
         let new_vault = self.new_vault;
         let vault = cx.new(|cx| new_vault(self.live.clone(), window, cx));
-        self._vault_events = Self::follow_vault(&vault, window, cx);
+        self._vault_events = Some(Self::follow_vault(&vault, window, cx));
+        // The other windows' sessions end in the vault open now.
+        for other in self.others.iter().filter_map(WeakEntity::upgrade) {
+            other.update(cx, |other, cx| {
+                other.vault = vault.clone();
+                other.share_sessions(cx);
+            });
+        }
         self.vault = vault;
         let showing = self.active.is_none();
         self.vault.update(cx, |vault, _| vault.set_showing(showing));
@@ -600,13 +806,21 @@ impl Workspace {
         let Some(file) = &self.tabs_file else {
             return;
         };
+        // The tabs moved out to other windows come back in this one.
+        let others: Vec<Entity<Workspace>> =
+            self.others.iter().filter_map(WeakEntity::upgrade).collect();
+        let tabs: Vec<&[Entity<TerminalView>]> = self
+            .tabs
+            .iter()
+            .chain(others.iter().flat_map(|other| &other.read(cx).tabs))
+            .map(|tab| tab.panes.as_slice())
+            .collect();
         let (active, panes) = &self.remembered;
         let same = *active == self.active
-            && panes.len() == self.tabs.len()
-            && self.tabs.iter().zip(panes).all(|(tab, ids)| {
-                tab.panes.len() == ids.len()
+            && panes.len() == tabs.len()
+            && tabs.iter().zip(panes).all(|(tab, ids)| {
+                tab.len() == ids.len()
                     && tab
-                        .panes
                         .iter()
                         .zip(ids)
                         .all(|(pane, id)| pane.entity_id() == *id)
@@ -615,12 +829,10 @@ impl Workspace {
             return;
         }
         let open = OpenTabs {
-            tabs: self
-                .tabs
+            tabs: tabs
                 .iter()
                 .map(|tab| {
-                    tab.panes
-                        .iter()
+                    tab.iter()
                         .map(|pane| Opened::of(pane.read(cx).connection()))
                         .collect()
                 })
@@ -629,13 +841,11 @@ impl Workspace {
         };
         // Not written down, the tabs only don't come back.
         let _ = open.save(file);
-        self.remembered = (
-            self.active,
-            self.tabs
-                .iter()
-                .map(|tab| tab.panes.iter().map(|pane| pane.entity_id()).collect())
-                .collect(),
-        );
+        let ids = tabs
+            .iter()
+            .map(|tab| tab.iter().map(|pane| pane.entity_id()).collect())
+            .collect();
+        self.remembered = (self.active, ids);
     }
 
     /// Gives the keyboard somewhere to go when what had it is gone (a closed
@@ -652,7 +862,7 @@ impl Workspace {
             self.tabs[index]
                 .focused()
                 .update(cx, |pane, cx| pane.focus(window, cx));
-        } else {
+        } else if self.main.is_none() {
             self.vault.update(cx, |vault, cx| vault.focus(window, cx));
         }
     }
@@ -784,6 +994,16 @@ impl Workspace {
                 },
                 Command::Theater,
             ));
+        }
+        // A window of moved tabs leaves hosts and the vault's screens to
+        // the main window.
+        if self.main.is_some() {
+            entries.retain(|entry| {
+                !matches!(
+                    entry.command,
+                    Command::Connect(_) | Command::Tab(None) | Command::Screen(_)
+                )
+            });
         }
         entries
     }
@@ -1007,12 +1227,14 @@ impl Workspace {
         let Some(shortcut) = shortcut(&event.keystroke) else {
             return;
         };
-        // The vault, then each tab, round again.
-        let count = self.tabs.len() + 1;
-        let at = self.active.map_or(0, |index| index + 1);
+        // The vault, then each tab, round again; a window of moved tabs has
+        // no vault.
+        let vault = usize::from(self.main.is_none());
+        let count = self.tabs.len() + vault;
+        let at = self.active.map_or(0, |index| index + vault);
         let step = |by: usize| match (at + by) % count {
-            0 => None,
-            next => Some(next - 1),
+            next if next < vault => None,
+            next => Some(next - vault),
         };
         match shortcut {
             Shortcut::Palette => self.open_palette(window, cx),
@@ -1091,8 +1313,9 @@ impl Workspace {
                 Some((host.to_string(), terminal.preview()))
             })
             .collect();
+        let from = cx.entity_id();
         self.vault
-            .update(cx, |vault, cx| vault.set_open_sessions(sessions, cx));
+            .update(cx, |vault, cx| vault.set_open_sessions(from, sessions, cx));
     }
 
     /// Adds a tab for `terminal` and shows it.
@@ -1122,20 +1345,19 @@ impl Workspace {
         // tab shows changes, not for every bit of output.
         self.badges
             .insert(terminal.entity_id(), Badge::of(terminal.read(cx)));
-        self._subscriptions
-            .push(cx.observe(terminal, |this, terminal, cx| {
-                let badge = Badge::of(terminal.read(cx));
-                let changed =
-                    this.badges.insert(terminal.entity_id(), badge.clone()) != Some(badge);
-                let shown = this
-                    .active
-                    .and_then(|index| this.tabs.get(index))
-                    .is_some_and(|tab| tab.panes.contains(&terminal));
-                if changed || shown {
-                    cx.notify();
-                }
-            }));
-        self._subscriptions.push(cx.subscribe(
+        let watching = self.watching.entry(terminal.entity_id()).or_default();
+        watching.push(cx.observe(terminal, |this, terminal, cx| {
+            let badge = Badge::of(terminal.read(cx));
+            let changed = this.badges.insert(terminal.entity_id(), badge.clone()) != Some(badge);
+            let shown = this
+                .active
+                .and_then(|index| this.tabs.get(index))
+                .is_some_and(|tab| tab.panes.contains(&terminal));
+            if changed || shown {
+                cx.notify();
+            }
+        }));
+        watching.push(cx.subscribe(
             terminal,
             |this, terminal, event: &TerminalEvent, cx| match event {
                 TerminalEvent::Finished(visit) => {
@@ -1181,6 +1403,13 @@ impl Workspace {
         ));
     }
 
+    /// Lets go of a pane closed or moved to another window: its events
+    /// are no longer this window's.
+    fn unwatch(&mut self, terminal: &Entity<TerminalView>) {
+        self.watching.remove(&terminal.entity_id());
+        self.badges.remove(&terminal.entity_id());
+    }
+
     /// Gives the other panes of `from`'s tab what it was given, while that
     /// tab broadcasts.
     fn broadcast(
@@ -1217,6 +1446,16 @@ impl Workspace {
         self.active = tab;
         // Marks from the previous screen must not linger over the new one.
         self.live.clear();
+        // Only the main window shows the vault.
+        if self.main.is_some() {
+            cx.notify();
+            if let Some(index) = tab {
+                self.tabs[index]
+                    .focused()
+                    .update(cx, |terminal, cx| terminal.focus(window, cx));
+            }
+            return;
+        }
         self.vault
             .update(cx, |vault, _| vault.set_showing(tab.is_none()));
         match tab {
@@ -1607,7 +1846,7 @@ impl Workspace {
         }
         let closing = self.tabs[index].panes[pane].clone();
         self.record_closed(&closing, cx);
-        self.badges.remove(&closing.entity_id());
+        self.unwatch(&closing);
         // Dropping the view drops the session's input, which disconnects.
         let tab = &mut self.tabs[index];
         tab.panes.remove(pane);
@@ -1634,7 +1873,7 @@ impl Workspace {
         // Live sessions closed by hand still go into History.
         for pane in self.tabs[index].panes.clone() {
             self.record_closed(&pane, cx);
-            self.badges.remove(&pane.entity_id());
+            self.unwatch(&pane);
         }
         if self
             .filling
@@ -1644,8 +1883,19 @@ impl Workspace {
             self.filling = None;
         }
         self.tabs.remove(index);
+        self.after_removing(index, window, cx);
+    }
+
+    /// What follows once tab `index` is gone, closed or moved out: another
+    /// tab shows, or the vault; a window of moved tabs with none left
+    /// closes.
+    fn after_removing(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         // With no session left, the next one opens with the chrome back.
         self.theater &= !self.tabs.is_empty();
+        if self.main.is_some() && self.tabs.is_empty() {
+            window.remove_window();
+            return;
+        }
         let next = match self.active {
             Some(active) if active == index => {
                 (!self.tabs.is_empty()).then(|| index.min(self.tabs.len() - 1))
@@ -2491,20 +2741,25 @@ impl Workspace {
             .p(px(4.))
             .rounded(px(16.))
             .bg(theme.card2)
-            .child(
-                tab("tab-vault".into(), self.active.is_none())
-                    .child(icon(
-                        IconName::Server,
-                        16.,
-                        if self.active.is_none() {
-                            theme.text
-                        } else {
-                            theme.text2
-                        },
-                    ))
-                    .child("Vault")
-                    .on_click(cx.listener(|this, _, window, cx| this.activate(None, window, cx))),
-            )
+            // A window of moved tabs has no vault.
+            .when(self.main.is_none(), |d| {
+                d.child(
+                    tab("tab-vault".into(), self.active.is_none())
+                        .child(icon(
+                            IconName::Server,
+                            16.,
+                            if self.active.is_none() {
+                                theme.text
+                            } else {
+                                theme.text2
+                            },
+                        ))
+                        .child("Vault")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.activate(None, window, cx)),
+                        ),
+                )
+            })
             .children(self.tabs.iter().enumerate().map(|(index, session)| {
                 let focused = session.focused();
                 let badge = self
@@ -2518,6 +2773,14 @@ impl Workspace {
                     self.active == Some(index),
                 )
                 .debug_selector(move || format!("tab-{index}"))
+                // Dragged out of the window, it goes to a window of its own.
+                .on_drag(
+                    DraggedTab {
+                        pane,
+                        title: badge.title.clone(),
+                    },
+                    |dragged, _, _, cx| cx.new(|_| TabPreview(dragged.title.clone())),
+                )
                 .pr(px(4.))
                 .child(phase_glyph(badge.phase, theme))
                 .child(div().max_w(px(180.)).truncate().child(badge.title))
@@ -2662,6 +2925,17 @@ impl Workspace {
                             this.tab_menu = None;
                             cx.notify();
                         }))
+                        .child(
+                            item("tab-menu-window", "Move to a new window", true).on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.tab_menu = None;
+                                    if let Some(index) = this.tab_holding(pane) {
+                                        this.detach_tab(index, None, window, cx);
+                                    }
+                                }),
+                            ),
+                        )
+                        .child(div().my(px(4.)).h(px(1.)).bg(theme.line))
                         .child(
                             item("tab-menu-close", "Close tab", true).on_click(cx.listener(
                                 move |this, _, window, cx| {
@@ -2812,6 +3086,7 @@ impl Render for Workspace {
         let cached = StyleRefinement::default().size_full();
         let theater = self.theater && self.active.is_some();
         let body = match self.active {
+            None if self.main.is_some() => div().into_any_element(),
             None if bench::uncached() => self.vault.clone().into_any_element(),
             None => self.vault.clone().cached(cached).into_any_element(),
             // The terminals alone, nearly to the window's edges.
@@ -2857,6 +3132,27 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .on_key_down(cx.listener(Self::key_down))
+            // A tab dragged out of the window and let go there moves to a
+            // window of its own, under the pointer.
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedTab>, window, cx| {
+                    let inside = Bounds::new(Point::default(), window.viewport_size())
+                        .contains(&event.event.position);
+                    this.dragged_out = (!inside).then(|| event.drag(cx).pane);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    let Some(pane) = this.dragged_out.take() else {
+                        return;
+                    };
+                    if let Some(index) = this.tab_holding(pane) {
+                        let at = window.bounds().origin + event.position - point(px(160.), px(28.));
+                        this.detach_tab(index, Some(at), window, cx);
+                    }
+                }),
+            )
             // A recording dropped on the window plays.
             .on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
                 for path in dropped.paths() {
@@ -2907,7 +3203,7 @@ impl Render for Workspace {
 mod tests {
     // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use gpui_kit::{AppContext as _, Context, Entity};
+    use gpui_kit::{App, AppContext as _, Context, Entity, WeakEntity};
     use tern_core::Vault;
     use tern_core::ssh::Connection;
 
@@ -2995,6 +3291,174 @@ mod tests {
         assert_eq!(active(cx), None);
         cx.simulate_keystrokes("ctrl-shift-tab");
         assert_eq!(active(cx), Some(2));
+    }
+
+    #[gpui::test]
+    fn tabs_move_out_to_windows_of_their_own(cx: &mut TestAppContext) {
+        use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+        use tern_core::restore::OpenTabs;
+
+        let dir = std::env::temp_dir().join(format!("tern-tab-windows-{}", std::process::id()));
+        let file = dir.join("tabs.json");
+        let (workspace, cx) = open_workspace(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.remember_tabs_in(file.clone(), cx)
+        });
+        click(cx, "new-local");
+        let pane = |cx: &mut VisualTestContext, index: usize| {
+            workspace.read_with(cx, |w, _| w.tabs[index].focused().entity_id())
+        };
+        let (first, second) = (pane(cx, 0), pane(cx, 1));
+        let windows = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.windows().len());
+        let others = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, _| {
+                w.others
+                    .iter()
+                    .filter_map(WeakEntity::upgrade)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let none = Modifiers::none();
+
+        // From the tab's menu: the tab goes, its session with it.
+        let at = cx.debug_bounds("tab-1").unwrap().center();
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: none,
+            click_count: 1,
+            first_mouse: false,
+        });
+        click(cx, "tab-menu-window");
+        assert_eq!(windows(cx), 2);
+        assert_eq!(workspace.read_with(cx, |w, _| w.tabs.len()), 1);
+        let moved = others(cx);
+        moved[0].read_with(cx, |other, _| {
+            assert!(other.main.is_some(), "a window of moved tabs has no vault");
+            assert_eq!(other.tabs[0].focused().entity_id(), second);
+            assert_eq!(other.active, Some(0));
+        });
+        // Both still come back at the next start.
+        assert_eq!(OpenTabs::load(&file).tabs.len(), 2);
+        drop(moved);
+
+        // Dragged past the window's edge and let go, likewise.
+        let start = cx.debug_bounds("tab-0").unwrap().center();
+        let outside = gpui::point(gpui::px(-80.), gpui::px(12.));
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: start,
+            modifiers: none,
+            click_count: 1,
+            first_mouse: false,
+        });
+        for position in [start + gpui::point(gpui::px(24.), gpui::px(0.)), outside] {
+            cx.simulate_event(MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: none,
+            });
+        }
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: outside,
+            modifiers: none,
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        assert_eq!(windows(cx), 3);
+        assert_eq!(
+            workspace.read_with(cx, |w, _| (w.tabs.len(), w.active)),
+            (0, None)
+        );
+        let moved = others(cx);
+        assert_eq!(
+            moved[1].read_with(cx, |other, _| other.tabs[0].focused().entity_id()),
+            first
+        );
+        assert_eq!(OpenTabs::load(&file).tabs.len(), 2);
+
+        // Its last tab closed, a window of moved tabs closes too.
+        let main = cx.update(|window, _| window.window_handle());
+        let window = cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .find(|window| {
+                    *window != main && window.update(cx, |_, window, _| window.bounds()).is_ok()
+                })
+                .unwrap()
+        });
+        let holding = |other: &Entity<Workspace>, cx: &App| {
+            other
+                .read(cx)
+                .tabs
+                .iter()
+                .any(|tab| tab.panes.iter().any(|pane| pane.entity_id() == second))
+        };
+        cx.update(|_, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    for other in &moved {
+                        if holding(other, cx) {
+                            other.update(cx, |other, cx| other.close_tab(0, window, cx));
+                        }
+                    }
+                })
+                .unwrap()
+        });
+        // Only the windows hold their workspaces.
+        drop(moved);
+        cx.run_until_parked();
+        assert_eq!(windows(cx), 2);
+        assert_eq!(others(cx).len(), 1);
+        assert_eq!(OpenTabs::load(&file).tabs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn a_moved_tab_moves_on_again(cx: &mut TestAppContext) {
+        use tern_core::restore::OpenTabs;
+
+        let dir = std::env::temp_dir().join(format!("tern-tab-on-{}", std::process::id()));
+        let file = dir.join("tabs.json");
+        let (workspace, cx) = open_workspace(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.remember_tabs_in(file.clone(), cx)
+        });
+        click(cx, "new-local");
+        let moving = workspace.read_with(cx, |w, _| w.tabs[1].focused().entity_id());
+        cx.update(|window, cx| workspace.update(cx, |w, cx| w.detach_tab(1, None, window, cx)));
+        cx.run_until_parked();
+        let main = cx.update(|window, _| window.window_handle());
+        let first = workspace.read_with(cx, |w, _| w.others[0].upgrade().unwrap());
+        let window = cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .find(|window| *window != main)
+                .unwrap()
+        });
+
+        // Its window has no other tab, so it closes as a new one opens.
+        cx.update(|_, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    first.update(cx, |first, cx| first.detach_tab(0, None, window, cx))
+                })
+                .unwrap()
+        });
+        drop(first);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+        let others: Vec<_> = workspace.read_with(cx, |w, _| {
+            w.others.iter().filter_map(WeakEntity::upgrade).collect()
+        });
+        assert_eq!(others.len(), 1);
+        assert_eq!(
+            others[0].read_with(cx, |other, _| other.tabs[0].focused().entity_id()),
+            moving
+        );
+        assert_eq!(OpenTabs::load(&file).tabs.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]

@@ -195,6 +195,8 @@ pub struct VaultContent {
     background: HashMap<String, Background>,
     /// The open sessions' previews, by saved host.
     open_sessions: HashMap<String, Preview>,
+    /// The same for each window, which the window keeps up to date.
+    sessions_by_window: HashMap<EntityId, HashMap<String, Preview>>,
     vault: Vault,
     /// Where changes are saved; `None` keeps them in memory (tests, or a
     /// file this Tern mustn't overwrite).
@@ -660,6 +662,7 @@ impl VaultContent {
             forward_states: States::default(),
             background: HashMap::new(),
             open_sessions: HashMap::new(),
+            sessions_by_window: HashMap::new(),
             vault,
             file,
             notice: None,
@@ -1849,13 +1852,25 @@ impl VaultContent {
         self.refresh_forwards(cx);
     }
 
-    /// Which saved hosts have a session open, with its preview.
+    /// Which saved hosts have a session open in the window `from`, with its
+    /// preview; the vault shows those of every window.
     pub fn set_open_sessions(
         &mut self,
+        from: EntityId,
         sessions: HashMap<String, Preview>,
         cx: &mut Context<Self>,
     ) {
-        self.open_sessions = sessions;
+        if sessions.is_empty() {
+            self.sessions_by_window.remove(&from);
+        } else {
+            self.sessions_by_window.insert(from, sessions);
+        }
+        self.open_sessions = self
+            .sessions_by_window
+            .values()
+            .flatten()
+            .map(|(host, preview)| (host.clone(), preview.clone()))
+            .collect();
         cx.notify();
     }
 
@@ -4180,7 +4195,12 @@ mod tests {
         vault.update(cx, |vault, cx| {
             vault.vault.save_forward("bastion", None, rule).unwrap();
             let preview = Rc::new(RefCell::new(vec!["admin@bastion:~$ uptime".to_string()]));
-            vault.set_open_sessions(HashMap::from([("bastion".to_string(), preview)]), cx);
+            let window = cx.entity_id();
+            vault.set_open_sessions(
+                window,
+                HashMap::from([("bastion".to_string(), preview)]),
+                cx,
+            );
         });
 
         // A host without a session shows no preview; bastion has one.

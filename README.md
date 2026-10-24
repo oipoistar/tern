@@ -162,6 +162,7 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 - The host's load, memory and disk, drawn live in the toolbar
 - Tabs mark unseen output, bells and long commands that finished while you were elsewhere
 - Full screen, and a theater mode that shows nothing but the terminal
+- Drag a tab out of the window and it carries on in a window of its own
 
 **Staying safe**
 - Pasting several lines into a shell that would run them asks first, and a paste can't smuggle in control characters

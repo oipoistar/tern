@@ -331,6 +331,12 @@ claude.ai account). Each item below names the artboard it comes from.
       macOS, or the toolbar) and theater mode (Shift+F11, the toolbar or
       the palette): a session tab shows its terminals alone, and the way
       back appears at the window's top edge
+- [x] Tabs in windows of their own: a tab dragged out of the window and let
+      go there, or moved with its menu, carries on in a new window, which
+      has no vault, leaves hosts and the vault's screens to the main
+      window and closes with its last tab. History, the vault's open
+      sessions and the tabs reopened at the next start (in the main window)
+      count every window's; closing the main window quits
 - [x] Windows releases: a version tag builds `Tern-windows-x64.exe`
       (windowed, with Tern's icon and version) and publishes it as a GitHub
       Release; the README's download link always fetches the latest

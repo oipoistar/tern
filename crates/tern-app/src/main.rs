@@ -43,20 +43,14 @@ fn main() {
             )));
 
             let benching = bench::enabled() || bench::launch();
-            let options = WindowOptions {
-                window_bounds: Some(if benching {
+            let options = workspace::window_options(
+                if benching {
                     bench::window_bounds()
                 } else {
                     WindowBounds::centered(size(px(1280.), px(820.)), cx)
-                }),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Tern".into()),
-                    ..Default::default()
-                }),
-                window_min_size: Some(size(px(720.), px(480.))),
-                focus: !benching,
-                ..Default::default()
-            };
+                },
+                !benching,
+            );
             gpui_kit::open_window(options, cx, |window, cx| {
                 settings::apply_appearance(window, cx);
                 cx.new(|cx| workspace::Workspace::new(window, cx))
