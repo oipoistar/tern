@@ -1,7 +1,9 @@
 # Working on Tern
 
 Guidance for anyone changing this repo, people and coding agents alike. The
-README covers what Tern is and how to run it. What to build next is in
+README is for people using Tern (its screenshots are in `docs/images`);
+[DEVELOPMENT.md](DEVELOPMENT.md) is how to build and run it from source, the
+dev server and the SSH lab. What to build next is in
 [ROADMAP.md](ROADMAP.md), in order; tick an item in the commit that ships it.
 
 ## Checks before every commit
@@ -13,8 +15,8 @@ cargo test --workspace                   # includes an end-to-end SSH test
 ```
 
 Visual changes: run the app and look (`TERN_THEME=light|dark` to check both).
-Performance-sensitive changes: compare `--bench 10` with and without them
-(see README).
+Performance-sensitive changes: compare `--bench 10` (and `--bench-start`
+for launch) with and without them (see DEVELOPMENT.md).
 
 ## UI rules
 

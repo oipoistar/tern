@@ -1,110 +1,218 @@
-# Tern
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo-light.svg" alt="Tern" width="240">
+  </picture>
+</p>
 
-A free, open-source SSH client for macOS, Windows and Linux: a modern
-alternative to PuTTY and Termius. Desktop only, no accounts, no Tern servers;
-settings will sync through storage you already own (Google Drive, Dropbox,
-OneDrive, iCloud, WebDAV or any folder).
+<h3 align="center">The SSH client that gets out of your way.</h3>
 
-Early development. Native Rust with [GPUI](https://gpui.rs) and
-[GPUI Kit](https://gpui-kit.com); SSH via [russh](https://github.com/Eugeny/russh);
-terminal emulation via [alacritty_terminal](https://crates.io/crates/alacritty_terminal).
-What's built and what comes next: [ROADMAP.md](ROADMAP.md).
+<p align="center">
+  Every server you look after, in one calm, fast window.<br>
+  Free and open source for Windows, macOS and Linux. No account, no Tern cloud:<br>
+  your hosts, your keys, your storage.
+</p>
 
-## Layout
+<p align="center">
+  <a href="#get-tern"><b>Get Tern</b></a> &nbsp;·&nbsp;
+  <a href="#a-quick-tour">Tour</a> &nbsp;·&nbsp;
+  <a href="#and-all-the-little-things">Features</a> &nbsp;·&nbsp;
+  <a href="#your-data-stays-yours">Your data</a> &nbsp;·&nbsp;
+  <a href="ROADMAP.md">Roadmap</a>
+</p>
 
-| Crate | What it is |
-| --- | --- |
-| `crates/tern-core` | UI-free core: hosts and the vault, SSH sessions (direct or through jump hosts), host-key checks |
-| `crates/tern-app` | The desktop app (`tern`) |
-| `crates/tern-devserver` | Local SSH server with a real shell, for development |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.png">
+    <img src="docs/images/hero-light.png" alt="Tern's vault of hosts, each with a live latency trace and its host key's art, with a terminal session laid over it" width="900">
+  </picture>
+</p>
 
-## Run
+<table>
+<tr>
+<td width="33%" valign="top">
+
+**Native and quick**
+
+Written in Rust and drawn on the GPU. Opens in about a quarter of a second and stays smooth through floods of output.
+
+</td>
+<td width="33%" valign="top">
+
+**Yours alone**
+
+No sign-up and no Tern servers. Passwords stay in your system's keychain, and sync is encrypted on your device before it reaches a folder you already own.
+
+</td>
+<td width="33%" valign="top">
+
+**Made for real fleets**
+
+Jump hosts, proxies, certificates, port forwarding, SFTP, containers, kept shells: what the job actually asks for.
+
+</td>
+</tr>
+</table>
+
+## A quick tour
+
+### Every server at a glance
+
+Your hosts live in a vault of cards. Each one draws its own heartbeat, a trace of how fast it answered over the last minutes, so a slow or silent server stands out before you connect. Its host key appears as a picture you'll learn to recognise, and every card is one click, or Enter, from a session. Type `ssh deploy@10.0.4.21` into the search to reach anything, saved or not.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/vault-dark.png">
+  <img src="docs/images/vault-light.png" alt="The vault: hosts in groups, with tags, latency traces and key art, and the selected host's panel" width="900">
+</picture>
+
+### A terminal that keeps up
+
+Tabs, colour schemes, find, links and the mouse in vim, htop and tmux, with output that flows without a stutter. Add two lines to your shell and Tern marks every command, a ring when it worked and a dot when it failed, jumps between them and copies a single command's output. Images show right in the terminal. On a slow link, what you type appears at once, before the server echoes it, and never when it's a password.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/terminal-dark.png">
+  <img src="docs/images/terminal-light.png" alt="A session with git log, docker ps, an inline chart, command marks in the margin and the host's load, memory and disk in the toolbar" width="900">
+</picture>
+
+### Four panes, one keystroke
+
+Split a tab into up to four sessions, side by side or in a grid. Broadcast sends what you type to all of them, while a host you've marked as guarded stays out unless you let it in.
+
+<img src="docs/images/split-dark.png" alt="Four sessions in a grid with Broadcast on, each running the same upgrade" width="900">
+
+### Files right beside your shell
+
+Browse, upload, download, rename and change permissions in a panel next to the terminal. It follows your shell as you `cd`, and a click takes the shell to the folder you're looking at. Open a remote file in your own editor: every save goes straight back to the server.
+
+<img src="docs/images/files-light.png" alt="The Files panel showing the shell's current folder on the server, beside the session" width="900">
+
+### Everything a few letters away
+
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> and type: hosts, open tabs, snippets and screens all come up as you go.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/palette-dark.png">
+  <img src="docs/images/palette-light.png" alt="The command palette finding web hosts" width="900">
+</picture>
+
+### Set a host up once
+
+Keys, the SSH agent or a password kept in your system's credential store. Jump hosts, proxies, environment variables, a command to run after login, Wake-on-LAN and notes. Mark a host as guarded, and pastes and snippets wait for your yes before they reach it.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/editor-dark.png">
+  <img src="docs/images/editor-light.png" alt="The host editor for a guarded database server" width="900">
+</picture>
+
+### Trust you can see
+
+Every host key Tern trusts shows as its fingerprint art, from your own `~/.ssh/known_hosts` (read, never written) and from Tern's. A key that changes stops the connection and names the exact line to check.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/known-dark.png">
+  <img src="docs/images/known-light.png" alt="Known hosts, each key with its art and fingerprint" width="900">
+</picture>
+
+### Make it yours
+
+Light and dark, ten colour schemes, your font, size and cursor.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.png">
+  <img src="docs/images/settings-light.png" alt="Terminal settings with the colour schemes" width="900">
+</picture>
+
+### Sync without an account
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/vaults-dark.png">
+  <img align="right" src="docs/images/vaults-light.png" alt="The vault switcher with Personal, Acme Corp and Homelab" width="300">
+</picture>
+
+Point Tern at a folder that Google Drive, Dropbox, OneDrive, iCloud Drive or Nextcloud already keeps in step. Each computer writes its own file there, encrypted with your passphrase before it leaves the device, so sync clients never fight over a file and the cloud never sees your hosts.
+
+Keep work and home apart with more than one vault. Each has its own hosts, snippets and history, and syncs to its own folder with its own passphrase.
+
+<br clear="right">
+
+## And all the little things
+
+**Connecting**
+- Quick connect from a typed `ssh` command (`-p`, `-l` and `-i` understood)
+- Keys, the SSH agent (OpenSSH's or Pageant), passwords and one-time codes; OpenSSH certificates
+- Jump hosts chained as deep as you need; SOCKS5 and HTTP proxies
+- Reconnects by itself after a dropped connection, and kept shells (tmux or screen) carry on where you left them
+- Port forwarding (`-L`, `-R`, `-D`), with or without a terminal open; ports a server starts listening on are offered, forwarded in a click
+- A shell inside any of the host's Docker or Podman containers
+- Run when it's back: queue a command for a host that's down, and it runs the moment the host answers
+- Wake-on-LAN for machines that sleep
+- Local terminal tabs for this computer's own shell
+
+**Organising**
+- Groups, tags and filters; cards or a compact list
+- Groups that fill themselves from a command, such as your cloud's inventory
+- Snippets with `{{variables}}`, run in one session or on several hosts at once
+- History of every connection, and the tabs you had open come back at the next start
+- Import from PuTTY (its `.ppk` keys sign in through Pageant) and from `~/.ssh/config`; copy any host as an `ssh` command or a config block
+- Identities: one user and sign-in shared by many hosts
+
+**In the terminal**
+- Find in the scrollback, clickable links, font zoom
+- Record a session and play it back (asciicast)
+- The host's load, memory and disk, drawn live in the toolbar
+- Tabs mark unseen output, bells and long commands that finished while you were elsewhere
+
+**Staying safe**
+- Pasting several lines into a shell that would run them asks first, and a paste can't smuggle in control characters
+- Guarded hosts for the machines you can't afford to fumble
+- Files from a server that your computer would run, such as scripts, open as text when you edit them
+- Links a server prints can't open programs or file shares on your computer
+
+## Get Tern
+
+Tern is young and moving fast; installers for each system are [on the roadmap](ROADMAP.md). Until then, build it with [Rust](https://rustup.rs):
 
 ```sh
-cargo run -p tern-app                      # the app
-cargo run -p tern-app -- --connect "ssh -p 2222 user@host"   # open a session at start
-cargo run -p tern-app -- --connect prod-db-01                 # or one to a saved host
-cargo run -p tern-app -- --local                              # open a local terminal at start
-cargo run -p tern-app -- --play session.cast                  # play a recording (asciicast v2)
-cargo run -p tern-app -- --edit prod-db-01                    # open the host editor (a new host without a name)
-cargo run -p tern-app -- --settings sync                      # open Settings at a page
-cargo run -p tern-app -- --show snippets                      # open the vault at a screen
-cargo run -p tern-app -- --palette prod                       # open the command palette
+git clone https://github.com/oipoistar/tern.git
+cd tern
+cargo run -p tern-app --release
 ```
 
-The quick-connect field in the vault accepts the same `ssh …` commands
-(`-p`, `-l` and `-i` are understood). Hosts are added and changed in the host
-editor (New host, or the pencil on the selected host) and saved to
-`vault.json` in Tern's data folder. The file holds no secrets: names,
-addresses, users and key-file paths, like `~/.ssh/config`. If it can't be
-read, Tern moves it aside as `vault.json.unreadable` and starts empty.
+On Linux, install the few system libraries GPUI needs first ([DEVELOPMENT.md](DEVELOPMENT.md) lists them). Tern is used daily on Windows; macOS and Linux build and pass their tests on every change.
 
-When PuTTY has saved SSH sessions the vault lacks (in the registry on
-Windows, `~/.putty/sessions` elsewhere; only read), the vault offers "Import
-from PuTTY" and adds them to a PuTTY group. Sessions with a PuTTY `.ppk` key
-sign in through Pageant.
+### Shell integration (optional)
 
-Settings (the sliders in the header) can sync hosts, snippets, port
-forwards, settings and chosen private keys through a folder a sync client
-already keeps in step (Google Drive, Dropbox, OneDrive, iCloud Drive,
-Nextcloud…). Each device writes its own file there, encrypted with your
-passphrase; the passphrase stays in the system's credential store.
-
-Tern checks host keys against `~/.ssh/known_hosts` (read only) and its own
-known hosts in its data folder (`%APPDATA%\Tern`, `~/Library/Application
-Support/Tern` or `~/.local/share/tern`; `TERN_DATA_DIR` overrides it, which
-also keeps a test run away from your real vault).
-
-Tern marks each command in the terminal's margin (a ring when it succeeded,
-a dot when it failed), jumps between them with Ctrl+Shift+Up and Down,
-copies one's output, and keeps the Files panel in the shell's folder, when
-the shell reports them as iTerm2, WezTerm and Windows Terminal read it (OSC
-133 and OSC 7). For bash, in `~/.bashrc`:
+With two lines in `~/.bashrc`, the shell tells Tern where each command starts and ends and which folder it's in, the way iTerm2, WezTerm and Windows Terminal read it. That's what lights up command marks and keeps the Files panel in step:
 
 ```sh
 PS0='\e]133;C\a'
 PS1='\[\e]133;D;$?\a\e]133;A\a\e]7;file://$HOSTNAME$PWD\a\]'"$PS1"'\[\e]133;B\a\]'
 ```
 
-## Develop
+### Keyboard
 
-```sh
-cargo run -p tern-devserver                # SSH server on 127.0.0.1:2222
-```
+| | Windows and Linux | macOS |
+| --- | --- | --- |
+| Command palette | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
+| New local terminal | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> | <kbd>Cmd</kbd>+<kbd>T</kbd> |
+| Next and previous tab | <kbd>Ctrl</kbd>+<kbd>Tab</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> | the same |
+| Copy and paste | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> | <kbd>Cmd</kbd>+<kbd>C</kbd>, <kbd>Cmd</kbd>+<kbd>V</kbd> |
+| Find in the terminal | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> | <kbd>Cmd</kbd>+<kbd>F</kbd> |
+| Previous and next command | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>, <kbd>↓</kbd> |
+| Bigger, smaller, reset font | <kbd>Ctrl</kbd>+<kbd>=</kbd>, <kbd>Ctrl</kbd>+<kbd>-</kbd>, <kbd>Ctrl</kbd>+<kbd>0</kbd> | <kbd>Cmd</kbd>+<kbd>=</kbd>, <kbd>Cmd</kbd>+<kbd>-</kbd>, <kbd>Cmd</kbd>+<kbd>0</kbd> |
+| Open a link | <kbd>Ctrl</kbd>+click | <kbd>Cmd</kbd>+click |
+| In the vault: move, connect, edit | arrows, <kbd>Enter</kbd>, <kbd>E</kbd> | the same |
 
-It creates a test key and password in `dev/test-ssh/` (git-ignored) on first
-run, and serves SFTP over your home folder for the Files panel. When that
-key exists and there is no `vault.json` yet, the app starts with a "Local
-dev server" group listing it once directly and once as
-`devserver-via-jump`, which goes through the dev server itself as a jump
-host (it forwards only to addresses on this computer).
+## Your data stays yours
 
-```sh
-cargo test --workspace                     # includes an end-to-end SSH test
-cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi"
-cargo run -p tern-core --example probe -- "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1" "echo hi" --jump "ssh -p 2222 -i dev/test-ssh/id_ed25519 tern@127.0.0.1"
-cargo run -p tern-app --release -- --bench 10                    # frame cost of the vault's latency traces
-cargo run -p tern-app --release -- --bench 10 --bench-uncached   # same, re-rendering everything
-cargo run -p tern-app --release -- --bench-start                 # time from launch to the first frame, with the data folder's vault
-```
+- **No accounts, no Tern servers, no telemetry.** Tern talks to your servers, and to the sync folder you choose.
+- **Passwords and the sync passphrase** live in your system's credential store: Windows Credential Manager, the macOS Keychain or the Secret Service on Linux. Never in Tern's files.
+- **Hosts, snippets and settings** are plain files in Tern's data folder (`%APPDATA%\Tern`, `~/Library/Application Support/Tern` or `~/.local/share/tern`), readable only by you. They hold no passwords or private keys, though notes and environment variables are kept as you write them. A vault file that can't be read is set aside as `vault.json.unreadable`, never overwritten.
+- **Host keys** are checked against your `~/.ssh/known_hosts`, which Tern reads but never writes, and against Tern's own list.
+- **Sync** encrypts everything on your device (Argon2id and XChaCha20-Poly1305) before it reaches the cloud folder. Private keys sync only if you pick them, one by one.
 
-`TERN_THEME=light|dark` forces an appearance.
+## Contributing
 
-### SSH lab
+[DEVELOPMENT.md](DEVELOPMENT.md) covers building, the local test server and the Docker lab of real OpenSSH servers; [AGENTS.md](AGENTS.md) is how changes are made here; [ROADMAP.md](ROADMAP.md) is what comes next.
 
-`dev/lab` runs real OpenSSH servers in Docker to test Tern against: one for
-each way of signing in (a password, keys, a password then a one-time code, a
-key then a code, user and host certificates), servers with only today's or
-with older algorithms, a bastion → hop2 → deep chain into networks this
-computer can't reach, SOCKS5 (Dante) and HTTP (Tinyproxy) proxies, and a web
-server to forward to; every server has tmux and a stand-in `docker` with one
-container. `entrypoint.sh` says what each offers. The lab's
-tests are ignored unless asked for, and need `docker` on the `PATH`:
-
-```sh
-dev/lab/setup.sh                                              # make its keys, start it
-cargo run -p tern-core --example lab_hosts                    # add its servers to Tern's vault (quit Tern first)
-cargo test -p tern-core --test lab -- --ignored --nocapture   # Tern's SSH against every server
-cargo test -p tern-app lab -- --ignored --nocapture           # the app's panes, keyboard only
-docker compose -f dev/lab/compose.yaml down                   # stop it
-```
+Tern is free and will be open source under a licence chosen before its first release.
