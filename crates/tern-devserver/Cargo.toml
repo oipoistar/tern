@@ -3,6 +3,7 @@ name = "tern-devserver"
 description = "Local SSH server with a real shell, for trying Tern end to end"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

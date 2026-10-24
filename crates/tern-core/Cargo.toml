@@ -3,6 +3,7 @@ name = "tern-core"
 description = "Tern's UI-free core: hosts, vault, SSH and sync"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1"

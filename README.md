@@ -215,4 +215,4 @@ PS1='\[\e]133;D;$?\a\e]133;A\a\e]7;file://$HOSTNAME$PWD\a\]'"$PS1"'\[\e]133;B\a\
 
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building, the local test server and the Docker lab of real OpenSSH servers; [AGENTS.md](AGENTS.md) is how changes are made here; [ROADMAP.md](ROADMAP.md) is what comes next.
 
-Tern is free and will be open source under a licence chosen before its first release.
+Tern is free and open source under the [MIT License](LICENSE).

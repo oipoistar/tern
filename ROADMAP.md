@@ -322,6 +322,7 @@ claude.ai account). Each item below names the artboard it comes from.
       Tern go into `~/.ssh/known_hosts`, whose entries the Known hosts
       screen can forget (a linked file changes where it lives). Windows
       keeps both in Tern's own folder and only reads `~/.ssh`
+- [x] Licence: MIT, in `LICENSE` and every crate's manifest
 
 ## Known gaps in what's built
 
@@ -362,9 +363,8 @@ claude.ai account). Each item below names the artboard it comes from.
 - Published as GitHub Releases. Any update check stays serverless (the GitHub
   releases API).
 
-### 21. Licence and going public
-- Choose a licence (MIT, Apache-2.0 or GPL-3.0), add `LICENSE`, then make the
-  repository public.
+### 21. Going public
+- Make the repository public.
 
 ## Not planned
 
