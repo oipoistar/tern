@@ -7584,7 +7584,7 @@ dependencies = [
 
 [[package]]
 name = "tern-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alacritty_terminal",
  "base64 0.22.1",
@@ -7598,7 +7598,7 @@ dependencies = [
 
 [[package]]
 name = "tern-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7621,7 +7621,7 @@ dependencies = [
 
 [[package]]
 name = "tern-devserver"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "portable-pty",
