@@ -41,6 +41,10 @@ const HOLD_AT_MOST: usize = 64 << 20;
 pub struct Scanner {
     /// The start of a sequence, or of what may be one, from the last chunk.
     held: Vec<u8>,
+    /// How much of the held sequence's body was looked through for its
+    /// end, in vain: a long one (an image) arrives over many chunks, and
+    /// going through it again for each would take minutes.
+    searched: usize,
 }
 
 impl Scanner {
@@ -53,25 +57,27 @@ impl Scanner {
     /// Splits `bytes` (after what was held) into output for the terminal and
     /// the sequences between it.
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<Piece> {
-        let joined;
-        let input: &[u8] = if self.held.is_empty() {
-            bytes
-        } else {
+        let searched = std::mem::take(&mut self.searched);
+        let joined = (!self.held.is_empty()).then(|| {
             let mut held = std::mem::take(&mut self.held);
             held.extend_from_slice(bytes);
-            joined = held;
-            &joined
-        };
+            held
+        });
+        let input: &[u8] = joined.as_deref().unwrap_or(bytes);
         let mut pieces = Vec::new();
         let mut text_from = 0;
         let mut at = 0;
+        // Where a sequence starts that waits for more, and how much of its
+        // body was looked through.
+        let mut hold = None;
         while let Some(found) = input[at..].iter().position(|&byte| byte == 0x1b) {
             let start = at + found;
             let rest = &input[start..];
             // `ESC` alone, or `ESC ]` and part of a sequence's start: wait
             // for more.
             if rest.len() < 2 {
-                return self.hold(input, text_from, start, pieces);
+                hold = Some((start, 0));
+                break;
             }
             if rest[1] != b']' {
                 at = start + 1;
@@ -86,12 +92,19 @@ impl Scanner {
                     .iter()
                     .any(|prefix| body.len() < prefix.len() && prefix.starts_with(body));
                 if partial {
-                    return self.hold(input, text_from, start, pieces);
+                    hold = Some((start, 0));
+                    break;
                 }
                 at = start + 2;
                 continue;
             };
-            match terminator(body) {
+            // The held sequence's body was looked through before, but for
+            // its last byte: an `ESC` there may meet its `\` only now.
+            let skip = match joined {
+                Some(_) if start == 0 => searched.saturating_sub(1),
+                _ => 0,
+            };
+            match terminator(body, skip) {
                 Some((content_end, after)) => {
                     if start > text_from {
                         pieces.push(Piece::Text(input[text_from..start].to_vec()));
@@ -114,44 +127,40 @@ impl Scanner {
                     text_from = at;
                 }
                 None if rest.len() <= HOLD_AT_MOST => {
-                    return self.hold(input, text_from, start, pieces);
+                    hold = Some((start, body.len()));
+                    break;
                 }
                 // Too long to be one: it's output.
                 None => at = start + 2,
             }
         }
-        if input.len() > text_from {
-            pieces.push(Piece::Text(input[text_from..].to_vec()));
+        let end = hold.map_or(input.len(), |(from, _)| from);
+        if end > text_from {
+            pieces.push(Piece::Text(input[text_from..end].to_vec()));
         }
-        pieces.retain(|piece| piece != &Piece::Text(Vec::new()));
-        pieces
-    }
-
-    /// Gives the output before `from` and keeps the rest for the next chunk.
-    fn hold(
-        &mut self,
-        input: &[u8],
-        text_from: usize,
-        from: usize,
-        mut pieces: Vec<Piece>,
-    ) -> Vec<Piece> {
-        if from > text_from {
-            pieces.push(Piece::Text(input[text_from..from].to_vec()));
+        // The rest waits for the next chunk. All that was held, still
+        // waiting, is kept as it is rather than copied again.
+        if let Some((from, searched)) = hold {
+            let tail = (from > 0 || joined.is_none()).then(|| input[from..].to_vec());
+            self.held = tail.or(joined).unwrap_or_default();
+            self.searched = searched;
         }
-        self.held = input[from..].to_vec();
         pieces.retain(|piece| piece != &Piece::Text(Vec::new()));
         pieces
     }
 }
 
 /// Where an OSC sequence's content ends and what follows its terminator
-/// (BEL, or `ESC \`), within `body`.
-fn terminator(body: &[u8]) -> Option<(usize, usize)> {
-    body.iter().enumerate().find_map(|(at, &byte)| match byte {
-        0x07 => Some((at, at + 1)),
-        0x1b if body.get(at + 1) == Some(&b'\\') => Some((at, at + 2)),
-        _ => None,
-    })
+/// (BEL, or `ESC \`), within `body`, looking from `from` on.
+fn terminator(body: &[u8], from: usize) -> Option<(usize, usize)> {
+    body.iter()
+        .enumerate()
+        .skip(from)
+        .find_map(|(at, &byte)| match byte {
+            0x07 => Some((at, at + 1)),
+            0x1b if body.get(at + 1) == Some(&b'\\') => Some((at, at + 2)),
+            _ => None,
+        })
 }
 
 /// The path in what followed `7;`: a `file://host/path` URL, its
@@ -288,5 +297,30 @@ mod tests {
             scanner.scan(b"\x1b\\"),
             [Piece::Image(b"inline=1:QUJD".to_vec())]
         );
+        // Their end may be split between chunks too, and what follows
+        // comes through.
+        assert_eq!(scanner.scan(b"\x1b]1337;File=inline=1:QU"), []);
+        assert_eq!(scanner.scan(b"JD\x1b"), []);
+        assert_eq!(
+            scanner.scan(b"\\$ \x1b]1337;File=:QQ"),
+            [Piece::Image(b"inline=1:QUJD".to_vec()), text("$ ")]
+        );
+        assert_eq!(scanner.scan(b"==\x07"), [Piece::Image(b":QQ==".to_vec())]);
+    }
+
+    #[test]
+    fn a_long_image_takes_as_long_as_its_chunks() {
+        let mut scanner = Scanner::default();
+        let chunk = vec![b'A'; 32 << 10];
+        let started = std::time::Instant::now();
+        assert_eq!(scanner.scan(b"\x1b]1337;File=inline=1:"), []);
+        for _ in 0..(32 << 20) / chunk.len() {
+            assert_eq!(scanner.scan(&chunk), []);
+        }
+        let pieces = scanner.scan(b"\x07");
+        assert!(matches!(&pieces[..], [Piece::Image(image)] if image.len() == (32 << 20) + 9));
+        // Going through all that was held for each chunk took half a
+        // minute.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }
