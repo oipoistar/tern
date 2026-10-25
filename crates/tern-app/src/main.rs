@@ -89,9 +89,15 @@ fn main() {
 
 /// A panic leaves what happened in `crash.log` in the data folder: on
 /// Windows Tern has no console to print it, and a panic in a window takes
-/// the app down with nothing said. The last one is kept.
+/// the app down with nothing said. The log holds the last run that
+/// panicked, every panic of it in order: one in a window ends in a second,
+/// "panic in a function that cannot unwind", which mustn't hide the first.
 fn record_panics() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let print = std::panic::take_hook();
+    let first = AtomicBool::new(true);
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let text = format!(
@@ -101,7 +107,14 @@ fn record_panics() {
             std::backtrace::Backtrace::force_capture(),
         );
         let log = tern_core::paths::data_dir().join("crash.log");
-        let _ = tern_core::paths::write_atomically(&log, text.as_bytes());
+        let _ = if first.swap(false, Ordering::SeqCst) {
+            tern_core::paths::write_atomically(&log, text.as_bytes())
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .and_then(|mut file| file.write_all(text.as_bytes()))
+        };
         print(info);
     }));
 }
