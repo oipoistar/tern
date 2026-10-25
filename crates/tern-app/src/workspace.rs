@@ -562,11 +562,17 @@ impl Workspace {
         workspace.main = Some(main);
         workspace.record_when_closed(window, cx);
         workspace.adopt_tab(tab, window, cx);
-        // Its tabs are written down with the main window's.
+        // Its tabs are written down with the main window's, once this window
+        // is done changing: writing them reads this workspace too, which
+        // mustn't be in the middle of an update then (GPUI panics, and a
+        // panic there ends the app).
         cx.observe_self(|this, cx| {
-            if let Some(main) = this.main.as_ref().and_then(WeakEntity::upgrade) {
-                main.update(cx, |main, cx| main.remember_tabs(cx));
-            }
+            let main = this.main.clone();
+            cx.defer(move |cx| {
+                if let Some(main) = main.and_then(|main| main.upgrade()) {
+                    main.update(cx, |main, cx| main.remember_tabs(cx));
+                }
+            });
         })
         .detach();
         workspace
@@ -3499,8 +3505,15 @@ mod tests {
     #[gpui::test]
     fn a_split_tab_dragged_out_leaves_the_main_window_working(cx: &mut TestAppContext) {
         use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+        use tern_core::restore::OpenTabs;
 
+        let dir = std::env::temp_dir().join(format!("tern-split-out-{}", std::process::id()));
+        let file = dir.join("tabs.json");
         let (workspace, cx) = open_workspace(cx);
+        // Open tabs are written down, as in a plain start.
+        workspace.update(cx, |workspace, cx| {
+            workspace.remember_tabs_in(file.clone(), cx)
+        });
         // Two sessions side by side in one tab, one of them focused.
         click(cx, "layout-2");
         click(cx, "pane-1");
@@ -3535,6 +3548,11 @@ mod tests {
         );
         let moved = workspace.read_with(cx, |w, _| w.others[0].upgrade().unwrap());
         assert_eq!(moved.read_with(cx, |other, _| other.tabs[0].panes.len()), 2);
+        // The moved window changing (a pane printing, its focus going) has
+        // the tabs written down again, and reads that window to do it.
+        moved.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(OpenTabs::load(&file).tabs.len(), 1);
 
         // The main window shows the vault and goes on taking clicks.
         assert!(cx.debug_bounds("new-host").is_some());
@@ -3544,6 +3562,7 @@ mod tests {
         click(cx, "new-host");
         click(cx, "filter");
         assert!(cx.debug_bounds("new-host").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]
