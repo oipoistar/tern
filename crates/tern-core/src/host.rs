@@ -118,6 +118,25 @@ pub fn new_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
+/// What's wrong with `address` as a host's name or address, in a few
+/// words, if anything: it holds only letters, digits and `.` `-` `_`, with
+/// `:` and `%` for IPv6 and its zones, and doesn't start with `-`, which a
+/// command line reads as an option. Anything else would read as more than
+/// a name where it's written: a known_hosts line, a command a shell runs.
+pub fn address_problem(address: &str) -> Option<String> {
+    if address.starts_with('-') {
+        return Some("can't start with -".into());
+    }
+    match address
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%')))
+    {
+        Some(c) if c.is_whitespace() || c.is_control() => Some("can't contain spaces".into()),
+        Some(c) => Some(format!("can't contain {c}")),
+        None => None,
+    }
+}
+
 /// Milliseconds since the Unix epoch, now.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()

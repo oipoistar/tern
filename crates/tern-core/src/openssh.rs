@@ -565,6 +565,28 @@ fn to_hosts(blocks: &[Block], dir: &Path, user: &str) -> Vec<Host> {
         let host = &mut import.hosts[index];
         host.jump = via.filter(|name| *name != host.name);
     }
+    // An address, proxy or user that a shell or `ssh` would read as more
+    // than a name (a command's output may say anything) keeps its host out,
+    // and the hosts that go through it.
+    let mut out: Vec<String> = import
+        .hosts
+        .iter()
+        .filter(|host| {
+            crate::host::address_problem(&host.address).is_some()
+                || host.user.starts_with('-')
+                || host
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|proxy| crate::host::address_problem(&proxy.host).is_some())
+        })
+        .map(|host| host.name.clone())
+        .collect();
+    while let Some(through) = import.hosts.iter().find(|host| {
+        !out.contains(&host.name) && host.jump.as_ref().is_some_and(|jump| out.contains(jump))
+    }) {
+        out.push(through.name.clone());
+    }
+    import.hosts.retain(|host| !out.contains(&host.name));
     import.hosts
 }
 
@@ -635,9 +657,12 @@ fn port_number(text: &str) -> Option<u16> {
 
 /// `host` as one `ssh` command line, for a terminal without Tern: its
 /// port, key, jump hosts (`-J`), agent forwarding, proxy and the rules
-/// switched on. A key path with spaces is quoted. OpenSSH ignores a
-/// `ProxyCommand` beside `-J`, so when the first jump host is behind a
-/// proxy, the jump hosts are a `ProxyCommand` too (see [`through`]).
+/// switched on. A key path with spaces is quoted, and so is anything from
+/// the host a shell would read as more than a word (a user like `John
+/// Smith`, or worse); a destination starting with `-` comes after `--`, so
+/// `ssh` doesn't read it as an option. OpenSSH ignores a `ProxyCommand`
+/// beside `-J`, so when the first jump host is behind a proxy, the jump
+/// hosts are a `ProxyCommand` too (see [`through`]).
 pub fn ssh_command(vault: &Vault, host: &Host) -> String {
     let (user, auth, _) = vault.sign_in(host);
     let mut words = vec!["ssh".to_string()];
@@ -650,7 +675,7 @@ pub fn ssh_command(vault: &Vault, host: &Host) -> String {
     let jumps = vault.jumps(host).unwrap_or_default();
     let proxy = jumps.first().copied().unwrap_or(host).proxy.as_ref();
     if proxy.is_none() && !jumps.is_empty() {
-        words.push(format!("-J {}", jump_list(vault, &jumps)));
+        words.push(format!("-J {}", sh_quote(&jump_list(vault, &jumps))));
     }
     if host.agent_forwarding {
         words.push("-A".into());
@@ -662,9 +687,17 @@ pub fn ssh_command(vault: &Vault, host: &Host) -> String {
         ));
     }
     for forward in host.forwards.iter().filter(|forward| forward.on) {
-        words.push(format!("{} {}", forward.flag(), forward_spec(forward)));
+        words.push(format!(
+            "{} {}",
+            forward.flag(),
+            sh_quote(&forward_spec(forward))
+        ));
     }
-    words.push(format!("{user}@{}", host.address));
+    let destination = format!("{user}@{}", host.address);
+    if destination.starts_with('-') {
+        words.push("--".into());
+    }
+    words.push(sh_quote(&destination));
     words.join(" ")
 }
 
@@ -1522,6 +1555,36 @@ Host db-again
         let bastion = find(&read, "bastion");
         assert_eq!(bastion.target(), "admin@bastion.example.com:2222");
         assert_eq!(read.len(), 2);
+    }
+
+    #[test]
+    fn copies_a_command_no_shell_reads_more_into() {
+        let mut vault = Vault::default();
+        // Hosts saved by an older Tern, or arriving some other way than the
+        // editor, as the editor wouldn't take them now.
+        let spaced = Host::new("tools", "John Smith", "tools.lan", 22);
+        let sneaky = Host::new("db", "x$(reboot)", "db;reboot", 22);
+        let option = Host::new("odd", "-oProxyCommand=calc", "odd.lan", 22);
+        for host in [&spaced, &sneaky, &option] {
+            vault.save(None, host.clone(), "Mine");
+        }
+        assert_eq!(ssh_command(&vault, &spaced), "ssh 'John Smith@tools.lan'");
+        assert_eq!(ssh_command(&vault, &sneaky), "ssh 'x$(reboot)@db;reboot'");
+        assert_eq!(
+            ssh_command(&vault, &option),
+            "ssh -- -oProxyCommand=calc@odd.lan"
+        );
+    }
+
+    #[test]
+    fn imports_no_host_named_like_a_command() {
+        let config = "Host web\n    HostName web.lan\n\
+                      Host evil\n    HostName x;reboot\n\
+                      Host through\n    HostName inside.lan\n    ProxyJump evil\n\
+                      Host sneaky\n    HostName ok.lan\n    User -oProxyCommand=calc\n";
+        let hosts = described(config, Path::new("."), "me");
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, ["web"]);
     }
 
     /// prod db through bastion, which goes through gw, which is behind a

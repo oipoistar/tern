@@ -54,7 +54,9 @@ impl Proxy {
                 _ => (rest, None),
             },
         };
-        if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
+        // OpenSSH runs a proxy's `nc` through a shell, so nothing in the
+        // host may read as more than a name.
+        if host.is_empty() || crate::host::address_problem(host).is_some() {
             return Err("The proxy's host isn't valid".into());
         }
         let port = match port {
@@ -243,5 +245,11 @@ mod tests {
                 .contains("port")
         );
         assert!(Proxy::parse("socks5://").unwrap_err().contains("host"));
+        // OpenSSH runs a proxy's `nc` through a shell.
+        assert!(
+            Proxy::parse("socks5://p;reboot:1080")
+                .unwrap_err()
+                .contains("host")
+        );
     }
 }

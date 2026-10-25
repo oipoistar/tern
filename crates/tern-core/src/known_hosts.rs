@@ -205,11 +205,7 @@ fn hashes(hashed: &str, name: &str) -> bool {
 /// A name that would read as more than one host there (several names,
 /// patterns, a marker or a comment) is refused rather than written.
 pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<(), String> {
-    let plain = !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'));
-    if !plain {
+    if host.is_empty() || crate::host::address_problem(host).is_some() {
         return Err(format!("{host} isn't a host name a key can be trusted for"));
     }
     let name = if port == 22 {

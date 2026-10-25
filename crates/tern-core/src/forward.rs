@@ -112,6 +112,9 @@ impl Forward {
                     .filter(|&port| port > 0)
                     .ok_or("Send to host:port")?;
                 let host = host.trim_start_matches('[').trim_end_matches(']');
+                if crate::host::address_problem(host).is_some() {
+                    return Err("Send to host:port".into());
+                }
                 (host.to_string(), port)
             }
         };
