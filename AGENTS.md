@@ -171,4 +171,5 @@ at startup, for looking at it without clicking.
   every build but tests), so starting it opens no console window. Started
   from a terminal it attaches to that one (`attach_console` in `main.rs`),
   so `--bench` and `cargo run` still print; from Explorer, what it prints
-  goes nowhere.
+  goes nowhere. A panic is written to `crash.log` in the data folder
+  (`record_panics` in `main.rs`): ask for it when someone reports a crash.

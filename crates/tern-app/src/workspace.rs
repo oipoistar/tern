@@ -3497,6 +3497,56 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_split_tab_dragged_out_leaves_the_main_window_working(cx: &mut TestAppContext) {
+        use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+
+        let (workspace, cx) = open_workspace(cx);
+        // Two sessions side by side in one tab, one of them focused.
+        click(cx, "layout-2");
+        click(cx, "pane-1");
+        let none = Modifiers::none();
+        let start = cx.debug_bounds("tab-0").unwrap().center();
+        let outside = gpui::point(gpui::px(-80.), gpui::px(12.));
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: start,
+            modifiers: none,
+            click_count: 1,
+            first_mouse: false,
+        });
+        for position in [start + gpui::point(gpui::px(24.), gpui::px(0.)), outside] {
+            cx.simulate_event(MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: none,
+            });
+        }
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: outside,
+            modifiers: none,
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+        assert_eq!(
+            workspace.read_with(cx, |w, _| (w.tabs.len(), w.active)),
+            (0, None)
+        );
+        let moved = workspace.read_with(cx, |w, _| w.others[0].upgrade().unwrap());
+        assert_eq!(moved.read_with(cx, |other, _| other.tabs[0].panes.len()), 2);
+
+        // The main window shows the vault and goes on taking clicks.
+        assert!(cx.debug_bounds("new-host").is_some());
+        let middle = cx.update(|window, _| window.viewport_size().center());
+        cx.simulate_click(middle, none);
+        cx.run_until_parked();
+        click(cx, "new-host");
+        click(cx, "filter");
+        assert!(cx.debug_bounds("new-host").is_some());
+    }
+
+    #[gpui::test]
     fn a_moved_tab_moves_on_again(cx: &mut TestAppContext) {
         use tern_core::restore::OpenTabs;
 

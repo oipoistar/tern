@@ -33,6 +33,7 @@ use gpui_kit::*;
 fn main() {
     #[cfg(windows)]
     load_libraries_from_system32();
+    record_panics();
     // `tern --mcp`: the MCP server an agent starts, speaking MCP on standard
     // input and output and handing tool calls to the Tern running here. No
     // window, and nothing else on standard output.
@@ -84,6 +85,25 @@ fn main() {
                 cx.activate(true);
             }
         });
+}
+
+/// A panic leaves what happened in `crash.log` in the data folder: on
+/// Windows Tern has no console to print it, and a panic in a window takes
+/// the app down with nothing said. The last one is kept.
+fn record_panics() {
+    let print = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let text = format!(
+            "Tern {} panicked on thread {}: {info}\n\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            thread.name().unwrap_or("unnamed"),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        let log = tern_core::paths::data_dir().join("crash.log");
+        let _ = tern_core::paths::write_atomically(&log, text.as_bytes());
+        print(info);
+    }));
 }
 
 /// Libraries load from System32 only, never from Tern's own folder: a
