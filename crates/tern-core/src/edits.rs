@@ -60,8 +60,10 @@ pub fn folder(base: &Path) -> std::io::Result<PathBuf> {
 
 /// Whether this computer would run a file called `name` when asked to
 /// open it, rather than show it in an editor: scripts, programs, shortcuts
-/// and installers on Windows, Terminal's command files on macOS, launchers
-/// on Linux.
+/// and installers on Windows, with the scripts of interpreters a developer's
+/// computer has (Python's launcher runs a `.py`, Git Bash a `.sh`), and
+/// what connects elsewhere (`.rdp`) or mounts a disk; Terminal's command
+/// files and Python's launcher on macOS; launchers on Linux.
 pub fn runs_when_opened(name: &str) -> bool {
     let Some((_, extension)) = name.rsplit_once('.') else {
         return false;
@@ -69,17 +71,27 @@ pub fn runs_when_opened(name: &str) -> bool {
     let extension = extension.to_ascii_lowercase();
     let runs: &[&str] = if cfg!(windows) {
         &[
+            "ahk",
+            "appinstaller",
             "application",
             "appref-ms",
+            "appx",
+            "appxbundle",
+            "bash",
             "bat",
             "chm",
             "cmd",
             "com",
             "cpl",
+            "deskthemepack",
+            "diagcab",
             "exe",
             "gadget",
             "hta",
+            "ica",
+            "img",
             "inf",
+            "iso",
             "jar",
             "js",
             "jse",
@@ -87,27 +99,61 @@ pub fn runs_when_opened(name: &str) -> bool {
             "lnk",
             "msc",
             "msi",
+            "msix",
+            "msixbundle",
             "msp",
+            "msu",
             "pif",
+            "pl",
+            "ppkg",
             "ps1",
+            "py",
+            "pyc",
+            "pyw",
+            "pyz",
+            "pyzw",
+            "rb",
+            "rdp",
             "reg",
             "scf",
             "scr",
             "sct",
+            "search-ms",
+            "searchconnector-ms",
             "settingcontent-ms",
+            "sh",
+            "theme",
+            "themepack",
             "url",
             "vbe",
             "vbs",
+            "vhd",
+            "vhdx",
+            "vsto",
             "website",
+            "wsb",
             "wsc",
             "wsf",
             "wsh",
+            "xbap",
             "xll",
         ]
     } else if cfg!(target_os = "macos") {
         &[
-            "app", "command", "fileloc", "inetloc", "jar", "mpkg", "pkg", "terminal", "tool",
-            "webloc", "workflow",
+            "action",
+            "app",
+            "command",
+            "fileloc",
+            "inetloc",
+            "jar",
+            "mobileconfig",
+            "mpkg",
+            "pkg",
+            "py",
+            "terminal",
+            "tool",
+            "webloc",
+            "workflow",
         ]
     } else {
         &["appimage", "desktop", "jar"]
@@ -154,6 +200,15 @@ mod tests {
         };
         assert!(runs_when_opened(script));
         assert!(!runs_when_opened("notes.txt") && !runs_when_opened("Makefile"));
+        // Python's launcher runs a script it's asked to open; on Windows Git
+        // Bash runs a shell script, and Remote Desktop connects where an
+        // .rdp file says.
+        assert_eq!(
+            runs_when_opened("deploy.PY"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+        assert_eq!(runs_when_opened("deploy.sh"), cfg!(windows));
+        assert_eq!(runs_when_opened("jump.rdp"), cfg!(windows));
         let local = folder.join(script);
         std::fs::write(&local, "echo hi").unwrap();
         let opened = openable(local).unwrap();
