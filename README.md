@@ -208,7 +208,7 @@ Apps that take a JSON config want the same command:
 
 The agent then works in the Tern you have open, in tabs you can watch: it lists your hosts and adds, changes or removes them, opens sessions (to a saved host, any `user@host`, or a local shell), types commands and reads what they print, reads the whole screen of programs like `top` or `vim`, and answers what a server asks before the shell starts, as you would at the keyboard. If Tern isn't running, the agent starts it.
 
-- An agent's typing into a guarded host's session waits for your yes in Tern.
+- An agent's typing into a guarded host's session waits for your yes in Tern, however the agent reaches the host. Only you can change or remove a guarded host.
 - Agents get in only through that command, only from this computer, and only while the switch is on.
 
 ## Keyboard

@@ -60,7 +60,7 @@ connects to one (or to a typed destination, or opens a shell on this computer) i
 send_input types into a session and returns what it printed; read_session reads more of it, or \
 its whole screen for full-screen programs; close_session closes it. add_host, edit_host and \
 remove_host change the saved hosts. A guarded host's sessions hold typed input until the user \
-allows it in Tern.";
+allows it in Tern, and only the user can change or remove a guarded host.";
 
 /// A tool call, checked: what the running Tern is asked to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -595,14 +595,14 @@ pub fn tools() -> Value {
         {
             "name": "edit_host",
             "title": "Change a host",
-            "description": "Changes a saved host: only the fields given change, and name renames it.",
+            "description": "Changes a saved host: only the fields given change, and name renames it. A guarded host only the user can change.",
             "inputSchema": object(edit_fields, &["host"]),
             "annotations": hints(false, false),
         },
         {
             "name": "remove_host",
             "title": "Remove a host",
-            "description": "Deletes a saved host, with its saved password. Refused while other hosts connect through it. Its open sessions stay open.",
+            "description": "Deletes a saved host, with its saved password. Refused while other hosts connect through it, and for a guarded host. Its open sessions stay open.",
             "inputSchema": object(json!({ "host": text("The name of the host to delete") }), &["host"]),
             "annotations": hints(false, true),
         },
