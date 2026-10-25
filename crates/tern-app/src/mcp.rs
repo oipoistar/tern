@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 use serde_json::{Map, Value, json};
 use tern_core::draft::HostDraft;
-use tern_core::mcp::{Answer, Call, HostFields, Incoming, Key, Server, To};
+use tern_core::mcp::{Answer, Call, HostFields, Incoming, Key, Server, To, refused_to_agents};
 use tern_core::secrets::host_password;
 use tern_core::ssh::{Connection, Target};
 use tern_core::{Auth, Host, HostStatus, Vault};
@@ -273,7 +273,7 @@ fn save_host(
 ) -> Answer {
     let content = main.read(cx).vault().clone();
     let vault = content.read(cx).vault().clone();
-    let (mut draft, replacing) = match replacing {
+    let (mut draft, original) = match replacing {
         None => (
             HostDraft::new(fields.group.as_deref().unwrap_or("Hosts")),
             None,
@@ -284,11 +284,12 @@ fn save_host(
             Some(host) if host.guarded => return guarded(&host.name),
             Some(host) => (
                 HostDraft::edit(host, vault.group_of(&host.name).unwrap_or("Hosts")),
-                Some(host.name.clone()),
+                Some(host.clone()),
             ),
             None => return no_host(name),
         },
     };
+    let replacing = original.as_ref().map(|host| host.name.clone());
     if let Err(reason) = fields.apply(&mut draft, &vault) {
         return Answer::error(reason);
     }
@@ -302,6 +303,9 @@ fn save_host(
             return Answer::error(reasons.join("; "));
         }
     };
+    if let Some(reason) = refused_to_agents(original.as_ref(), &host) {
+        return Answer::error(reason);
+    }
     // Passwords live in the system's credential store, never the vault.
     let store = sync::secrets(cx);
     let secret = host_password(&host.id);
@@ -464,7 +468,7 @@ fn settled(
     let quiet = now.saturating_duration_since(last);
     match pane.stage() {
         Stage::Ended | Stage::Asking => true,
-        Stage::Connecting => false,
+        Stage::Connecting | Stage::Waiting => false,
         Stage::Live => match until {
             Until::Up => {
                 let quiet_live = now.saturating_duration_since(last.max(live_at));
@@ -747,7 +751,7 @@ mod tests {
     use serde_json::Value;
     use tern_core::mcp::{Answer, Call, HostFields, Key, SignIn, To};
     use tern_core::secrets::{MemorySecrets, Secrets as _, host_password};
-    use tern_core::ssh::{Event, Target};
+    use tern_core::ssh::{Event, HostKey, Target, Trusted};
     use tern_core::{Auth, Vault};
 
     use super::{POLL, act, attach};
@@ -1138,6 +1142,115 @@ mod tests {
             ask(send(1, "x", &[], 0), cx),
             Answer::error("Nothing was typed: the session is ended: Cancelled; enter reconnects")
         );
+    }
+
+    #[gpui::test]
+    fn only_the_user_trusts_a_servers_key(cx: &mut TestAppContext) {
+        let (workspace, cx) = open(cx);
+        ask(open_local(0), cx);
+        let pane = last_pane(&workspace, cx);
+        let key = HostKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJQcfBOGr0NzINylvUGAqKGNRYlc0YQcFzh42nXCoFQ",
+        )
+        .unwrap();
+        pane.update(cx, |pane, cx| {
+            pane.phase = Phase::Trust {
+                shown: "web".into(),
+                host: Trusted {
+                    host: "web.example.com".into(),
+                    port: 22,
+                    key,
+                },
+                fingerprint: "SHA256:abc".into(),
+            };
+            cx.notify();
+        });
+        // Enter would trust it: an agent's isn't taken.
+        let enter = ask(send(1, "\n", &[], 0), cx);
+        assert!(
+            enter.error
+                && enter
+                    .text
+                    .contains("asking the user whether to trust the host key of web"),
+            "{}",
+            enter.text
+        );
+        // An agent's wait lasts while the user hasn't answered.
+        let started = cx.executor().now();
+        let read = ask(
+            Call::ReadSession {
+                session: 1,
+                wait: Duration::from_secs(5),
+                screen: false,
+                lines: 200,
+            },
+            cx,
+        );
+        assert!(cx.executor().now() - started >= Duration::from_secs(5));
+        assert!(
+            read.text.starts_with("state: asking the user"),
+            "{}",
+            read.text
+        );
+        assert!(pane.read_with(cx, |pane, _| matches!(pane.phase, Phase::Trust { .. })));
+        // Refusing is an agent's to do.
+        let refused = ask(send(1, "", &["escape"], 0), cx);
+        assert!(
+            refused.text.starts_with("state: ended: Not trusted"),
+            "{}",
+            refused.text
+        );
+    }
+
+    #[gpui::test]
+    fn only_the_user_lets_a_host_use_this_computers_agent(cx: &mut TestAppContext) {
+        let (workspace, cx) = open(cx);
+        let mut relay = fields("relay", "relay.example.com", "me");
+        relay.agent_forwarding = Some(true);
+        assert_eq!(
+            ask(Call::AddHost(relay), cx),
+            Answer::error("Only the user can let a host use this computer's SSH agent, in Tern")
+        );
+        assert!(!names(cx).contains(&"relay".into()));
+
+        // A host the user let use it stays where they pointed it.
+        workspace.update(cx, |workspace, cx| {
+            workspace.vault().update(cx, |content, cx| {
+                let mut bastion = content.vault().find("bastion").unwrap().clone();
+                bastion.agent_forwarding = true;
+                let group = content.vault().group_of("bastion").unwrap().to_string();
+                content.save_host(Some("bastion"), bastion, &group, cx);
+            })
+        });
+        let edit = |fields: HostFields| Call::EditHost {
+            host: "bastion".into(),
+            fields,
+        };
+        let moved = edit(HostFields {
+            address: Some("relay.example.com".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            ask(moved, cx),
+            Answer::error(
+                "bastion can use this computer's SSH agent: only the user can change where it connects, in Tern"
+            )
+        );
+        let tagged = edit(HostFields {
+            tags: Some(vec!["edge".into()]),
+            ..Default::default()
+        });
+        assert_eq!(ask(tagged, cx), Answer::ok("Saved bastion"));
+        let off = edit(HostFields {
+            agent_forwarding: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(ask(off, cx), Answer::ok("Saved bastion"));
+        workspace.read_with(cx, |workspace, cx| {
+            let bastion = workspace.vault().read(cx).vault().find("bastion").unwrap();
+            assert!(!bastion.agent_forwarding);
+            assert_ne!(bastion.address, "relay.example.com");
+        });
     }
 
     #[gpui::test]

@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::draft::HostDraft;
-use crate::host::Auth;
+use crate::host::{Auth, Host};
 use crate::settings::Settings;
 use crate::ssh::{Target, parse_command};
 use crate::vault::Vault;
@@ -60,7 +60,9 @@ connects to one (or to a typed destination, or opens a shell on this computer) i
 send_input types into a session and returns what it printed; read_session reads more of it, or \
 its whole screen for full-screen programs; close_session closes it. add_host, edit_host and \
 remove_host change the saved hosts. A guarded host's sessions hold typed input until the user \
-allows it in Tern, and only the user can change or remove a guarded host.";
+allows it in Tern, and only the user can change or remove a guarded host. Only the user can \
+trust a server's key, let a host use this computer's SSH agent, or change where such a host \
+connects.";
 
 /// A tool call, checked: what the running Tern is asked to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -320,7 +322,7 @@ impl HostFields {
                 return Err("A password goes with sign_in password".into());
             }
             (_, Some(_), Some(_)) => return Err("Give a key or a password, not both".into()),
-            (_, Some(key), _) => Some(Auth::Key(home_path(key))),
+            (_, Some(key), _) => Some(Auth::Key(local_key(key)?)),
             (Some(SignIn::Key), None, _) => match &draft.auth {
                 Auth::Key(path) => Some(Auth::Key(path.clone())),
                 _ => return Err("Give the key file's path in key".into()),
@@ -343,6 +345,39 @@ fn home_path(path: &str) -> PathBuf {
             home.join(rest.trim_start_matches(['/', '\\']))
         }
         _ => PathBuf::from(path),
+    }
+}
+
+/// The key file an agent named, which must be on this computer: Windows
+/// opens a path like `\\server\share\key` over the network, signing in to
+/// that server as the user.
+fn local_key(path: &str) -> Result<PathBuf, String> {
+    let path = home_path(path);
+    if crate::paths::network_path(&path) {
+        return Err("A key file must be on this computer".into());
+    }
+    Ok(path)
+}
+
+/// Why an agent can't save `host` over `old` (`None` for a new host), if
+/// it can't. A host that may use this computer's SSH agent can sign in
+/// elsewhere as the user, so letting one, and changing where one connects,
+/// are the user's to do.
+pub fn refused_to_agents(old: Option<&Host>, host: &Host) -> Option<String> {
+    if !host.agent_forwarding {
+        return None;
+    }
+    match old {
+        Some(old) if old.agent_forwarding => {
+            let moved = !old.address.eq_ignore_ascii_case(&host.address) || old.port != host.port;
+            moved.then(|| {
+                format!(
+                    "{} can use this computer's SSH agent: only the user can change where it connects, in Tern",
+                    old.name
+                )
+            })
+        }
+        _ => Some("Only the user can let a host use this computer's SSH agent, in Tern".into()),
     }
 }
 
@@ -454,6 +489,9 @@ impl Call {
                     (None, Some(destination), false) => {
                         let (target, key) = parse_command(&destination)
                             .map_err(|error| format!("destination: {error}"))?;
+                        if key.as_deref().is_some_and(crate::paths::network_path) {
+                            return Err("destination: a key file must be on this computer".into());
+                        }
                         To::Typed(target, key)
                     }
                     (None, None, true) => To::Local,
@@ -551,7 +589,7 @@ pub fn tools() -> Value {
             "enum": ["agent", "key", "password"],
             "description": "agent: the SSH agent, then the usual keys in ~/.ssh. key: the key file in key first. password: a password, asked for when connecting unless password saves one",
         },
-        "key": text("A private key file's path, for sign_in key"),
+        "key": text("A private key file's path on this computer, for sign_in key"),
         "password": text("A password, saved in the system's credential store (never in Tern's files); means sign_in password"),
         "identity": text("A saved identity's name, whose user and sign-in the host takes instead of its own; empty for none"),
         "jump": text("Another saved host's name, to connect through first; empty for none"),
@@ -561,7 +599,7 @@ pub fn tools() -> Value {
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables the shell starts with, which the server must accept" },
         "mac": text("Its MAC address, for Wake-on-LAN"),
         "keep_alive": flag("Keep idle connections up; on for a new host unless given"),
-        "agent_forwarding": flag("Let the host use this computer's SSH agent"),
+        "agent_forwarding": flag("Let the host use this computer's SSH agent; only the user can turn this on, or change where a host with it on connects"),
         "guarded": flag("Guard against stray input: pastes, snippets and agents' typing wait for the user's yes"),
         "keep_shell": flag("Keep the shell running in tmux or screen on the host, so a dropped session reattaches"),
     });
@@ -640,7 +678,7 @@ pub fn tools() -> Value {
         {
             "name": "send_input",
             "title": "Type into a session",
-            "description": "Types into a session as at its keyboard: text as it is (a newline is Enter), then each of keys pressed in turn (enter, tab, escape, backspace, delete, up, down, left, right, home, end, pageup, pagedown, space, f1 to f12, with ctrl+, alt+ or shift+ as in ctrl+c). While the session asks something before its shell starts, this answers it as the keyboard would: type a password or answer and end it with a newline; enter trusts an unknown host key and escape refuses it; enter reconnects an ended session. Then waits for the command to finish or the output to settle, and answers with what was printed since this agent last read the session. A guarded host's session holds the input until the user allows it in Tern.",
+            "description": "Types into a session as at its keyboard: text as it is (a newline is Enter), then each of keys pressed in turn (enter, tab, escape, backspace, delete, up, down, left, right, home, end, pageup, pagedown, space, f1 to f12, with ctrl+, alt+ or shift+ as in ctrl+c). While the session asks something before its shell starts, this answers it as the keyboard would: type a password or answer and end it with a newline; an unknown host key waits for the user to trust it in Tern, and escape refuses it; enter reconnects an ended session. Then waits for the command to finish or the output to settle, and answers with what was printed since this agent last read the session. A guarded host's session holds the input until the user allows it in Tern.",
             "inputSchema": object(json!({
                 "session": session,
                 "text": text("Text to type; a newline is Enter"),
@@ -1282,6 +1320,15 @@ mod tests {
                 .unwrap_err()
                 .starts_with("destination: ")
         );
+        // Windows would open a key file on another computer over the
+        // network, signing in there.
+        assert_eq!(
+            parse(
+                "open_session",
+                json!({ "destination": r"ssh -i \\files\keys\id me@example.com" })
+            ),
+            Err("destination: a key file must be on this computer".into())
+        );
     }
 
     fn vault() -> Vault {
@@ -1425,6 +1472,52 @@ mod tests {
         );
         assert_eq!(home_path("/etc/key"), PathBuf::from("/etc/key"));
         assert_eq!(home_path("~other/key"), PathBuf::from("~other/key"));
+        // A key on another computer would have Windows sign in there.
+        let mut draft = HostDraft::new("Hosts");
+        let fields = HostFields {
+            key: Some(r"\\files\keys\id".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fields.apply(&mut draft, &vault()),
+            Err("A key file must be on this computer".into())
+        );
+    }
+
+    #[test]
+    fn only_the_user_lets_a_host_use_the_agent() {
+        let plain = Host::new("db", "admin", "10.0.0.5", 22);
+        let forwarding = Host {
+            agent_forwarding: true,
+            ..plain.clone()
+        };
+        // Turning it on, for a new host or a saved one, is the user's.
+        assert!(refused_to_agents(None, &forwarding).is_some());
+        assert!(refused_to_agents(Some(&plain), &forwarding).is_some());
+        // So is changing where a host with it on connects.
+        for moved in [
+            Host {
+                address: "elsewhere.example.com".into(),
+                ..forwarding.clone()
+            },
+            Host {
+                port: 2222,
+                ..forwarding.clone()
+            },
+        ] {
+            let reason = refused_to_agents(Some(&forwarding), &moved).unwrap();
+            assert!(reason.starts_with("db can use this computer's SSH agent"));
+        }
+        // The rest of it, and turning it off, are an agent's to change.
+        let renamed = Host {
+            name: "database".into(),
+            user: "root".into(),
+            tags: vec!["prod".into()],
+            ..forwarding.clone()
+        };
+        assert_eq!(refused_to_agents(Some(&forwarding), &renamed), None);
+        assert_eq!(refused_to_agents(Some(&forwarding), &plain), None);
+        assert_eq!(refused_to_agents(None, &plain), None);
     }
 
     #[test]

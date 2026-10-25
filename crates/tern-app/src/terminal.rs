@@ -233,7 +233,10 @@ pub struct Activity {
 pub enum Stage {
     /// Connecting, or reconnecting.
     Connecting,
-    /// Asking to trust a key, for a password or the server's questions.
+    /// Waiting for the user to trust the server's key, which is theirs to
+    /// decide.
+    Waiting,
+    /// Asking for a password or the server's questions.
     Asking,
     Live,
     Ended,
@@ -1176,7 +1179,7 @@ impl TerminalView {
             Phase::Trust {
                 shown, fingerprint, ..
             } => format!(
-                "asking whether to trust the host key of {shown}, {fingerprint}: enter trusts it, escape refuses"
+                "asking the user whether to trust the host key of {shown}, {fingerprint}: they decide in Tern; escape refuses it"
             ),
             Phase::Password { rejected, .. } => {
                 let target = &self.connection.target;
@@ -1210,7 +1213,8 @@ impl TerminalView {
     pub fn stage(&self) -> Stage {
         match self.phase {
             Phase::Connecting => Stage::Connecting,
-            Phase::Trust { .. } | Phase::Password { .. } | Phase::Questions { .. } => Stage::Asking,
+            Phase::Trust { .. } => Stage::Waiting,
+            Phase::Password { .. } | Phase::Questions { .. } => Stage::Asking,
             Phase::Live => Stage::Live,
             Phase::Ended(_) => Stage::Ended,
         }
@@ -1290,6 +1294,9 @@ impl TerminalView {
                     typed.push_str(&key);
                     true
                 }
+                // Whether to trust a server is the user's to decide: an
+                // agent can only refuse.
+                Phase::Trust { .. } if key != "escape" => false,
                 _ => self.answer_key(&key, cx),
             };
             if !took {

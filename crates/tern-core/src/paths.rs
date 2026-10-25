@@ -125,6 +125,17 @@ pub fn system_program(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Whether `path` starts with two slashes, as `\\server\share\…` does:
+/// Windows opens such a path over the network (or as a device), signing in
+/// to the computer it names as the user. The long forms (`\\?\…`) count
+/// too; no file Tern is handed needs them.
+pub fn network_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    let mut start = text.chars();
+    let slash = |c: Option<char>| matches!(c, Some('/' | '\\'));
+    slash(start.next()) && slash(start.next())
+}
+
 /// Writes `bytes` to `path` through a temporary file renamed over the old
 /// one, so a crash mid-write never leaves half a file. Creates the folder.
 /// On Unix, files and folders made are the user's alone (0600 and 0700):
@@ -182,5 +193,27 @@ mod tests {
             assert_eq!(mode(&dir.join("inner")), 0o700);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tells_network_paths_from_files_here() {
+        for network in [
+            r"\\server\share\id_ed25519",
+            "//server/share/id_ed25519",
+            r"\/server\share",
+            r"\\?\UNC\server\share\key",
+            r"\\.\pipe\agent",
+        ] {
+            assert!(network_path(Path::new(network)), "{network}");
+        }
+        for here in [
+            r"C:\Users\me\.ssh\id_ed25519",
+            "/home/me/.ssh/id_ed25519",
+            r"\Users\me\key",
+            "~/.ssh/key",
+            "key",
+        ] {
+            assert!(!network_path(Path::new(here)), "{here}");
+        }
     }
 }
