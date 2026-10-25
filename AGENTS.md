@@ -157,6 +157,13 @@ at startup, for looking at it without clicking.
   `NoAction` in its `Terminal` key context (`terminal::bind_keys`). Tests
   that open a view as the window's own root never see `Root`'s bindings:
   a key test puts the view under a real `Root` (see `pane_in_root`).
+- **Nothing may read or update a view in the middle of its own update.**
+  GPUI panics ("cannot read … while it is already being updated"), and in
+  a window's message handler a panic can't unwind, so the app ends. An
+  observer (`observe_self` included) runs inside its entity's update:
+  work that reaches back into it, like the main window writing down a
+  moved-out window's tabs, goes in `cx.defer`. Checks start Tern with a
+  flag, which leaves tab-saving off, so test a plain start too.
 - **Open windows with `gpui_kit::open_window`**, not GPUI's own: it wraps
   the view in GPUI Kit's `Root`, which inputs and popovers rely on. A view
   made in one window keeps what it subscribed to there (`subscribe_in`, a
