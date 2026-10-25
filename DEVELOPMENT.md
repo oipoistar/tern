@@ -127,7 +127,10 @@ A self-hosted runner runs whatever a workflow says, on that machine, so
 pull requests from forks run CI on GitHub's own machines instead, and only
 once a maintainer approves them (the repository requires that for every
 outside contributor). A fork's pull request can change the workflow itself:
-read what it changes in `.github` before approving it.
+read what it changes in `.github` before approving it. For the same
+reason each action the workflows use is pinned to a commit, not a tag
+that can move: to update one, read what changed, then put its new
+commit in place.
 
 ## Release
 

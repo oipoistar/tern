@@ -22,6 +22,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Checks only read the repository.
+permissions:
+  contents: read
+
 # Steps run in bash everywhere: on Windows that's Git's, which needs neither
 # PowerShell 7 nor an execution policy that lets scripts run, as the
 # self-hosted runner's machine has neither.
@@ -47,11 +51,17 @@ jobs:
     # self-hosted runner, which runs whatever a workflow says.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'windows-latest' || matrix.runs-on }}
     timeout-minutes: 60
+    # Actions run on the project's own machine, so each is pinned to the
+    # commit its tag named when last checked: a tag moved later (or a
+    # branch, as rust-toolchain's `stable`) can't change what runs there.
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
 
       # GPUI links X11, xcb, xkbcommon, Wayland and fontconfig on Linux.
@@ -65,7 +75,7 @@ jobs:
             libwayland-dev libfontconfig-dev libfreetype-dev libvulkan1
 
       # A self-hosted runner keeps its build output from run to run.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: runner.environment == 'github-hosted'
 
       # Formatting doesn't differ by platform; once is enough.

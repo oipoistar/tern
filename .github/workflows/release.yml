@@ -25,8 +25,12 @@ jobs:
     # The project's own machine, as CI's Windows checks (see DEVELOPMENT.md).
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
+    # Pinned to commits, as in ci.yml: what runs on the project's machine,
+    # with a token that can publish, doesn't change by itself.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # The exe carries Cargo.toml's version; a tag that says otherwise is
       # a mistake.
@@ -38,9 +42,11 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: runner.environment == 'github-hosted'
 
       - name: Build
