@@ -9,15 +9,27 @@ const SCHEMES: [&str; 5] = ["https://", "http://", "file://", "ssh://", "mailto:
 
 /// Whether the link `url`, found in output, may be opened. A `file:` link
 /// opens only from a shell on this computer (`local`) and only to a path
-/// here: one naming another computer (`file://server/share`) would have
-/// Windows hand that computer this account's credentials, and from a host
-/// one could point at a program to run.
+/// here: one naming another computer (`file://server/share`, or with its
+/// slashes escaped as `%2F` or `%5C`) would have Windows hand that computer
+/// this account's credentials, and from a host one could point at a program
+/// to run. An `ssh:` link whose user or host starts with `-` would read as
+/// an option to whatever program opens it, as `-oProxyCommand=…` runs a
+/// command.
 pub fn may_open(url: &str, local: bool) -> bool {
     let lower = url.to_ascii_lowercase();
-    match lower.strip_prefix("file://") {
-        Some(path) => local && path.starts_with('/') && !path.starts_with("//"),
-        None => true,
+    if let Some(path) = lower.strip_prefix("file://") {
+        return local
+            && path.starts_with('/')
+            && !path.starts_with("//")
+            && !path.contains("%2f")
+            && !path.contains("%5c");
     }
+    if let Some(rest) = lower.strip_prefix("ssh://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let (user, host) = authority.rsplit_once('@').unwrap_or(("", authority));
+        return !user.starts_with('-') && !host.starts_with('-');
+    }
+    true
 }
 
 /// The byte ranges of the links in `text`, in order.
@@ -95,6 +107,17 @@ mod tests {
         assert!(may_open("file:///home/me/report.html", true));
         assert!(!may_open("file://attacker.example/share/x", true));
         assert!(!may_open("FILE:////attacker.example/share/x", true));
+        // Another computer's share, its slashes escaped.
+        assert!(!may_open(
+            "file:///%5C%5Cattacker.example%5Cshare%5Cx.exe",
+            true
+        ));
+        assert!(!may_open("file:///%2f%2fattacker.example/share/x", true));
+        assert!(may_open("file:///home/me/My%20report.html", true));
+        // An ssh link that would read as an option.
+        assert!(may_open("ssh://git@host:22/repo.git", false));
+        assert!(!may_open("ssh://-oProxyCommand=calc/x", false));
+        assert!(!may_open("ssh://me@-oProxyCommand=calc", false));
     }
 
     #[test]
