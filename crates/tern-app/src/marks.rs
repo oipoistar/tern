@@ -27,10 +27,12 @@ const STEADY_MS: f32 = 10.;
 const TRACE_PAD: f32 = 3.;
 
 /// Host-key art: the drunken-bishop field as dots, with a ring where the
-/// bishop stopped. Without a known key the field is empty, so an untrusted
-/// host reads as blank rather than as a different host.
+/// bishop stopped, bent to follow its tile's corners, which are rounded by
+/// `radius`. Without a known key the field is empty, so an untrusted host
+/// reads as blank rather than as a different host.
 pub fn paint_art(
     bounds: Bounds<Pixels>,
+    radius: f32,
     art: Option<&Randomart>,
     ink: Hsla,
     faint: Hsla,
@@ -38,9 +40,17 @@ pub fn paint_art(
 ) {
     let width = bounds.size.width.as_f32();
     let pad = width * ART_PAD;
-    let pitch = (width - 2. * pad) / (SIZE - 1) as f32;
-    let scale = (pitch / ART_PITCH).min(1.);
-    let at = |x: usize, y: usize| offset(bounds, pad + x as f32 * pitch, pad + y as f32 * pitch);
+    let half = width / 2. - pad;
+    let pitch = half / (SIZE / 2) as f32;
+    // The field's corners keep the pad from the tile's.
+    let rounding = ((radius - pad) / half).clamp(0., 1.);
+    // Bent, the outer dots sit closer together.
+    let spacing = 1. - (1. - std::f32::consts::FRAC_1_SQRT_2) * rounding;
+    let scale = (pitch * spacing / ART_PITCH).min(1.);
+    let at = |x: usize, y: usize| {
+        let (dx, dy) = field_point(x, y, rounding);
+        offset(bounds, width / 2. + dx * pitch, width / 2. + dy * pitch)
+    };
     for y in 0..SIZE {
         for x in 0..SIZE {
             let visits = art.map_or(0, |art| art.visits(x, y)) as usize;
@@ -52,6 +62,20 @@ pub fn paint_art(
         let (x, y) = art.end();
         ring(at(x, y), 3.2 * scale, ink, window);
     }
+}
+
+/// Where the field's square (`x`, `y`) goes, from the field's centre in
+/// pitches: the square field bent towards a disc by `rounding` (0 keeps
+/// the square, 1 makes a disc), so its corners sit where corners rounded
+/// by that share of its half-width would, and its rows and columns bend
+/// smoothly rather than break.
+fn field_point(x: usize, y: usize, rounding: f32) -> (f32, f32) {
+    let middle = (SIZE / 2) as f32;
+    let (u, v) = (x as f32 / middle - 1., y as f32 / middle - 1.);
+    // The elliptical grid mapping, which takes the square onto a disc.
+    let disc = (u * (1. - v * v / 2.).sqrt(), v * (1. - u * u / 2.).sqrt());
+    let bent = |square: f32, disc: f32| middle * (square + rounding * (disc - square));
+    (bent(u, disc.0), bent(v, disc.1))
 }
 
 /// What a latency trace shows: a host's status and its recent checks.
@@ -263,7 +287,45 @@ pub fn ring(center: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window
 
 #[cfg(test)]
 mod tests {
-    use super::{SAMPLE_PITCH, TRACE_PAD, sample_points};
+    use super::{SAMPLE_PITCH, SIZE, TRACE_PAD, field_point, sample_points};
+
+    #[test]
+    fn the_art_follows_its_tiles_corners() {
+        let close =
+            |(x, y): (f32, f32), (a, b): (f32, f32)| (x - a).abs() < 1e-4 && (y - b).abs() < 1e-4;
+        let last = SIZE - 1;
+        // Square corners keep the square field.
+        for (x, y) in [(0, 0), (3, last), (last, 7), (5, 5)] {
+            let square = (x as f32 - 5., y as f32 - 5.);
+            assert!(close(field_point(x, y, 0.), square), "{x},{y}");
+        }
+        // Rounded ones pull the field's corners onto the arc of corners
+        // rounded as much, and leave the middles of its sides and its
+        // centre where they were.
+        let rounding = 0.4;
+        let corner = field_point(last, last, rounding);
+        let at_45 = 5. * (1. - rounding) + 5. * rounding * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(close(corner, (at_45, at_45)), "{corner:?}");
+        assert!(close(field_point(0, 0, rounding), (-at_45, -at_45)));
+        assert!(close(field_point(last, 5, rounding), (5., 0.)));
+        assert!(close(field_point(5, 0, rounding), (0., -5.)));
+        assert!(close(field_point(5, 5, rounding), (0., 0.)));
+        // Neighbours stay about a pitch apart: a little closer, never
+        // further, and never crowded.
+        let least = 1. - (1. - std::f32::consts::FRAC_1_SQRT_2) * rounding;
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let here = field_point(x, y, rounding);
+                for (nx, ny) in [(x + 1, y), (x, y + 1)] {
+                    if nx < SIZE && ny < SIZE {
+                        let there = field_point(nx, ny, rounding);
+                        let step = (here.0 - there.0).hypot(here.1 - there.1);
+                        assert!(step > least - 0.02 && step < 1.001, "{x},{y}: {step}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn samples_run_up_to_now_at_the_right_edge() {

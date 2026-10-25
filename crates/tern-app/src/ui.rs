@@ -83,8 +83,9 @@ pub fn art_tile(art: Option<Randomart>, size: f32, radius: f32, theme: &Theme) -
         .child(
             canvas(
                 |_, _, _| (),
+                // Inside the hairline, whose inner corners are a pixel tighter.
                 move |bounds, _, window, _| {
-                    marks::paint_art(bounds, art.as_ref(), ink, faint, window)
+                    marks::paint_art(bounds, radius - 1., art.as_ref(), ink, faint, window)
                 },
             )
             .size_full(),
