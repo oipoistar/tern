@@ -1041,6 +1041,63 @@ impl client::Handler for Verifier {
         crate::agent::serve(self.agent_forwarding, channel, reply);
         Ok(())
     }
+
+    // Channels Tern never offers a server (X11, a session, connections or
+    // sockets out of this computer) are refused, by dropping `reply`:
+    // russh would take them.
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _: russh::Channel<client::Msg>,
+        _: &str,
+        _: u32,
+        _: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _: russh::Channel<client::Msg>,
+        _: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _: russh::Channel<client::Msg>,
+        _: &str,
+        _: u32,
+        _: &str,
+        _: u32,
+        _: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _: russh::Channel<client::Msg>,
+        _: &str,
+        _: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _: russh::Channel<client::Msg>,
+        _: &str,
+        _: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Whether a key of type `known` shows as `algorithm`: RSA keys sign with

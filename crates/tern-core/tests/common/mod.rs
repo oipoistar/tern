@@ -35,6 +35,9 @@ pub struct TestServer {
     /// it went in the shell's output.
     probe_agent: bool,
     agent_offered: bool,
+    /// Open channels of every other kind back to the client on every
+    /// shell, none of them asked for, and say which it took.
+    probe_channels: bool,
     /// Accepts user certificates this authority signed.
     user_ca: Option<PublicKey>,
     /// Variables the client asked for, said in the shell's first output.
@@ -54,6 +57,7 @@ impl Clone for TestServer {
             channels: HashMap::new(),
             probe_agent: self.probe_agent,
             agent_offered: false,
+            probe_channels: self.probe_channels,
             user_ca: self.user_ca.clone(),
             env: Vec::new(),
             otp: self.otp.clone(),
@@ -269,6 +273,51 @@ impl russh::server::Handler for TestServer {
                 let _ = handle.data(channel, said.as_bytes().to_vec()).await;
             });
         }
+        if self.probe_channels {
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let took = |opened: Result<Channel<Msg>, russh::Error>| match opened {
+                    Ok(_) => "opened",
+                    Err(_) => "refused",
+                };
+                let said = [
+                    (
+                        "x11",
+                        took(handle.channel_open_x11("127.0.0.1", 6010).await),
+                    ),
+                    ("session", took(handle.channel_open_session().await)),
+                    (
+                        "tcpip",
+                        took(
+                            handle
+                                .channel_open_direct_tcpip("127.0.0.1", 22, "127.0.0.1", 5000)
+                                .await,
+                        ),
+                    ),
+                    (
+                        "forwarded-tcpip",
+                        took(
+                            handle
+                                .channel_open_forwarded_tcpip("127.0.0.1", 8080, "127.0.0.1", 5000)
+                                .await,
+                        ),
+                    ),
+                    (
+                        "socket",
+                        took(handle.channel_open_direct_streamlocal("/tmp/s").await),
+                    ),
+                    (
+                        "forwarded-socket",
+                        took(handle.channel_open_forwarded_streamlocal("/tmp/s").await),
+                    ),
+                ]
+                .map(|(kind, how)| format!("{kind}:{how}"))
+                .join(" ");
+                let _ = handle
+                    .data(channel, format!("{said}\r\n").into_bytes())
+                    .await;
+            });
+        }
         self.shells.push(channel);
         session.channel_success(channel)?;
         for (name, value) in &self.env {
@@ -404,6 +453,8 @@ pub async fn start_server_with_sftp(
 pub struct Setup {
     pub sftp_root: Option<PathBuf>,
     pub probe_agent: bool,
+    /// Try opening every other kind of channel back to the client.
+    pub probe_channels: bool,
     /// A host certificate, presented to clients that ask for one.
     pub certificate: Option<Certificate>,
     /// Sign-in with user certificates this authority signed.
@@ -420,6 +471,7 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
     let Setup {
         sftp_root,
         probe_agent,
+        probe_channels,
         certificate,
         user_ca,
         otp,
@@ -449,6 +501,7 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
             channels: HashMap::new(),
             probe_agent,
             agent_offered: false,
+            probe_channels,
             user_ca,
             env: Vec::new(),
             otp,
