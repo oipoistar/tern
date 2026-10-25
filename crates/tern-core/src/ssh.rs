@@ -915,11 +915,23 @@ async fn open(
     remote: RemoteTargets,
     agent_forwarding: bool,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
-    let authorities = certs::authorities(&known_hosts_files(), &target.host, target.port);
+    let files = known_hosts_files();
+    let authorities = certs::authorities(&files, &target.host, target.port);
     let mut config = client::Config {
         keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
         ..Default::default()
     };
+    // The key types already known for the host first, as OpenSSH asks: a
+    // server that still has its known key shows that one, so any other key
+    // is a change (see `known_hosts::verdict`).
+    let known = crate::known_hosts::known_types(&files, &target.host, target.port);
+    let (first, rest): (Vec<Algorithm>, Vec<Algorithm>) = config
+        .preferred
+        .key
+        .iter()
+        .cloned()
+        .partition(|algorithm| known.iter().any(|known| same_type(known, algorithm)));
+    config.preferred.key = [first, rest].concat().into();
     if !authorities.is_empty() {
         config.preferred.host_key_certificates = config.preferred.key.clone();
     }
@@ -1031,20 +1043,41 @@ impl client::Handler for Verifier {
     }
 }
 
+/// Whether a key of type `known` shows as `algorithm`: RSA keys sign with
+/// any of RSA's hashes.
+fn same_type(known: &Algorithm, algorithm: &Algorithm) -> bool {
+    matches!(
+        (known, algorithm),
+        (Algorithm::Rsa { .. }, Algorithm::Rsa { .. })
+    ) || known == algorithm
+}
+
 /// A host certificate is good when an authority known_hosts names for the
-/// host vouches for it. Otherwise, as OpenSSH does, the key inside counts
-/// as a plain host key, already trusted or not; it isn't offered for trust,
-/// because a host that has an authority shouldn't need it.
+/// host vouches for it, and neither that authority nor the key is
+/// `@revoked`. Otherwise, as OpenSSH does, the key inside counts as a plain
+/// host key, already trusted or not; it isn't offered for trust, because a
+/// host that has an authority shouldn't need it.
 fn check_host_certificate(
     host: &str,
     port: u16,
     cert: &russh::keys::Certificate,
     authorities: &[PublicKey],
 ) -> Result<(), ConnectError> {
+    let key = PublicKey::from(cert.public_key().clone());
+    let authority = PublicKey::from(cert.signature_key().clone());
+    for revoked in [&key, &authority] {
+        if let Some((file, line)) =
+            crate::known_hosts::revoked(&known_hosts_files(), host, port, revoked)
+        {
+            return Err(other(format!(
+                "the host certificate is revoked by {}:{line}",
+                file.display()
+            )));
+        }
+    }
     let Err(reason) = certs::check_host(cert, host, authorities, certs::now()) else {
         return Ok(());
     };
-    let key = PublicKey::from(cert.public_key().clone());
     match check_host_key(host, port, &key, None) {
         Err(ConnectError::UnknownHostKey { .. }) => {
             Err(other(format!("the host certificate {reason}")))
@@ -1060,42 +1093,40 @@ pub fn check_host_key(
     key: &PublicKey,
     trust: Option<&PublicKey>,
 ) -> Result<(), ConnectError> {
-    for file in &known_hosts_files() {
-        match known_hosts::check_known_hosts_path(host, port, key, file) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(russh::keys::Error::KeyChanged { line }) => {
-                return Err(ConnectError::HostKeyChanged {
-                    fingerprint: fingerprint(key),
-                    file: file.clone(),
-                    line,
-                });
+    use crate::known_hosts::{Verdict, learn, verdict};
+    match verdict(&known_hosts_files(), host, port, key).map_err(other)? {
+        Verdict::Trusted => Ok(()),
+        Verdict::Changed { file, line } => Err(ConnectError::HostKeyChanged {
+            fingerprint: fingerprint(key),
+            file,
+            line,
+        }),
+        Verdict::Revoked { file, line } => Err(other(format!(
+            "the host key {} is revoked by {}:{line}",
+            fingerprint(key),
+            file.display()
+        ))),
+        Verdict::Unknown if trust == Some(key) => {
+            let file = paths::trusted_known_hosts();
+            let saved = |error: &dyn std::fmt::Display| {
+                other(format!(
+                    "can't save the host key to {}: {error}",
+                    file.display()
+                ))
+            };
+            // A missing ~/.ssh is made the user's alone, as OpenSSH makes it.
+            if let Some(dir) = file.parent() {
+                paths::private_dir(dir).map_err(|error| saved(&error))?;
             }
-            Err(error) => return Err(other(format!("can't read {}: {error}", file.display()))),
+            learn(&file, host, port, key).map_err(|error| saved(&error))
         }
+        Verdict::Unknown => Err(ConnectError::UnknownHostKey {
+            host: host.into(),
+            port,
+            key: Box::new(key.clone()),
+            fingerprint: fingerprint(key),
+        }),
     }
-    if trust == Some(key) {
-        let file = paths::trusted_known_hosts();
-        let saved = |error: &dyn std::fmt::Display| {
-            other(format!(
-                "can't save the host key to {}: {error}",
-                file.display()
-            ))
-        };
-        // A missing ~/.ssh is made the user's alone, as OpenSSH makes it.
-        if let Some(dir) = file.parent() {
-            paths::private_dir(dir).map_err(|error| saved(&error))?;
-        }
-        known_hosts::learn_known_hosts_path(host, port, key, &file)
-            .map_err(|error| saved(&error))?;
-        return Ok(());
-    }
-    Err(ConnectError::UnknownHostKey {
-        host: host.into(),
-        port,
-        key: Box::new(key.clone()),
-        fingerprint: fingerprint(key),
-    })
 }
 
 /// The OpenSSH user's file, then Tern's own.

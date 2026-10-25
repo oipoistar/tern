@@ -411,6 +411,8 @@ pub struct Setup {
     /// Sign-in by questions only (no plain passwords): the password, then
     /// this one-time code.
     pub otp: Option<String>,
+    /// Host keys of other types beside the first, as most servers have.
+    pub more_keys: Vec<PrivateKey>,
 }
 
 /// Like [`start_server`], doing what `setup` adds.
@@ -421,6 +423,7 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
         certificate,
         user_ca,
         otp,
+        more_keys,
     } = setup;
     let methods = if otp.is_some() {
         use russh::MethodKind;
@@ -430,7 +433,7 @@ pub async fn start_server_with(host_key: PrivateKey, client_key: PublicKey, setu
     };
     let config = Arc::new(russh::server::Config {
         methods,
-        keys: vec![host_key],
+        keys: std::iter::once(host_key).chain(more_keys).collect(),
         certificates: certificate.into_iter().collect(),
         auth_rejection_time: Duration::from_millis(10),
         auth_rejection_time_initial: Some(Duration::ZERO),

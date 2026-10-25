@@ -26,37 +26,11 @@ fn authorities_in(text: &str, host: &str, port: u16) -> Vec<PublicKey> {
                 .split_whitespace();
             let patterns = fields.next()?;
             let key = format!("{} {}", fields.next()?, fields.next()?);
-            matches_patterns(patterns, host, port)
+            crate::known_hosts::takes(patterns, host, port)
                 .then(|| PublicKey::from_openssh(&key).ok())
                 .flatten()
         })
         .collect()
-}
-
-/// Whether OpenSSH's comma-separated host `patterns` take `host:port`:
-/// `*` and `?` wildcards, `[host]:port` for ports other than 22, and `!`
-/// to exclude. Hashed names (`|1|…`) never match here.
-fn matches_patterns(patterns: &str, host: &str, port: u16) -> bool {
-    let host = host.to_lowercase();
-    let name = if port == 22 {
-        host
-    } else {
-        format!("[{host}]:{port}")
-    };
-    let mut matched = false;
-    for pattern in patterns.split(',') {
-        let (excluded, pattern) = match pattern.strip_prefix('!') {
-            Some(pattern) => (true, pattern),
-            None => (false, pattern),
-        };
-        if wildcard(&pattern.to_lowercase(), &name) {
-            if excluded {
-                return false;
-            }
-            matched = true;
-        }
-    }
-    matched
 }
 
 /// Glob matching with `*` (any run) and `?` (any one character).
@@ -168,26 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn host_patterns_work_as_in_openssh() {
-        assert!(matches_patterns("*.example.com", "db.example.com", 22));
-        assert!(matches_patterns("db.EXAMPLE.com", "DB.example.com", 22));
-        assert!(matches_patterns("a,b,c?", "c1", 22));
-        assert!(!matches_patterns(
-            "*.example.com,!db.example.com",
-            "db.example.com",
-            22
-        ));
-        assert!(!matches_patterns("*.example.com", "example.org", 22));
-        // Other ports go by `[host]:port`.
-        assert!(!matches_patterns("*.example.com", "db.example.com", 2222));
-        assert!(matches_patterns(
-            "[*.example.com]:2222",
-            "db.example.com",
-            2222
-        ));
-        assert!(matches_patterns("*", "db.example.com", 2222));
+    fn wildcards_match_runs_and_single_characters() {
         assert!(wildcard("a*b*c", "aXbYbZc"));
         assert!(!wildcard("a*b", "aXbYc"));
+        assert!(wildcard("c?", "c1") && !wildcard("c?", "c12"));
     }
 
     #[test]
