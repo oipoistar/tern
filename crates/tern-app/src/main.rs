@@ -31,6 +31,8 @@ mod workspace;
 use gpui_kit::*;
 
 fn main() {
+    #[cfg(windows)]
+    load_libraries_from_system32();
     // `tern --mcp`: the MCP server an agent starts, speaking MCP on standard
     // input and output and handing tool calls to the Tern running here. No
     // window, and nothing else on standard output.
@@ -82,6 +84,22 @@ fn main() {
                 cx.activate(true);
             }
         });
+}
+
+/// Libraries load from System32 only, never from Tern's own folder: a
+/// Downloads folder, perhaps, where a file named like one could be waiting
+/// (portable-pty would load a `conpty.dll` there into every local
+/// terminal). The ones tern.exe imports are looked for there too
+/// (`/DEPENDENTLOADFLAG`, in build.rs).
+#[cfg(windows)]
+fn load_libraries_from_system32() {
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
 }
 
 /// Started from a console (`--bench` prints its results there), the

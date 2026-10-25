@@ -121,7 +121,7 @@ fn shell(command: &str) -> Command {
     use std::os::windows::process::CommandExt as _;
     // No console window flashing up behind the app.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut shell = Command::new("cmd");
+    let mut shell = Command::new(crate::paths::system_program("cmd.exe"));
     shell
         .arg("/C")
         .raw_arg(command)

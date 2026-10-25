@@ -113,6 +113,18 @@ pub fn system_known_hosts() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".ssh").join("known_hosts"))
 }
 
+/// A program that comes with Windows, by its full path in System32 (`name`
+/// may start with a folder there). Run by its name alone, a program is
+/// looked for first in the folder of the program starting it: Tern's own,
+/// perhaps a Downloads folder, where a file of that name could be waiting.
+pub fn system_program(name: &str) -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+        .join("System32")
+        .join(name)
+}
+
 /// Writes `bytes` to `path` through a temporary file renamed over the old
 /// one, so a crash mid-write never leaves half a file. Creates the folder.
 /// On Unix, files and folders made are the user's alone (0600 and 0700):

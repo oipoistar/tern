@@ -408,7 +408,7 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let user = std::env::var("USERNAME").map_err(std::io::Error::other)?;
-        let status = std::process::Command::new("icacls")
+        let status = std::process::Command::new(paths::system_program("icacls.exe"))
             .arg(path)
             .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
             .stdout(std::process::Stdio::null())

@@ -161,6 +161,12 @@ at startup, for looking at it without clicking.
   the view in GPUI Kit's `Root`, which inputs and popovers rely on. A view
   made in one window keeps what it subscribed to there (`subscribe_in`, a
   find bar's field), so a pane moving windows drops those first.
+- **Windows looks in tern.exe's own folder first**, for programs run by
+  name alone and for libraries, and tern.exe is often run from Downloads,
+  where a file of the same name could be waiting. Run Windows' own
+  programs by full path (`paths::system_program`); tern.exe loads
+  libraries from System32 only (`/DEPENDENTLOADFLAG` in build.rs,
+  `SetDefaultDllDirectories` first thing in `main`).
 - **Tern has no console of its own on Windows** (`windows_subsystem`, in
   every build but tests), so starting it opens no console window. Started
   from a terminal it attaches to that one (`attach_console` in `main.rs`),

@@ -15,16 +15,12 @@ use crate::ssh::{ConnectError, Event, Input, TermSize};
 /// arrive, where something else can hold the terminal open.
 const DRAIN: Duration = Duration::from_millis(250);
 
-/// The shell a local terminal runs: PowerShell 7 when it's installed, else
-/// Windows PowerShell; elsewhere `$SHELL`, else `/bin/sh`.
+/// The shell a local terminal runs, as its name shows: PowerShell 7 when
+/// it's installed, else Windows PowerShell; elsewhere `$SHELL`, else
+/// `/bin/sh`.
 pub fn default_shell() -> String {
     if cfg!(windows) {
-        let on_path = |program: &str| {
-            std::env::var_os("PATH").is_some_and(|path| {
-                std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-            })
-        };
-        if on_path("pwsh.exe") {
+        if pwsh().is_some() {
             "pwsh.exe".into()
         } else {
             "powershell.exe".into()
@@ -35,6 +31,30 @@ pub fn default_shell() -> String {
             .filter(|shell| !shell.is_empty())
             .unwrap_or_else(|| "/bin/sh".into())
     }
+}
+
+/// Where [`default_shell`] is. On Windows that's a full path: a program
+/// named alone is looked for in Tern's own folder first, where a download
+/// could have put one of that name.
+fn shell_program() -> String {
+    if cfg!(windows) {
+        pwsh()
+            .unwrap_or_else(|| {
+                crate::paths::system_program(r"WindowsPowerShell\v1.0\powershell.exe")
+            })
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        default_shell()
+    }
+}
+
+/// PowerShell 7 in a folder of the `PATH`, if it's installed.
+fn pwsh() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|program| program.is_absolute() && program.is_file())
 }
 
 /// The program a terminal title names, when the title is only that
@@ -72,7 +92,7 @@ pub(crate) fn run(
         Err(error) => return failed(format!("can't open a terminal: {error}")),
     };
     let shell = default_shell();
-    let mut command = CommandBuilder::new(&shell);
+    let mut command = CommandBuilder::new(shell_program());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     if let Some(home) = std::env::home_dir() {

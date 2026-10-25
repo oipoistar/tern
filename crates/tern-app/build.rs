@@ -1,5 +1,6 @@
 //! On Windows, gives tern.exe Tern's icon (resource 1, which GPUI also puts
-//! on the window and the taskbar) and the name Task Manager shows.
+//! on the window and the taskbar) and the name Task Manager shows, and has
+//! it find the libraries it imports in System32 only.
 
 use std::path::PathBuf;
 
@@ -9,6 +10,13 @@ fn main() {
         return;
     }
     let var = |name: &str| std::env::var(name).expect("set by cargo");
+    // Windows looks for a program's libraries in its own folder first, so
+    // tern.exe run from Downloads would load a `dwmapi.dll` or `d3d11.dll`
+    // waiting there. 0x800 is LOAD_LIBRARY_SEARCH_SYSTEM32; `main` does the
+    // same for libraries loaded later.
+    if var("CARGO_CFG_TARGET_ENV") == "msvc" {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    }
     let icon = PathBuf::from(var("CARGO_MANIFEST_DIR"))
         .join("resources")
         .join("tern.ico");
