@@ -151,7 +151,7 @@ pub(crate) struct Forwarder<H: client::Handler> {
     handle: Arc<client::Handle<H>>,
     remote: RemoteTargets,
     running: HashMap<ForwardId, Running>,
-    events: mpsc::UnboundedSender<Event>,
+    events: mpsc::Sender<Event>,
 }
 
 enum Running {
@@ -165,7 +165,7 @@ impl<H: client::Handler + 'static> Forwarder<H> {
     pub(crate) fn new(
         handle: Arc<client::Handle<H>>,
         remote: RemoteTargets,
-        events: mpsc::UnboundedSender<Event>,
+        events: mpsc::Sender<Event>,
     ) -> Self {
         Self {
             handle,
@@ -186,7 +186,7 @@ impl<H: client::Handler + 'static> Forwarder<H> {
             self.stop(&forward.id()).await;
             ForwardState::Stopped
         };
-        let _ = self.events.send(Event::Forwarding { forward, state });
+        let _ = self.events.send(Event::Forwarding { forward, state }).await;
     }
 
     async fn start(&mut self, forward: &Forward) -> Result<(), String> {

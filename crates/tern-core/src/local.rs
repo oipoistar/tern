@@ -82,10 +82,10 @@ fn pty_size(size: TermSize) -> PtySize {
 pub(crate) fn run(
     size: TermSize,
     mut input: mpsc::UnboundedReceiver<Input>,
-    events: mpsc::UnboundedSender<Event>,
+    events: mpsc::Sender<Event>,
 ) {
     let failed = |message: String| {
-        let _ = events.send(Event::Failed(ConnectError::Other(message)));
+        let _ = events.blocking_send(Event::Failed(ConnectError::Other(message)));
     };
     let pair = match native_pty_system().openpty(pty_size(size)) {
         Ok(pair) => pair,
@@ -113,7 +113,7 @@ pub(crate) fn run(
     };
     let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
         Arc::new(Mutex::new(Some(pair.master)));
-    let _ = events.send(Event::Connected);
+    let _ = events.blocking_send(Event::Connected);
 
     // Output goes out through this until the session closes, and never
     // after: a job the shell left running may still be writing.
@@ -126,9 +126,13 @@ pub(crate) fn run(
             let _pumping = pumping;
             let mut buffer = [0u8; 8192];
             while let Ok(read) = reader.read(&mut buffer) {
+                // Waits while the pane has enough to show, and the shell
+                // with it.
                 let sent = read > 0
                     && output.lock().unwrap().as_ref().is_some_and(|events| {
-                        events.send(Event::Output(buffer[..read].to_vec())).is_ok()
+                        events
+                            .blocking_send(Event::Output(buffer[..read].to_vec()))
+                            .is_ok()
                     });
                 if !sent {
                     break;
@@ -163,7 +167,7 @@ pub(crate) fn run(
                     }
                 }
                 Input::Forward(forward, _) => {
-                    let _ = replies.send(Event::Forwarding {
+                    let _ = replies.blocking_send(Event::Forwarding {
                         forward,
                         state: ForwardState::Failed("not on a local terminal".into()),
                     });
@@ -200,7 +204,7 @@ pub(crate) fn run(
         let _ = pumped.recv_timeout(DRAIN);
     }
     output.lock().unwrap().take();
-    let _ = events.send(Event::Closed { exit_status });
+    let _ = events.blocking_send(Event::Closed { exit_status });
 }
 
 #[cfg(test)]

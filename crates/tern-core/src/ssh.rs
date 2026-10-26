@@ -445,13 +445,18 @@ impl Inbox {
 /// Lets sign-in ask the user what the server asks.
 struct Asker<'a> {
     inbox: &'a mut Inbox,
-    events: &'a mpsc::UnboundedSender<Event>,
+    events: &'a mpsc::Sender<Event>,
 }
+
+/// Events waiting to be read, at most. Output past that waits in the
+/// connection, which stops reading until the reader catches up: a host
+/// printing faster than a pane can show it can't fill memory.
+const EVENTS_AT_MOST: usize = 256;
 
 /// A running (or starting) session. Dropping it closes the connection.
 pub struct Session {
     input: SessionInput,
-    events: mpsc::UnboundedReceiver<Event>,
+    events: mpsc::Receiver<Event>,
 }
 
 /// The sending side of a session, for UIs that read events elsewhere. The
@@ -514,7 +519,7 @@ impl SessionInput {
 }
 
 /// Events from a session, readable from any async executor.
-pub struct SessionEvents(mpsc::UnboundedReceiver<Event>);
+pub struct SessionEvents(mpsc::Receiver<Event>);
 
 impl SessionEvents {
     pub async fn next(&mut self) -> Option<Event> {
@@ -527,10 +532,10 @@ impl Session {
     /// arrives through [`Session::next_event`].
     pub fn open(request: ConnectRequest) -> Self {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENTS_AT_MOST);
         runtime().spawn(async move {
             if let Err(error) = run(request, input_rx, &event_tx).await {
-                let _ = event_tx.send(Event::Failed(error));
+                let _ = event_tx.send(Event::Failed(error)).await;
             }
         });
         Self {
@@ -543,7 +548,7 @@ impl Session {
     /// events and input are an SSH session's.
     pub fn local(size: TermSize) -> Self {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENTS_AT_MOST);
         std::thread::Builder::new()
             .name("tern-local-shell".into())
             .spawn(move || crate::local::run(size, input_rx, event_tx))
@@ -612,7 +617,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 async fn run(
     request: ConnectRequest,
     input: mpsc::UnboundedReceiver<Input>,
-    events: &mpsc::UnboundedSender<Event>,
+    events: &mpsc::Sender<Event>,
 ) -> Result<(), ConnectError> {
     let mut inbox = Inbox {
         input,
@@ -697,7 +702,7 @@ async fn run(
         events,
     };
     authenticate(&mut handle, &target, &credentials, &mut asker, false).await?;
-    let _ = events.send(Event::Connected);
+    let _ = events.send(Event::Connected).await;
     let handle = Arc::new(handle);
     let mut forwarder = Forwarder::new(handle.clone(), remote, events.clone());
     for forward in forwards {
@@ -772,7 +777,8 @@ async fn run(
         tokio::select! {
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    let _ = events.send(Event::Output(data.to_vec()));
+                    // Waits while the reader has enough to show.
+                    let _ = events.send(Event::Output(data.to_vec())).await;
                 }
                 Some(ChannelMsg::ExitStatus { exit_status: status }) => {
                     exit_status = Some(status);
@@ -883,7 +889,7 @@ async fn finish(
     via: &[client::Handle<Verifier>],
     lost: bool,
     exit_status: Option<u32>,
-    events: &mpsc::UnboundedSender<Event>,
+    events: &mpsc::Sender<Event>,
 ) -> Result<(), ConnectError> {
     forwarder.stop_all();
     let _ = handle
@@ -894,11 +900,13 @@ async fn finish(
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
-    let _ = events.send(if lost && exit_status.is_none() {
-        Event::Lost
-    } else {
-        Event::Closed { exit_status }
-    });
+    let _ = events
+        .send(if lost && exit_status.is_none() {
+            Event::Lost
+        } else {
+            Event::Closed { exit_status }
+        })
+        .await;
     Ok(())
 }
 
@@ -1467,11 +1475,14 @@ async fn interactive(
             .map(|(prompt, _)| (prompt.prompt.trim().to_string(), prompt.echo))
             .collect();
         if !questions.is_empty() {
-            let _ = asker.events.send(Event::Prompts(Prompts {
-                from: format!("{}@{}", target.user, target.host),
-                instructions: instructions.trim().to_string(),
-                questions,
-            }));
+            let _ = asker
+                .events
+                .send(Event::Prompts(Prompts {
+                    from: format!("{}@{}", target.user, target.host),
+                    instructions: instructions.trim().to_string(),
+                    questions,
+                }))
+                .await;
             let Some(given) = asker.inbox.answers().await else {
                 return Ok(false);
             };
@@ -1595,11 +1606,15 @@ impl Unlock<'_, '_> {
             if self.key.is_some() {
                 break;
             }
-            let _ = self.asker.events.send(Event::Prompts(Prompts {
-                from: format!("{}@{}", self.target.user, self.target.host),
-                instructions: String::new(),
-                questions: vec![(format!("Passphrase for {name}:"), false)],
-            }));
+            let _ = self
+                .asker
+                .events
+                .send(Event::Prompts(Prompts {
+                    from: format!("{}@{}", self.target.user, self.target.host),
+                    instructions: String::new(),
+                    questions: vec![(format!("Passphrase for {name}:"), false)],
+                }))
+                .await;
             let Some(answers) = self.asker.inbox.answers().await else {
                 bail!("signing in was stopped");
             };
