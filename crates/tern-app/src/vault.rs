@@ -202,6 +202,15 @@ impl Section {
 
 impl EventEmitter<VaultEvent> for VaultContent {}
 
+/// Where reachability checks go, as the last look for due checks worked
+/// out ([`VaultContent::places`]).
+struct Places {
+    waited: bool,
+    all: Vec<Place>,
+    wanted: Vec<Place>,
+    proxies: HashMap<Place, Option<tern_core::proxy::Proxy>>,
+}
+
 /// How the hosts screen lays hosts out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layout {
@@ -297,8 +306,10 @@ pub struct VaultContent {
     /// those of hosts a command waits for: a check that ends starts the
     /// next due the same way, without waiting for the next look.
     checking: Option<bool>,
-    /// That look, soon after a check ends.
+    /// That look, soon after a check ends, and where the last look found
+    /// the places to check.
     filling: Option<Task<()>>,
+    places: Option<Places>,
     _checks: Option<Task<()>>,
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
@@ -539,7 +550,7 @@ impl VaultContent {
                         None
                     };
                     if let Some(waited) = this.checking {
-                        this.run_due_checks(waited, cx);
+                        this.run_due_checks(waited, true, cx);
                     }
                 });
                 if alive.is_err() {
@@ -551,33 +562,28 @@ impl VaultContent {
     }
 
     /// Checks the hosts due a check: all of them, or `waited` only those
-    /// a command waits for.
-    fn run_due_checks(&mut self, waited: bool, cx: &mut Context<Self>) {
-        // Each place once, in vault order, with the proxy its first hop
-        // dials through.
-        let hops = self.vault.hops();
-        let mut places: Vec<Place> = Vec::new();
-        let mut proxies = HashMap::new();
-        let mut among: Vec<Place> = Vec::new();
-        let mut wanted = HashSet::new();
-        for host in self.vault.hosts() {
-            let hop = hops.first_hop_host(host);
-            let place = (hop.address.clone(), hop.port);
-            if (!waited || self.waiting.command(&host.id).is_some()) && wanted.insert(place.clone())
-            {
-                among.push(place.clone());
-            }
-            if !proxies.contains_key(&place) {
-                proxies.insert(place.clone(), hop.proxy.clone());
-                places.push(place);
-            }
+    /// a command waits for. The look once a second works out where they
+    /// are (`fresh`); a slot freeing in between goes by that.
+    fn run_due_checks(&mut self, waited: bool, fresh: bool, cx: &mut Context<Self>) {
+        if fresh
+            || self
+                .places
+                .as_ref()
+                .is_none_or(|places| places.waited != waited)
+        {
+            self.places = Some(self.places(waited));
         }
-        let due = self.monitor.due_among(&places, &among, Instant::now());
+        let Some(places) = &self.places else {
+            return;
+        };
+        let due = self
+            .monitor
+            .due_among(&places.all, &places.wanted, Instant::now());
         if due.is_empty() {
             return;
         }
         for place in due {
-            let proxy = proxies.get(&place).cloned().flatten();
+            let proxy = places.proxies.get(&place).cloned().flatten();
             let check = probe(&place.0, place.1, proxy);
             cx.spawn(async move |this, cx| {
                 let latency_ms = check.await.ok().map(|reached| reached.latency_ms);
@@ -594,7 +600,7 @@ impl VaultContent {
                             let _ = this.update(cx, |this, cx| {
                                 this.filling = None;
                                 if let Some(waited) = this.checking {
-                                    this.run_due_checks(waited, cx);
+                                    this.run_due_checks(waited, false, cx);
                                 }
                             });
                         }));
@@ -606,6 +612,33 @@ impl VaultContent {
         }
         // A first check shows as connecting.
         cx.notify();
+    }
+
+    /// Where the vault's hosts are checked: each place once, in vault
+    /// order, with the proxy its first hop dials through; `waited`, only
+    /// those of hosts a command waits for are wanted.
+    fn places(&self, waited: bool) -> Places {
+        let hops = self.vault.hops();
+        let mut places = Places {
+            waited,
+            all: Vec::new(),
+            wanted: Vec::new(),
+            proxies: HashMap::new(),
+        };
+        let mut wanted = HashSet::new();
+        for host in self.vault.hosts() {
+            let hop = hops.first_hop_host(host);
+            let place = (hop.address.clone(), hop.port);
+            if (!waited || self.waiting.command(&host.id).is_some()) && wanted.insert(place.clone())
+            {
+                places.wanted.push(place.clone());
+            }
+            if !places.proxies.contains_key(&place) {
+                places.proxies.insert(place.clone(), hop.proxy.clone());
+                places.all.push(place);
+            }
+        }
+        places
     }
 
     /// The hosts the search and the filter let through, with their group,
@@ -888,6 +921,7 @@ impl VaultContent {
             showing: true,
             checking: None,
             filling: None,
+            places: None,
             _checks: None,
             _subscription: subscription,
             _editor_events: None,
@@ -3740,6 +3774,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_slot_freeing_between_looks_goes_by_the_last_look(cx: &mut TestAppContext) {
+        use std::time::Instant;
+
+        let (vault, cx, _) = open_vault(cx);
+        vault.update(cx, |vault, cx| {
+            // Every place checked just now: nothing is due, nothing dialled.
+            for place in vault.places(false).all {
+                vault.monitor.record(&place, Some(1), Instant::now());
+            }
+            vault.run_due_checks(false, true, cx);
+            let looked = vault.places.as_ref().unwrap().all.len();
+            vault.vault.groups[0]
+                .hosts
+                .push(Host::new("new", "me", "10.9.9.9", 22));
+            // Between looks, the places are where the last look found them;
+            // the next look sees the vault as it is.
+            vault.run_due_checks(false, false, cx);
+            assert_eq!(vault.places.as_ref().unwrap().all.len(), looked);
+            let new = ("10.9.9.9".to_string(), 22);
+            vault.monitor.record(&new, Some(1), Instant::now());
+            vault.run_due_checks(false, true, cx);
+            assert_eq!(vault.places.as_ref().unwrap().all.len(), looked + 1);
+        });
+    }
+
+    #[gpui::test]
     fn builds_only_the_hosts_on_screen(cx: &mut TestAppContext) {
         use gpui::{ScrollDelta, ScrollWheelEvent, point, px};
         use tern_core::HostGroup;
@@ -4919,7 +4979,7 @@ mod tests {
         };
         assert_eq!(status(cx), HostStatus::Unknown);
 
-        vault.update(cx, |vault, cx| vault.run_due_checks(false, cx));
+        vault.update(cx, |vault, cx| vault.run_due_checks(false, true, cx));
         assert_eq!(status(cx), HostStatus::Connecting);
         let deadline = Instant::now() + Duration::from_secs(10);
         while status(cx) == HostStatus::Connecting && Instant::now() < deadline {
