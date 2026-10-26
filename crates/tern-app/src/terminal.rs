@@ -82,6 +82,17 @@ const REPLAY_TICK: Duration = Duration::from_millis(33);
 const PLACEHOLDER: char = '\u{10EEEE}';
 /// Inline images kept, at most: older ones stop showing.
 const IMAGES_KEPT: usize = 64;
+/// Lines a search looks through at a time, before checking the clock.
+const HUNT_LINES: i32 = 256;
+/// How long a search works before everything else on the UI thread gets a
+/// turn. In tests, one stretch of lines, so every search goes on in turns.
+const HUNT_SLICE: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_millis(4)
+};
+/// How long output must pause before a search it changed starts over.
+const HUNT_QUIET: Duration = Duration::from_millis(150);
 
 /// An inline image placed in the terminal, drawn over its cells.
 struct Placed {
@@ -398,12 +409,17 @@ struct Find {
     /// `None` while the field is empty.
     regex: Option<RegexSearch>,
     /// Which match is selected, counting from the oldest, and how many
-    /// there are, as of the last search or step.
-    count: (usize, usize),
+    /// there are, as of the last search or step; `None` until a new
+    /// search has counted them.
+    count: Option<(usize, usize)>,
     /// What the scrollback held when `count` was made ([`TerminalView::
     /// contents`]), and the match it's at: stepping on from that match
     /// with nothing changed since is one along, with nothing to count.
     counted: Option<(Contents, Match)>,
+    /// The search under way, when it didn't finish at once, and the task
+    /// giving it its turns.
+    hunt: Option<Hunt>,
+    _hunting: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -411,6 +427,57 @@ struct Find {
 /// given so far, and the lines kept and their size, which clearing and
 /// resizing change.
 type Contents = (u64, usize, usize, usize);
+
+/// A search under way, done a stretch of lines at a time so that neither
+/// typing nor output waits on a long scrollback: first the nearest match,
+/// then all of them counted.
+struct Hunt {
+    direction: Direction,
+    /// What the scrollback held as the search started.
+    contents: Contents,
+    /// Stepping on from the match counted last, with nothing changed since:
+    /// the count moves by one instead of being made again.
+    along: bool,
+    stage: HuntStage,
+}
+
+enum HuntStage {
+    /// Looking for the nearest match from `at` on: first to the grid's
+    /// end, then, `wrapped`, from its other end back to `origin`.
+    Seeking {
+        origin: GridPoint,
+        at: GridPoint,
+        wrapped: bool,
+    },
+    /// Counting the matches from the top, those above the line `at` done:
+    /// `total` so far, `found` being the `index`th of them (0 until passed).
+    Counting {
+        found: Match,
+        at: Line,
+        total: usize,
+        index: usize,
+    },
+    /// Output changed the scrollback, last to `seen`: once it pauses, the
+    /// search starts over, `counting` again if it was.
+    Waiting { seen: Contents, counting: bool },
+}
+
+/// How a stretch of a search went.
+#[derive(Debug, PartialEq)]
+enum Hunting {
+    More,
+    Done,
+    /// Output changed the scrollback: on once it pauses.
+    Changed,
+}
+
+/// What a stretch of looking for the nearest match found.
+enum Seek {
+    Found(Match),
+    /// No match anywhere.
+    Nothing,
+    More,
+}
 
 /// A link on screen, from its first cell to its last.
 #[derive(Clone, Debug, PartialEq)]
@@ -2883,8 +2950,10 @@ impl TerminalView {
                 input,
                 query: String::new(),
                 regex: None,
-                count: (0, 0),
+                count: Some((0, 0)),
                 counted: None,
+                hunt: None,
+                _hunting: None,
                 _subscription: subscription,
             });
         }
@@ -2919,82 +2988,220 @@ impl TerminalView {
             .then(|| RegexSearch::new(&literal(&query)).ok())
             .flatten();
         find.query = query;
+        find.count = None;
+        find.counted = None;
         self.term.selection = None;
         self.step(Direction::Left, cx);
     }
 
-    /// Goes to the next match back in time (`Left`) or forward (`Right`)
-    /// from the one selected, wrapping around; from the bottom when none
-    /// is.
-    fn step(&mut self, direction: Direction, cx: &mut Context<Self>) {
-        let Some(find) = &mut self.find else {
-            return;
-        };
-        let current = self
-            .term
-            .selection
-            .as_ref()
-            .and_then(|selection| selection.to_range(&self.term));
-        let origin = match current {
-            Some(range) if direction == Direction::Left => {
-                range.start.sub(&self.term, Boundary::None, 1)
-            }
-            Some(range) => range.end.add(&self.term, Boundary::None, 1),
-            None => GridPoint::new(self.term.bottommost_line(), self.term.last_column()),
-        };
-        let found = find.regex.as_mut().and_then(|regex| {
-            self.term
-                .search_next(regex, origin, direction, Side::Left, None)
-        });
-        self.term.selection = found.as_ref().map(|found| {
-            let mut selection = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
-            selection.update(*found.end(), Side::Right);
-            selection
-        });
-        if let Some(found) = &found {
-            self.term.scroll_to_point(*found.start());
-        }
+    /// What the scrollback holds, as far as counting matches goes.
+    fn contents(&self) -> Contents {
         let grid = self.term.grid();
-        let contents = (
+        (
             self.fed,
             grid.history_size(),
             grid.columns(),
             grid.screen_lines(),
-        );
+        )
+    }
+
+    /// The selection, as a range of cells.
+    fn selected_range(&self) -> Option<Match> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some(range.start..=range.end)
+    }
+
+    /// Goes to the next match back in time (`Left`) or forward (`Right`)
+    /// from the one selected, wrapping around; from the bottom when none
+    /// is. A long scrollback is searched a stretch at a time, taking turns
+    /// with everything else on the UI thread.
+    fn step(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let contents = self.contents();
+        let current = self.selected_range();
+        let origin = origin(&self.term, current.as_ref(), direction);
+        let Some(find) = &mut self.find else {
+            return;
+        };
         // From the match counted last, with nothing changed since, the next
         // is one along. Otherwise all are counted afresh (output may have
         // added some), one by one rather than kept.
-        let along = find.counted.as_ref().is_some_and(|(then, at)| {
-            *then == contents
-                && current.is_some_and(|range| range.start == *at.start() && range.end == *at.end())
+        let along = find
+            .counted
+            .as_ref()
+            .is_some_and(|(then, at)| *then == contents && current.as_ref() == Some(at));
+        find.hunt = Some(Hunt {
+            direction,
+            contents,
+            along,
+            stage: HuntStage::Seeking {
+                origin,
+                at: origin,
+                wrapped: false,
+            },
         });
-        find.count = match (&mut find.regex, &found) {
-            (Some(_), Some(_)) if along => {
-                let (at, total) = find.count;
-                let at = match direction {
-                    Direction::Left if at <= 1 => total,
-                    Direction::Left => at - 1,
-                    Direction::Right if at >= total => 1,
-                    Direction::Right => at + 1,
-                };
-                (at, total)
+        find._hunting = None;
+        if self.hunt(cx) == Hunting::Done {
+            return;
+        }
+        let hunting = cx.spawn(async move |this, cx| {
+            loop {
+                match this.update(cx, |view, cx| view.hunt(cx)) {
+                    Ok(Hunting::More) => yield_now().await,
+                    Ok(Hunting::Changed) => cx.background_executor().timer(HUNT_QUIET).await,
+                    Ok(Hunting::Done) | Err(_) => break,
+                }
             }
-            (Some(regex), Some(found)) => {
-                let top = GridPoint::new(self.term.topmost_line(), Column(0));
-                let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
-                let (mut at, mut total) = (0, 0);
-                for each in RegexIter::new(top, bottom, Direction::Right, &self.term, regex) {
-                    total += 1;
-                    if each == *found {
-                        at = total;
+        });
+        if let Some(find) = &mut self.find {
+            find._hunting = Some(hunting);
+        }
+    }
+
+    /// Searches on for a turn: about [`HUNT_SLICE`].
+    fn hunt(&mut self, cx: &mut Context<Self>) -> Hunting {
+        let started = Instant::now();
+        loop {
+            match self.hunt_stretch(cx) {
+                Hunting::More if started.elapsed() < HUNT_SLICE => {}
+                hunting => return hunting,
+            }
+        }
+    }
+
+    /// One stretch of the search under way: a few hundred lines looked
+    /// through.
+    fn hunt_stretch(&mut self, cx: &mut Context<Self>) -> Hunting {
+        let contents = self.contents();
+        let current = self.selected_range();
+        let Some(find) = &mut self.find else {
+            return Hunting::Done;
+        };
+        let Some(hunt) = &mut find.hunt else {
+            return Hunting::Done;
+        };
+        let Some(regex) = &mut find.regex else {
+            // Nothing typed.
+            self.term.selection = None;
+            find.count = Some((0, 0));
+            find.counted = None;
+            find.hunt = None;
+            cx.notify();
+            return Hunting::Done;
+        };
+        if hunt.contents != contents && !matches!(hunt.stage, HuntStage::Waiting { .. }) {
+            let counting = matches!(hunt.stage, HuntStage::Counting { .. });
+            hunt.stage = HuntStage::Waiting {
+                seen: contents,
+                counting,
+            };
+            return Hunting::Changed;
+        }
+        match &mut hunt.stage {
+            HuntStage::Waiting { seen, .. } if *seen != contents => {
+                *seen = contents;
+                Hunting::Changed
+            }
+            // Output paused: over again, from the selection as it is now
+            // (it moves with the text).
+            HuntStage::Waiting { counting, .. } => {
+                hunt.contents = contents;
+                hunt.along = false;
+                hunt.stage = match current {
+                    Some(found) if *counting => HuntStage::Counting {
+                        found,
+                        at: self.term.topmost_line(),
+                        total: 0,
+                        index: 0,
+                    },
+                    current => {
+                        let origin = origin(&self.term, current.as_ref(), hunt.direction);
+                        HuntStage::Seeking {
+                            origin,
+                            at: origin,
+                            wrapped: false,
+                        }
+                    }
+                };
+                Hunting::More
+            }
+            HuntStage::Seeking {
+                origin,
+                at,
+                wrapped,
+            } => {
+                let seek = match hunt.direction {
+                    Direction::Left => seek_back(&self.term, regex, *origin, at, wrapped),
+                    Direction::Right => seek_on(&self.term, regex, *origin, at, wrapped),
+                };
+                let found = match seek {
+                    Seek::More => return Hunting::More,
+                    Seek::Nothing => {
+                        self.term.selection = None;
+                        find.count = Some((0, 0));
+                        find.counted = None;
+                        find.hunt = None;
+                        cx.notify();
+                        return Hunting::Done;
+                    }
+                    Seek::Found(found) => found,
+                };
+                let mut selection =
+                    Selection::new(SelectionType::Simple, *found.start(), Side::Left);
+                selection.update(*found.end(), Side::Right);
+                self.term.selection = Some(selection);
+                self.term.scroll_to_point(*found.start());
+                cx.notify();
+                match find.count {
+                    Some((at, total)) if hunt.along => {
+                        let at = match hunt.direction {
+                            Direction::Left if at <= 1 => total,
+                            Direction::Left => at - 1,
+                            Direction::Right if at >= total => 1,
+                            Direction::Right => at + 1,
+                        };
+                        find.count = Some((at, total));
+                        find.counted = Some((contents, found));
+                        find.hunt = None;
+                        Hunting::Done
+                    }
+                    _ => {
+                        hunt.stage = HuntStage::Counting {
+                            found,
+                            at: self.term.topmost_line(),
+                            total: 0,
+                            index: 0,
+                        };
+                        Hunting::More
                     }
                 }
-                (at, total)
             }
-            _ => (0, 0),
-        };
-        find.counted = found.map(|found| (contents, found));
-        cx.notify();
+            HuntStage::Counting {
+                found,
+                at,
+                total,
+                index,
+            } => {
+                let bottom = self.term.bottommost_line();
+                let line = Line(at.0.saturating_add(HUNT_LINES - 1)).min(bottom);
+                let high = self.term.line_search_right(GridPoint::new(line, Column(0)));
+                let start = GridPoint::new(*at, Column(0));
+                for each in RegexIter::new(start, high, Direction::Right, &self.term, regex) {
+                    *total += 1;
+                    if each == *found {
+                        *index = *total;
+                    }
+                }
+                if high.line < bottom {
+                    *at = Line(high.line.0 + 1);
+                    return Hunting::More;
+                }
+                find.count = Some((*index, *total));
+                find.counted = Some((contents, found.clone()));
+                find.hunt = None;
+                cx.notify();
+                Hunting::Done
+            }
+        }
     }
 
     /// The matches on screen, for painting.
@@ -3013,8 +3220,10 @@ impl TerminalView {
     }
 
     fn find_bar(&self, find: &Find, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let (at, total) = find.count;
         let typed = find.regex.is_some();
+        // While a new search counts, neither a count nor a miss shows.
+        let missed = typed && find.count.is_some_and(|(_, total)| total == 0);
+        let count = find.count.filter(|(_, total)| *total > 0);
         let control = |id: &'static str, name: IconName| {
             div()
                 .id(id)
@@ -3044,11 +3253,7 @@ impl TerminalView {
             .rounded(px(14.))
             .bg(theme.card)
             .border_1()
-            .border_color(if typed && total == 0 {
-                theme.danger
-            } else {
-                theme.line
-            })
+            .border_color(if missed { theme.danger } else { theme.line })
             .shadow(theme.shadow_sm())
             .text_color(theme.text)
             .child(
@@ -3057,7 +3262,7 @@ impl TerminalView {
                     .min_w_0()
                     .child(Input::new(&find.input).id("find-input").appearance(false)),
             )
-            .when(total > 0, |d| {
+            .when_some(count, |d, (at, total)| {
                 d.child(
                     div()
                         .px(px(6.))
@@ -3115,6 +3320,7 @@ impl TerminalView {
             .then_some((cursor_row as usize, cursor_col));
         let block_cursor = focused && cursor.shape == CursorShape::Block;
         let selection = content.selection;
+        let mut lit = Lit::new(matches);
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
@@ -3173,7 +3379,7 @@ impl TerminalView {
             if selection.is_some_and(|range| range.contains(indexed.point)) {
                 fg = palette.background;
                 bg = palette.foreground;
-            } else if matches.iter().any(|lit| lit.contains(&indexed.point)) {
+            } else if lit.contains(indexed.point) {
                 bg = palette.foreground.opacity(0.25);
             }
             if block_cursor && cursor_at == Some((row, col)) {
@@ -4168,6 +4374,130 @@ fn literal(text: &str) -> String {
     pattern
 }
 
+/// Where a search for the next match in `direction` starts: next to the
+/// match `current`, or at the bottom.
+fn origin(term: &Term<Listener>, current: Option<&Match>, direction: Direction) -> GridPoint {
+    match current {
+        Some(range) if direction == Direction::Left => range.start().sub(term, Boundary::None, 1),
+        Some(range) => range.end().add(term, Boundary::None, 1),
+        None => GridPoint::new(term.bottommost_line(), term.last_column()),
+    }
+}
+
+/// Looks through the next stretch of lines for the nearest match back from
+/// `at`: up to the top, then, `wrapped`, up from the bottom to just after
+/// `origin`. A stretch ends where a line does (not one that wraps on), as
+/// matches never cross a line's end.
+fn seek_back(
+    term: &Term<Listener>,
+    regex: &mut RegexSearch,
+    origin: GridPoint,
+    at: &mut GridPoint,
+    wrapped: &mut bool,
+) -> Seek {
+    let floor = if *wrapped {
+        origin.add(term, Boundary::None, 1)
+    } else {
+        GridPoint::new(term.topmost_line(), Column(0))
+    };
+    let line = Line(at.line.0.saturating_sub(HUNT_LINES - 1)).max(floor.line);
+    let low = term
+        .line_search_left(GridPoint::new(line, Column(0)))
+        .max(floor);
+    if let Some(found) = RegexIter::new(*at, low, Direction::Left, term, regex).next() {
+        return Seek::Found(found);
+    }
+    if low > floor {
+        *at = low.sub(term, Boundary::None, 1);
+        return Seek::More;
+    }
+    let bottom = GridPoint::new(term.bottommost_line(), term.last_column());
+    if *wrapped || origin == bottom {
+        return Seek::Nothing;
+    }
+    *wrapped = true;
+    *at = bottom;
+    Seek::More
+}
+
+/// Like [`seek_back`], forward: down to the bottom, then down from the top
+/// to just before `origin`.
+fn seek_on(
+    term: &Term<Listener>,
+    regex: &mut RegexSearch,
+    origin: GridPoint,
+    at: &mut GridPoint,
+    wrapped: &mut bool,
+) -> Seek {
+    let ceiling = if *wrapped {
+        origin.sub(term, Boundary::None, 1)
+    } else {
+        GridPoint::new(term.bottommost_line(), term.last_column())
+    };
+    let line = Line(at.line.0.saturating_add(HUNT_LINES - 1)).min(ceiling.line);
+    let high = term
+        .line_search_right(GridPoint::new(line, Column(0)))
+        .min(ceiling);
+    if let Some(found) = RegexIter::new(*at, high, Direction::Right, term, regex).next() {
+        return Seek::Found(found);
+    }
+    if high < ceiling {
+        *at = high.add(term, Boundary::None, 1);
+        return Seek::More;
+    }
+    let top = GridPoint::new(term.topmost_line(), Column(0));
+    if *wrapped || origin == top {
+        return Seek::Nothing;
+    }
+    *wrapped = true;
+    *at = top;
+    Seek::More
+}
+
+/// A search's matches on screen, asked about cell by cell from the top:
+/// both come in order, so each match is passed once instead of being tried
+/// at every cell.
+struct Lit<'a> {
+    matches: &'a [Match],
+    next: usize,
+}
+
+impl<'a> Lit<'a> {
+    fn new(matches: &'a [Match]) -> Self {
+        Self { matches, next: 0 }
+    }
+
+    /// Whether `point`, no earlier than the last one asked about, is in a
+    /// match.
+    fn contains(&mut self, point: GridPoint) -> bool {
+        while self
+            .matches
+            .get(self.next)
+            .is_some_and(|lit| *lit.end() < point)
+        {
+            self.next += 1;
+        }
+        self.matches
+            .get(self.next)
+            .is_some_and(|lit| lit.contains(&point))
+    }
+}
+
+/// Lets everything else waiting on the UI thread go first.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit imports: `gpui_kit::*` brings GPUI's own `test` macro, which
@@ -4642,35 +4972,109 @@ mod tests {
         // Without capitals either case matches; the newest comes first, and
         // the others on screen are lit.
         assert_eq!(selected(&view, cx).as_deref(), Some("ALPHA"));
-        assert_eq!(count(cx), Some((2, 2)));
+        assert_eq!(count(cx), Some(Some((2, 2))));
         view.update(cx, |view, _| assert_eq!(view.visible_matches().len(), 2));
 
         // Enter goes back, wrapping around; Shift+Enter forward.
         cx.simulate_keystrokes("enter");
         assert_eq!(selected(&view, cx).as_deref(), Some("alpha"));
-        assert_eq!(count(cx), Some((1, 2)));
+        assert_eq!(count(cx), Some(Some((1, 2))));
         cx.simulate_keystrokes("enter");
-        assert_eq!(count(cx), Some((2, 2)));
+        assert_eq!(count(cx), Some(Some((2, 2))));
         cx.simulate_keystrokes("shift-enter");
-        assert_eq!(count(cx), Some((1, 2)));
+        assert_eq!(count(cx), Some(Some((1, 2))));
         // New output may bring new matches: they're counted at the next.
         view.update(cx, |view, cx| view.feed(b"alpha three\r\n", cx));
         cx.simulate_keystrokes("enter");
-        assert_eq!(count(cx), Some((3, 3)));
+        assert_eq!(count(cx), Some(Some((3, 3))));
         cx.simulate_keystrokes("enter");
-        assert_eq!(count(cx), Some((2, 3)));
+        assert_eq!(count(cx), Some(Some((2, 3))));
 
         // Nothing typed in the bar reaches the shell.
         view.read_with(cx, |view, _| assert!(view.sent.borrow().is_empty()));
 
         cx.simulate_input("x");
         assert_eq!(selected(&view, cx), None);
-        assert_eq!(count(cx), Some((0, 0)));
+        assert_eq!(count(cx), Some(Some((0, 0))));
 
         // Escape closes the bar and gives the keyboard back to the shell.
         cx.simulate_keystrokes("escape");
         assert_eq!(count(cx), None);
         cx.update(|window, cx| assert!(view.read(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_long_scrollback_is_searched_in_turns(cx: &mut TestAppContext) {
+        use alacritty_terminal::index::Direction;
+
+        // A needle every 500 lines, the newest near the bottom.
+        let output: String = (0..3000)
+            .map(|line| match line % 500 {
+                400 => format!("needle {line}\r\n"),
+                _ => format!("line {line}\r\n"),
+            })
+            .collect();
+        let (view, cx) = pane_with(cx, &output);
+        let count = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.find.as_ref().and_then(|find| find.count))
+        };
+        focus(&view, cx);
+        cx.simulate_keystrokes(&shortcut("f"));
+        cx.run_until_parked();
+
+        // The newest match shows at once; counting them all goes on in
+        // turns with everything else.
+        view.update(cx, |view, cx| view.search("needle".into(), cx));
+        assert_eq!(selected(&view, cx).as_deref(), Some("needle"));
+        assert_eq!(count(cx), None);
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some((6, 6)));
+        // Stepping on from the match counted needs no count.
+        view.update(cx, |view, cx| view.step(Direction::Left, cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some((5, 6)));
+
+        // Output while counting: the count starts over once it pauses,
+        // from the match selected, which moved with the text.
+        view.update(cx, |view, cx| view.step(Direction::Right, cx));
+        view.update(cx, |view, cx| view.feed(b"needle again\r\nmore\r\n", cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some((5, 6)));
+        cx.executor().advance_clock(super::HUNT_QUIET);
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some((6, 7)));
+
+        // Nowhere: the search looks through everything, in turns too.
+        view.update(cx, |view, cx| view.search("absent".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(selected(&view, cx), None);
+        assert_eq!(count(cx), Some((0, 0)));
+    }
+
+    #[test]
+    fn lights_matches_cell_by_cell_in_one_pass() {
+        use alacritty_terminal::index::{Column, Line, Point};
+
+        let at = |line: i32, column: usize| Point::new(Line(line), Column(column));
+        let matches = [
+            at(0, 2)..=at(0, 4),
+            // Across a wrapped line's end.
+            at(0, 8)..=at(1, 1),
+            at(1, 5)..=at(1, 5),
+            at(3, 0)..=at(3, 9),
+        ];
+        let points: Vec<_> = (0..5)
+            .flat_map(|line| (0..10).map(move |column| at(line, column)))
+            .collect();
+        // Asked about every cell, or only some (a row of an image is
+        // skipped), the lit cells are the matches'.
+        for stride in [1, 3, 7] {
+            let mut lit = super::Lit::new(&matches);
+            for point in points.iter().step_by(stride) {
+                let expected = matches.iter().any(|lit| lit.contains(point));
+                assert_eq!(lit.contains(*point), expected, "{point:?}");
+            }
+        }
     }
 
     #[gpui::test]
