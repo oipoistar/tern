@@ -179,6 +179,58 @@ Keep work and home apart with more than one vault. Each has its own hosts, snipp
 - Files from a server that your computer would run, such as scripts, open as text when you edit them
 - Links a server prints can't open programs or file shares on your computer
 
+## How Tern compares
+
+<table>
+<thead>
+<tr>
+<th width="33%" align="left">Tern vs PuTTY</th>
+<th width="33%" align="left">Tern vs Termius</th>
+<th width="33%" align="left">Tern vs MobaXterm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td valign="top">
+
+- Tabs, with up to four sessions side by side in each; PuTTY opens a window per session
+- A vault of hosts with groups, tags and search
+- Find in the scrollback
+- Reconnects by itself after a dropped connection
+- A Files panel beside the shell, and remote files edited in your own editor
+- Uses your OpenSSH keys and `~/.ssh/known_hosts` as they are, with no `.ppk` conversion
+- Can keep a password in Windows Credential Manager; PuTTY never saves passwords
+- Encrypted sync between your computers
+
+</td>
+<td valign="top">
+
+- No account, ever; Termius asks you to sign in or create one at first launch
+- Sync with no account or subscription, through a folder you already sync, encrypted on your computer
+- Free and open source; Termius is closed source
+- Native: written in Rust and drawn on the GPU, where Termius's desktop app is built on Electron
+- AI agents (Claude Code, any MCP client) can drive it, in tabs you watch
+- Each host's latency over the last minutes, and its host key as art
+- Wake-on-LAN for machines that sleep
+
+</td>
+<td valign="top">
+
+- Free and open source, with no caps; the Home Edition stops at 12 sessions, 2 SSH tunnels and 4 macros
+- MIT licence: roll it out across a company, or change it; the Home Edition's licence allows neither
+- Encrypted sync of hosts, snippets and settings between your computers
+- Imports hosts from `~/.ssh/config`
+- AI agents (Claude Code, any MCP client) can drive it, in tabs you watch
+- Each host's latency over the last minutes, and its host key as art
+- Records a session and plays it back in a tab
+
+</td>
+</tr>
+</tbody>
+</table>
+
+Checked against PuTTY 0.85, Termius 10.2 and MobaXterm 26.6 in October 2026.
+
 ## Shell integration (optional)
 
 With two lines in `~/.bashrc`, the shell tells Tern where each command starts and ends and which folder it's in, the way iTerm2, WezTerm and Windows Terminal read it. That's what lights up command marks and keeps the Files panel in step:
