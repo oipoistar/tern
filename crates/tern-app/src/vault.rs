@@ -70,6 +70,8 @@ struct SourceForm {
 const SYNC_SETTLE: Duration = Duration::from_secs(2);
 /// How often other devices' changes are looked for.
 const SYNC_EVERY: Duration = Duration::from_secs(60);
+/// How soon after a reachability check ends the next due one starts.
+const FILL_AFTER: Duration = Duration::from_millis(100);
 
 /// Where `tern-devserver` keeps the key it accepts.
 const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
@@ -241,6 +243,12 @@ pub struct VaultContent {
     monitor: Monitor,
     /// The vault is the tab on screen; checks run only then.
     showing: bool,
+    /// Whether the last look for due checks ran them, and whether only
+    /// those of hosts a command waits for: a check that ends starts the
+    /// next due the same way, without waiting for the next look.
+    checking: Option<bool>,
+    /// That look, soon after a check ends.
+    filling: Option<Task<()>>,
     _checks: Option<Task<()>>,
     _subscription: Subscription,
     _editor_events: Option<Subscription>,
@@ -472,11 +480,16 @@ impl VaultContent {
             loop {
                 let alive = this.update_in(cx, |this, window, cx| {
                     let on_screen = this.showing && this.section == Section::Hosts;
-                    if on_screen && window.is_window_active() {
-                        this.run_due_checks(false, cx);
+                    this.checking = if on_screen && window.is_window_active() {
+                        Some(false)
                     } else if !this.waiting.is_empty() {
                         // A host something waits for is watched regardless.
-                        this.run_due_checks(true, cx);
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    if let Some(waited) = this.checking {
+                        this.run_due_checks(waited, cx);
                     }
                 });
                 if alive.is_err() {
@@ -490,17 +503,22 @@ impl VaultContent {
     /// Checks the hosts due a check: all of them, or `waited` only those
     /// a command waits for.
     fn run_due_checks(&mut self, waited: bool, cx: &mut Context<Self>) {
+        // Each place once, in vault order, with the proxy its first hop
+        // dials through.
+        let hops = self.vault.hops();
         let mut places: Vec<Place> = Vec::new();
-        let mut proxies = Vec::new();
+        let mut proxies = HashMap::new();
         let mut among: Vec<Place> = Vec::new();
+        let mut wanted = HashSet::new();
         for host in self.vault.hosts() {
-            let place = self.vault.first_hop(host);
-            let wanted = !waited || self.waiting.command(&host.id).is_some();
-            if wanted && !among.contains(&place) {
+            let hop = hops.first_hop_host(host);
+            let place = (hop.address.clone(), hop.port);
+            if (!waited || self.waiting.command(&host.id).is_some()) && wanted.insert(place.clone())
+            {
                 among.push(place.clone());
             }
-            if !places.contains(&place) {
-                proxies.push(self.vault.first_hop_host(host).proxy.clone());
+            if !proxies.contains_key(&place) {
+                proxies.insert(place.clone(), hop.proxy.clone());
                 places.push(place);
             }
         }
@@ -509,10 +527,7 @@ impl VaultContent {
             return;
         }
         for place in due {
-            let proxy = places
-                .iter()
-                .position(|each| *each == place)
-                .and_then(|at| proxies[at].clone());
+            let proxy = proxies.get(&place).cloned().flatten();
             let check = probe(&place.0, place.1, proxy);
             cx.spawn(async move |this, cx| {
                 let latency_ms = check.await.ok().map(|reached| reached.latency_ms);
@@ -520,6 +535,19 @@ impl VaultContent {
                     this.monitor.record(&place, latency_ms, Instant::now());
                     if latency_ms.is_some() {
                         this.run_waiting(&place, cx);
+                    }
+                    // Its slot goes to the next due soon, not at the next
+                    // look; checks ending together share one look.
+                    if this.checking.is_some() && this.filling.is_none() {
+                        this.filling = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(FILL_AFTER).await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.filling = None;
+                                if let Some(waited) = this.checking {
+                                    this.run_due_checks(waited, cx);
+                                }
+                            });
+                        }));
                     }
                     cx.notify();
                 });
@@ -744,6 +772,8 @@ impl VaultContent {
             openssh: Vec::new(),
             monitor: Monitor::default(),
             showing: true,
+            checking: None,
+            filling: None,
             _checks: None,
             _subscription: subscription,
             _editor_events: None,

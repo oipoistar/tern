@@ -342,6 +342,16 @@ impl Vault {
         (hop.address.clone(), hop.port)
     }
 
+    /// For finding many hosts' first hops at once: each jump host looked up
+    /// in a table, not by a search of the vault.
+    pub fn hops(&self) -> Hops<'_> {
+        let mut by_name = HashMap::new();
+        for host in self.hosts() {
+            by_name.entry(host.name.as_str()).or_insert(host);
+        }
+        Hops { by_name }
+    }
+
     /// How to connect to `host`, with its jump hosts resolved.
     pub fn connection(&self, host: &Host) -> Result<Connection, String> {
         let jumps = self
@@ -573,6 +583,38 @@ pub fn open(path: &Path) -> Opened {
 enum Unusable {
     Newer(u32),
     Broken(String),
+}
+
+/// The vault's hosts by name, the first of each as [`Vault::find`] gives,
+/// for finding many hosts' first hops ([`Vault::hops`]).
+pub struct Hops<'a> {
+    by_name: HashMap<&'a str, &'a Host>,
+}
+
+impl<'a> Hops<'a> {
+    /// Like [`Vault::first_hop_host`]: `host` itself when a jump host is
+    /// missing or they go round in a loop.
+    pub fn first_hop_host(&self, host: &'a Host) -> &'a Host {
+        let mut chain: Vec<&Host> = Vec::new();
+        let mut next = host.jump.as_deref();
+        while let Some(name) = next {
+            let Some(&via) = self.by_name.get(name) else {
+                return host;
+            };
+            if via.name == host.name || chain.iter().any(|seen| seen.name == via.name) {
+                return host;
+            }
+            chain.push(via);
+            next = via.jump.as_deref();
+        }
+        chain.last().copied().unwrap_or(host)
+    }
+
+    /// Like [`Vault::first_hop`].
+    pub fn first_hop(&self, host: &'a Host) -> Place {
+        let hop = self.first_hop_host(host);
+        (hop.address.clone(), hop.port)
+    }
 }
 
 /// The vault at `path` as it is, for looking in a vault that isn't open:
@@ -859,6 +901,34 @@ mod tests {
         assert!(vault.connection(&db).unwrap_err().contains("loop"));
         assert_eq!(vault.first_hop(&db), (db.address.clone(), db.port));
         assert!(!vault.goes_through(&db, "prod-web-01"));
+    }
+
+    #[test]
+    fn finds_every_hosts_first_hop_from_one_table() {
+        let mut vault = Vault::sample();
+        let mut chained = |name: &str, jump: &str| {
+            let mut host = vault.find(name).unwrap().clone();
+            host.jump = Some(jump.into());
+            let group = vault.group_of(name).unwrap().to_string();
+            vault.save(Some(name), host, &group);
+        };
+        // A chain, a jump host that isn't saved, and a loop.
+        chained("bastion", "pi-homelab");
+        chained("prod-db-01", "bastion");
+        chained("prod-web-01", "nowhere");
+        chained("stage-api", "stage-worker");
+        chained("stage-worker", "stage-api");
+        // A second host of a name: the first is the one jumped through.
+        let mut twin = Host::new("bastion", "x", "10.9.9.9", 2200);
+        twin.jump = None;
+        vault.groups[0].hosts.push(twin);
+
+        let hops = vault.hops();
+        for host in vault.hosts() {
+            assert_eq!(hops.first_hop(host), vault.first_hop(host), "{}", host.name);
+        }
+        let db = vault.find("prod-db-01").unwrap();
+        assert_eq!(hops.first_hop_host(db).name, "pi-homelab");
     }
 
     #[test]

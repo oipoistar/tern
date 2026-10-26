@@ -8,7 +8,7 @@
 //! what's due, what's running, and the recent samples. Running the checks
 //! is up to the caller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::host::HostStatus;
@@ -49,26 +49,45 @@ impl Monitor {
     }
 
     /// Like [`Monitor::due`], but only of the places `among`: the rest of
-    /// `places` keep what their checks found.
+    /// `places` keep what their checks found. The places waiting longest
+    /// go first: those never checked, then the longest ago, in the order
+    /// given when even; so in a vault of thousands, every host's turn
+    /// comes.
     pub fn due_among(&mut self, places: &[Place], among: &[Place], now: Instant) -> Vec<Place> {
-        self.watches.retain(|place, _| places.contains(place));
-        let mut running = self.watches.values().filter(|watch| watch.running).count();
-        let mut due = Vec::new();
-        for place in among {
-            if running >= AT_ONCE {
-                break;
-            }
-            let watch = self.watches.entry(place.clone()).or_default();
-            let stale = watch
-                .checked_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY);
-            if stale && !watch.running {
-                watch.running = true;
-                running += 1;
-                due.push(place.clone());
+        let listed: HashSet<&Place> = places.iter().collect();
+        self.watches.retain(|place, _| listed.contains(place));
+        let running = self.watches.values().filter(|watch| watch.running).count();
+        let free = AT_ONCE.saturating_sub(running);
+        // The free slots' places so far, by when they were last checked
+        // and where they're listed.
+        let mut chosen: Vec<(Option<Instant>, usize)> = Vec::with_capacity(free + 1);
+        if free > 0 {
+            for (index, place) in among.iter().enumerate() {
+                let (checked_at, running) = self
+                    .watches
+                    .get(place)
+                    .map_or((None, false), |watch| (watch.checked_at, watch.running));
+                let stale =
+                    checked_at.is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY);
+                if !stale || running || chosen.iter().any(|(_, at)| among[*at] == *place) {
+                    continue;
+                }
+                let key = (checked_at, index);
+                let at = chosen.partition_point(|other| *other <= key);
+                if at < free {
+                    chosen.insert(at, key);
+                    chosen.truncate(free);
+                }
             }
         }
-        due
+        chosen
+            .into_iter()
+            .map(|(_, index)| {
+                let place = &among[index];
+                self.watches.entry(place.clone()).or_default().running = true;
+                place.clone()
+            })
+            .collect()
     }
 
     /// Records a check of `place`: its round trip, or `None` if it failed.
@@ -134,6 +153,39 @@ mod tests {
         }
         assert!(monitor.due(&places, start + CHECK_EVERY / 2).is_empty());
         assert_eq!(monitor.due(&places, start + CHECK_EVERY), places[..AT_ONCE]);
+    }
+
+    #[test]
+    fn every_place_gets_its_turn_the_longest_waiting_first() {
+        // A thousand places, polled every second, each check over before
+        // the next poll: four a poll, never checked first, reach them all.
+        let places: Vec<Place> = (0..1000).map(|i| place(&format!("host-{i:04}"))).collect();
+        let start = Instant::now();
+        let mut monitor = Monitor::default();
+        let mut checked = std::collections::HashSet::new();
+        for tick in 0..300 {
+            let now = start + std::time::Duration::from_secs(tick);
+            for due in monitor.due(&places, now) {
+                checked.insert(due.clone());
+                monitor.record(&due, Some(1), now);
+            }
+        }
+        assert_eq!(checked.len(), places.len());
+
+        // Of places due again, those checked longest ago go first.
+        let mut monitor = Monitor::default();
+        let few: Vec<Place> = ["a", "b", "c", "d", "e", "f"].map(place).into();
+        for (i, each) in few.iter().enumerate().rev() {
+            monitor.record(
+                each,
+                Some(1),
+                start + std::time::Duration::from_secs(i as u64),
+            );
+        }
+        let later = start + CHECK_EVERY * 2;
+        monitor.record(&few[0], Some(1), later);
+        assert_eq!(monitor.due(&few, later), few[1..5]);
+        assert_eq!(monitor.due(&few, later), []);
     }
 
     #[test]
