@@ -525,6 +525,11 @@ impl SessionEvents {
     pub async fn next(&mut self) -> Option<Event> {
         self.0.recv().await
     }
+
+    /// The next event if one is waiting already, without waiting for one.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.0.try_recv().ok()
+    }
 }
 
 impl Session {

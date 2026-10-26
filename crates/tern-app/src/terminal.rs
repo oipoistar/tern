@@ -93,6 +93,8 @@ const HUNT_SLICE: Duration = if cfg!(test) {
 };
 /// How long output must pause before a search it changed starts over.
 const HUNT_QUIET: Duration = Duration::from_millis(150);
+/// Output a session's events are taken in at a time, about.
+const BATCH_BYTES: usize = 128 * 1024;
 
 /// An inline image placed in the terminal, drawn over its cells.
 struct Placed {
@@ -2012,13 +2014,21 @@ impl TerminalView {
         self.sessions += 1;
         self.phase = Phase::Connecting;
         self._events = Some(cx.spawn(async move |this, cx| {
-            while let Some(event) = events.next().await {
-                if this
-                    .update(cx, |view, cx| view.on_session_event(event, cx))
-                    .is_err()
-                {
+            while let Some(first) = events.next().await {
+                // What's waiting is taken in one turn, output in a row
+                // joined: a program writing a byte at a time costs a turn
+                // per batch, not one per byte, and between turns input and
+                // the other panes get theirs.
+                let batch = batch(first, || events.try_next());
+                let taken = this.update(cx, |view, cx| {
+                    for event in batch {
+                        view.on_session_event(event, cx);
+                    }
+                });
+                if taken.is_err() {
                     break;
                 }
+                yield_now().await;
             }
         }));
         cx.notify();
@@ -4374,6 +4384,28 @@ fn literal(text: &str) -> String {
     pattern
 }
 
+/// `first` and the events waiting after it, up to about [`BATCH_BYTES`] of
+/// output, in order, output in a row joined into one.
+fn batch(first: Event, mut waiting: impl FnMut() -> Option<Event>) -> Vec<Event> {
+    let size = |event: &Event| match event {
+        Event::Output(bytes) => bytes.len(),
+        _ => 0,
+    };
+    let mut bytes = size(&first);
+    let mut batch = vec![first];
+    while bytes < BATCH_BYTES {
+        let Some(event) = waiting() else {
+            break;
+        };
+        bytes += size(&event);
+        match (batch.last_mut(), event) {
+            (Some(Event::Output(joined)), Event::Output(more)) => joined.extend_from_slice(&more),
+            (_, event) => batch.push(event),
+        }
+    }
+    batch
+}
+
 /// Where a search for the next match in `direction` starts: next to the
 /// match `current`, or at the bottom.
 fn origin(term: &Term<Listener>, current: Option<&Match>, direction: Direction) -> GridPoint {
@@ -5049,6 +5081,30 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(selected(&view, cx), None);
         assert_eq!(count(cx), Some((0, 0)));
+    }
+
+    #[test]
+    fn takes_waiting_events_in_one_turn_with_output_joined() {
+        use super::{BATCH_BYTES, batch};
+
+        let mut waiting = vec![
+            Event::Output(b"b".to_vec()),
+            Event::Lost,
+            Event::Output(b"c".to_vec()),
+            Event::Output(b"d".to_vec()),
+        ]
+        .into_iter();
+        let events = batch(Event::Output(b"a".to_vec()), || waiting.next());
+        assert!(
+            matches!(events.as_slice(), [Event::Output(ab), Event::Lost, Event::Output(cd)]
+                if ab == b"ab" && cd == b"cd"),
+            "{events:?}"
+        );
+        // Past the budget, the rest waits for the next turn.
+        let mut waiting = vec![Event::Output(b"later".to_vec())].into_iter();
+        let events = batch(Event::Output(vec![b'x'; BATCH_BYTES]), || waiting.next());
+        assert_eq!(events.len(), 1);
+        assert_eq!(waiting.len(), 1);
     }
 
     #[test]
