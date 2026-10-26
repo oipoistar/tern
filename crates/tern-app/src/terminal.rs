@@ -84,6 +84,8 @@ const REPLAY_SLICE: Duration = if cfg!(test) {
 } else {
     Duration::from_millis(4)
 };
+/// Events a recording is moved through between looks at the clock.
+const CLOCK_EVERY: usize = 64;
 /// What an inline image's cells hold: a character no font draws, in a
 /// colour naming the image (red and green) and its row (blue).
 const PLACEHOLDER: char = '\u{10EEEE}';
@@ -772,7 +774,7 @@ impl TerminalView {
         // Taken out meanwhile, so that they're fed as they are, not copied.
         let events = std::mem::take(&mut replay.cast.events);
         let (at, mut next) = (replay.at, replay.next);
-        let started = Instant::now();
+        let (started, mut fed) = (Instant::now(), 0);
         while let Some((when, shown)) = events.get(next) {
             if *when > at {
                 break;
@@ -788,7 +790,10 @@ impl TerminalView {
                 }
             }
             next += 1;
-            if started.elapsed() >= REPLAY_SLICE {
+            fed += 1;
+            // The clock is looked at every so many events: on some
+            // machines reading it costs more than an event (6 µs here).
+            if fed % CLOCK_EVERY == 0 && started.elapsed() >= REPLAY_SLICE {
                 break;
             }
         }
