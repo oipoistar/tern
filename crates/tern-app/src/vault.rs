@@ -1649,11 +1649,14 @@ impl VaultContent {
             });
         }
         let have = keys::list_in(&keys::dirs());
-        let _ = tern_core::sync::receive_keys(&keys::dirs(), &merged.keys, &have);
+        let received = tern_core::sync::receive_keys(&keys::dirs(), &merged.keys, &have);
         sync::set_state(
             cx,
             SyncState {
-                status: Status::Synced(tern_core::host::now_ms()),
+                status: match received {
+                    Ok(_) => Status::Synced(tern_core::host::now_ms()),
+                    Err(reason) => Status::Failed(reason.into()),
+                },
                 devices,
             },
         );

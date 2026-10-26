@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::Aead as _;
 use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305, XNonce};
+use russh::keys::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, HostGroup, new_id, now_ms};
@@ -34,6 +35,7 @@ use crate::keys::{self, KeyPair};
 use crate::paths;
 use crate::settings::{Appearance, Settings, TerminalSettings};
 use crate::snippet::Snippet;
+use crate::ssh::fingerprint;
 use crate::vault::{Tombstone, Vault};
 
 /// The folder inside the chosen one that holds the devices' files.
@@ -392,9 +394,11 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
         })
         .flatten();
 
+    // Only the same key as written twice is left out: a file can't hide
+    // another's key by naming its fingerprint first.
     let mut keys: Vec<SyncedKey> = Vec::new();
     for key in others.iter().flat_map(|snapshot| &snapshot.keys) {
-        if !keys.iter().any(|have| have.fingerprint == key.fingerprint) {
+        if !keys.contains(key) {
             keys.push(key.clone());
         }
     }
@@ -450,22 +454,37 @@ pub fn keys_to_sync(pairs: &[KeyPair], fingerprints: &[String]) -> Vec<SyncedKey
 }
 
 /// Writes synced keys this device lacks where Tern puts keys
-/// ([`keys::home`] among `dirs`), under free names. Returns how many it
-/// wrote.
+/// ([`keys::home`] among `dirs`), under free names. A key that isn't the
+/// key pair it says it is is refused, and the others still arrive; the
+/// first refusal is the error, in one line. Returns how many it wrote.
 pub fn receive_keys(
     dirs: &[(PathBuf, bool)],
     synced: &[SyncedKey],
     have: &[KeyPair],
 ) -> Result<usize, String> {
-    let mut written = 0;
+    let mut written: Vec<&str> = Vec::new();
+    let mut refused = None;
     for key in synced
         .iter()
         .filter(|key| !have.iter().any(|pair| pair.fingerprint == key.fingerprint))
     {
-        keys::add(dirs, &key.name, key.private.as_bytes(), &key.public)?;
-        written += 1;
+        if written.contains(&key.fingerprint.as_str()) {
+            continue;
+        }
+        let named = PublicKey::from_openssh(key.public.trim())
+            .is_ok_and(|public| fingerprint(&public) == key.fingerprint);
+        let kept = match named {
+            true => keys::add(dirs, &key.name, key.private.as_bytes(), &key.public).map(|_| ()),
+            false => Err("it isn't the key it names".into()),
+        };
+        match kept {
+            Ok(()) => written.push(&key.fingerprint),
+            Err(reason) => {
+                refused.get_or_insert(format!("A synced key was refused: {reason}"));
+            }
+        }
     }
-    Ok(written)
+    refused.map_or(Ok(written.len()), Err)
 }
 
 /// What every format of a sync file starts with.
@@ -939,6 +958,54 @@ mod tests {
         let arrived = keys::list_in(&there);
         assert_eq!(arrived[0].fingerprint, chosen.fingerprint);
         assert_eq!(receive_keys(&there, &synced, &arrived).unwrap(), 0);
+        for dir in [ours, theirs] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_synced_key_must_be_the_key_it_names() {
+        let (ours, theirs) = (
+            std::env::temp_dir().join(format!("tern-sync-forged-a-{}", std::process::id())),
+            std::env::temp_dir().join(format!("tern-sync-forged-b-{}", std::process::id())),
+        );
+        for dir in [&ours, &theirs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let (here, there) = ([(ours.clone(), true)], [(theirs.clone(), true)]);
+        let chosen = keys::generate(&here, "deploy", None, "").unwrap();
+        let good = keys_to_sync(&keys::list_in(&here), &[chosen.fingerprint])[0].clone();
+        // Ssh's settings, sent as that key; and the key under a fingerprint
+        // that isn't its own.
+        let forged = SyncedKey {
+            name: "config".into(),
+            private: "Host *\n  ProxyCommand sh\n".into(),
+            ..good.clone()
+        };
+        let lying = SyncedKey {
+            fingerprint: "SHA256:another".into(),
+            ..good.clone()
+        };
+        let carrying = |keys: Vec<SyncedKey>| {
+            let mut snapshot = snapshot(&Vault::default(), &settings("Laptop"), keys);
+            snapshot.device_id = new_id();
+            snapshot
+        };
+        // The forged one can't hide the real one by coming first.
+        let merged = merge(
+            &Vault::default(),
+            &settings("Desk"),
+            &[carrying(vec![forged]), carrying(vec![good, lying])],
+        );
+        assert_eq!(merged.keys.len(), 3);
+        assert_eq!(
+            receive_keys(&there, &merged.keys, &[]).unwrap_err(),
+            "A synced key was refused: it isn't a private key"
+        );
+        let arrived = keys::list_in(&there);
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived[0].name, "deploy");
+        assert!(!theirs.join("config").exists());
         for dir in [ours, theirs] {
             std::fs::remove_dir_all(dir).unwrap();
         }

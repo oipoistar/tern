@@ -174,6 +174,17 @@ pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Creates the file at `path` as [`private_file`] does, but only if
+/// nothing is there yet, not even a link: it never writes through or over
+/// what another put there.
+pub fn new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

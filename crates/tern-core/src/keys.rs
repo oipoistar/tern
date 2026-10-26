@@ -16,17 +16,34 @@ use crate::vault::Vault;
 
 /// RSA keys shorter than this are weak by today's advice.
 const RSA_MIN_BITS: u32 = 3072;
+/// A key file's size at most: anything bigger is something else, and
+/// isn't read.
+const KEY_AT_MOST: u64 = 64 * 1024;
 /// The file in Tern's own folder noting the keys it put in `~/.ssh`, a line
 /// of fingerprint and name each: those are Tern's to delete there.
 const MADE: &str = ".made";
-/// Files in `~/.ssh` that are never keys.
-const NOT_KEYS: [&str; 5] = [
-    "known_hosts",
-    "known_hosts.old",
+/// Files in `~/.ssh` that are never keys: what ssh and sshd read there. No
+/// key is written under one of these names, in any case (macOS's folders
+/// ignore it), so a key from elsewhere can't become ssh's settings, the
+/// keys allowed to sign in, or a command run at sign-in.
+const NOT_KEYS: [&str; 11] = [
+    "agent",
+    "allowed_signers",
     "authorized_keys",
+    "authorized_keys2",
+    "authorized_principals",
     "config",
     "environment",
+    "known_hosts",
+    "known_hosts.old",
+    "known_hosts2",
+    "rc",
 ];
+
+/// Whether `name` is one of ssh's own files ([`NOT_KEYS`]).
+fn ssh_file(name: &str) -> bool {
+    NOT_KEYS.iter().any(|file| name.eq_ignore_ascii_case(file))
+}
 
 /// A private key file and its public half.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,19 +189,27 @@ pub fn list_in(dirs: &[(PathBuf, bool)]) -> Vec<KeyPair> {
 /// keeps the public half readable even in an encrypted key).
 fn read_pair(path: &Path, ours: bool) -> Option<KeyPair> {
     let name = path.file_name()?.to_string_lossy().into_owned();
-    if name.ends_with(".pub") || name.ends_with(".tmp") || NOT_KEYS.contains(&name.as_str()) {
+    if name.ends_with(".pub") || name.ends_with(".tmp") || ssh_file(&name) {
+        return None;
+    }
+    let small = |path: &Path| std::fs::metadata(path).is_ok_and(|file| file.len() <= KEY_AT_MOST);
+    if !small(path) {
+        return None;
+    }
+    // The private key must look like one either way.
+    let private = std::fs::read(path).ok()?;
+    if !private.starts_with(b"-----BEGIN") {
         return None;
     }
     let from_pub = || {
-        let text = std::fs::read_to_string(public_path(path)).ok()?;
+        let public = public_path(path);
+        let text = small(&public)
+            .then(|| std::fs::read_to_string(public).ok())
+            .flatten()?;
         PublicKey::from_openssh(text.trim()).ok()
     };
     let from_private = || {
-        // Keys are small; anything big is something else.
-        if std::fs::metadata(path).ok()?.len() > 64 * 1024 {
-            return None;
-        }
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = std::str::from_utf8(&private).ok()?;
         Some(
             PrivateKey::from_openssh(text.trim())
                 .ok()?
@@ -192,11 +217,6 @@ fn read_pair(path: &Path, ours: bool) -> Option<KeyPair> {
                 .clone(),
         )
     };
-    // The private key must exist and look like one either way.
-    let head = std::fs::read(path).ok()?;
-    if !head.starts_with(b"-----BEGIN") {
-        return None;
-    }
     let key = from_pub().or_else(from_private)?;
     Some(KeyPair {
         name,
@@ -241,7 +261,18 @@ pub fn check_name(dir: &Path, name: &str) -> Result<(), String> {
     if name.contains(['/', '\\', ':']) || name.starts_with('.') || name.ends_with(".pub") {
         return Err("A key's name can't contain / \\ or :, start with a dot or end in .pub".into());
     }
-    if dir.join(name).exists() || public_path(&dir.join(name)).exists() {
+    if name.chars().any(char::is_control) {
+        return Err("A key's name can't contain control characters".into());
+    }
+    if ssh_file(name) {
+        return Err(format!("{name} is one of ssh's own files"));
+    }
+    if cfg!(windows) {
+        crate::sftp::windows_name(name)?;
+    }
+    // A link to nowhere takes the name too.
+    let taken = |path: &Path| path.symlink_metadata().is_ok();
+    if taken(&dir.join(name)) || taken(&public_path(&dir.join(name))) {
         return Err("A key by that name already exists".into());
     }
     Ok(())
@@ -259,15 +290,29 @@ pub fn free_name(dir: &Path, base: &str) -> String {
 }
 
 /// `name` made fit for a key's file name, so a free one can be found from
-/// it: no path separators, colons or leading dots, and no `.pub` ending.
+/// it: no path separators, colons, control characters or leading dots, no
+/// `.pub` ending, and on Windows nothing it forbids in a name.
 fn usable_name(name: &str) -> String {
-    let name = name.trim().replace(['/', '\\', ':'], "-");
+    let forbidden =
+        |c: char| c.is_control() || "/\\:".contains(c) || (cfg!(windows) && "<>\"|?*".contains(c));
+    let name: String = name
+        .trim()
+        .chars()
+        .map(|c| if forbidden(c) { '-' } else { c })
+        .collect();
     let name = name.trim_start_matches('.');
     let name = name.strip_suffix(".pub").unwrap_or(name);
-    if name.is_empty() {
-        "key".into()
+    // Windows drops a name's last dots and spaces.
+    let name = if cfg!(windows) {
+        name.trim_end_matches(['.', ' '])
     } else {
-        name.into()
+        name
+    };
+    match name {
+        "" => "key".into(),
+        // A device's name on Windows (`CON`, `nul.txt`) is never a file's.
+        name if cfg!(windows) && crate::sftp::windows_name(name).is_err() => format!("key-{name}"),
+        name => name.into(),
     }
 }
 
@@ -320,18 +365,80 @@ pub fn import(dirs: &[(PathBuf, bool)], from: &Path) -> Result<KeyPair, String> 
 }
 
 /// Writes a key pair where Tern puts keys ([`home`]), as Tern's, under
-/// `name` or the first free name after it.
+/// `name` or the first free name after it. It's checked first ([`check_pair`]):
+/// what arrives from elsewhere, as a synced key does, may not be one.
 pub fn add(
     dirs: &[(PathBuf, bool)],
     name: &str,
     private: &[u8],
     public: &str,
 ) -> Result<KeyPair, String> {
+    let public = check_pair(private, public)?
+        .to_openssh()
+        .map_err(|error| error.to_string())?;
     let dir = home(dirs).ok_or("There's no folder for keys")?;
     let path = dir.join(free_name(&dir, &usable_name(name)));
-    write_pair(&path, private, public)?;
-    let pair = read_pair(&path, true).ok_or("the key can't be read back")?;
+    write_pair(&path, private, &public)?;
+    let Some(pair) = read_pair(&path, true) else {
+        let _ = std::fs::remove_file(public_path(&path));
+        let _ = std::fs::remove_file(&path);
+        return Err("the key can't be read back".into());
+    };
     claim(dirs, pair)
+}
+
+/// The public half of the key pair `private` and `public`, checked before
+/// either is written, so nothing but a key pair lands where keys go:
+/// `private` is one PEM block of a private key and nothing else, and its
+/// public half, where it can be read without the passphrase, is `public`.
+fn check_pair(private: &[u8], public: &str) -> Result<PublicKey, String> {
+    let public = PublicKey::from_openssh(public.trim())
+        .map_err(|_| "its public half isn't a public key".to_string())?;
+    let text = std::str::from_utf8(private)
+        .ok()
+        .map(str::trim)
+        .filter(|text| pem_block(text))
+        .ok_or("it isn't a private key")?;
+    let inside = PrivateKey::from_openssh(text)
+        .or_else(|_| russh::keys::decode_secret_key(text, None).map_err(|_| ()))
+        .ok()
+        .map(|key| key.public_key().clone());
+    match inside {
+        Some(inside) if inside.key_data() != public.key_data() => {
+            Err("its two halves aren't one key".into())
+        }
+        // An older format hides an encrypted key's public half too: its
+        // shape is all there is to check.
+        _ => Ok(public),
+    }
+}
+
+/// Whether `text` is one PEM block of a private key and nothing else:
+/// `-----BEGIN … PRIVATE KEY-----`, lines of base64 (after an older
+/// format's headers), and the matching end.
+fn pem_block(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim_end);
+    let Some(label) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("-----BEGIN "))
+        .and_then(|line| line.strip_suffix("-----"))
+        .filter(|label| label.ends_with("PRIVATE KEY"))
+    else {
+        return false;
+    };
+    let end = format!("-----END {label}-----");
+    let mut ended = false;
+    for line in lines {
+        let base64 = line
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c));
+        let header = line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:");
+        if ended || !(line == end || base64 || header) {
+            return false;
+        }
+        ended = line == end;
+    }
+    ended
 }
 
 /// Copies a key pair into the folder `to`, never over an existing file.
@@ -342,9 +449,7 @@ pub fn export(pair: &KeyPair, to: &Path) -> Result<PathBuf, String> {
         return Err(format!("{} already has a {}", to.display(), pair.name));
     }
     let private = std::fs::read(&pair.path).map_err(|error| error.to_string())?;
-    write_private(&path, &private)?;
-    std::fs::write(public_path(&path), format!("{}\n", pair.public))
-        .map_err(|error| error.to_string())?;
+    write_pair(&path, &private, &pair.public)?;
     Ok(path)
 }
 
@@ -378,25 +483,55 @@ pub fn install_command(public: &str) -> String {
     )
 }
 
-/// Writes a key pair: the private key readable by its owner only, the
-/// public half beside it.
+/// Writes a key pair as new files: the private key readable by its owner
+/// only, the public half beside it. Neither replaces a file, and a pair
+/// that can't be written whole leaves nothing behind.
 fn write_pair(path: &Path, private: &[u8], public: &str) -> Result<(), String> {
     write_private(path, private)?;
-    std::fs::write(public_path(path), format!("{}\n", public.trim()))
-        .map_err(|error| error.to_string())
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    write_new(
+        &public_path(path),
+        options.open(public_path(path)),
+        format!("{}\n", public.trim()).as_bytes(),
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })
 }
 
-/// Writes a private key so only its owner can read it, as OpenSSH insists.
+/// Writes a private key as a new file only its owner can read, as OpenSSH
+/// insists.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-
     if let Some(dir) = path.parent() {
         paths::private_dir(dir).map_err(|error| error.to_string())?;
     }
-    paths::private_file(path)
-        .and_then(|mut file| file.write_all(bytes))
-        .map_err(|error| error.to_string())?;
-    restrict_to_owner(path).map_err(|error| format!("can't restrict {}: {error}", path.display()))
+    write_new(path, paths::new_private_file(path), bytes)?;
+    restrict_to_owner(path).map_err(|error| {
+        let _ = std::fs::remove_file(path);
+        format!("can't restrict {}: {error}", path.display())
+    })
+}
+
+/// Fills `file`, just made at `path` and so Tern's own, with `bytes`; one
+/// that can't be written whole is removed.
+fn write_new(
+    path: &Path,
+    file: std::io::Result<std::fs::File>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut file = file.map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{} already exists", path.display()),
+        _ => error.to_string(),
+    })?;
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
@@ -530,6 +665,82 @@ mod tests {
         assert!(export(&first, &out).is_err(), "never over an existing file");
         for dir in [ours, elsewhere, out] {
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn writes_only_key_pairs_and_never_as_sshs_own_files() {
+        let (ssh, ours, source) = (
+            scratch("only-ssh"),
+            scratch("only-ours"),
+            scratch("only-source"),
+        );
+        let dirs = [(ssh.clone(), false), (ours.clone(), true)];
+        let home = super::home(&dirs).unwrap();
+        let made = generate(&only(&source), "source", None, "").unwrap();
+        let private = std::fs::read(&made.path).unwrap();
+
+        // What isn't a key pair is refused before anything is written:
+        // text, a key with more after it, a key with another's public half.
+        assert!(add(&dirs, "rc", b"# not a key\n", &made.public).is_err());
+        let mut more = private.clone();
+        more.extend_from_slice(b"Host *\n  ProxyCommand sh\n");
+        assert!(add(&dirs, "rc", &more, &made.public).is_err());
+        let other = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let other = other.public_key().to_openssh().unwrap();
+        assert_eq!(
+            add(&dirs, "rc", &private, &other).unwrap_err(),
+            "its two halves aren't one key"
+        );
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+
+        // A key named as one of ssh's own files, in any case, goes under
+        // another name.
+        for name in ["rc", "config", "AUTHORIZED_KEYS"] {
+            let kept = add(&dirs, name, &private, &made.public).unwrap();
+            assert_eq!(kept.name, format!("{name}-2"));
+            assert!(!home.join(name).exists());
+        }
+        assert!(check_name(&home, "Config").is_err());
+        // Nor can a name carry a line into the note of Tern's keys.
+        assert_eq!(
+            usable_name("id\nSHA256:x id_ed25519"),
+            "id-SHA256-x id_ed25519"
+        );
+        assert!(check_name(&home, "id\tx").is_err());
+
+        // A file already there is never written over, and a pair that
+        // can't be written whole leaves nothing.
+        std::fs::write(home.join("taken"), "theirs").unwrap();
+        assert!(write_pair(&home.join("taken"), &private, &made.public).is_err());
+        assert_eq!(std::fs::read(home.join("taken")).unwrap(), b"theirs");
+        assert!(!home.join("taken.pub").exists());
+        std::fs::write(home.join("lone.pub"), "theirs").unwrap();
+        assert!(write_pair(&home.join("lone"), &private, &made.public).is_err());
+        assert!(!home.join("lone").exists());
+        assert_eq!(std::fs::read(home.join("lone.pub")).unwrap(), b"theirs");
+        for dir in [ssh, ours, source] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn knows_a_private_keys_block() {
+        assert!(pem_block(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nQUJD\n-----END RSA PRIVATE KEY-----"
+        ));
+        assert!(pem_block(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJD\nRA==\n-----END OPENSSH PRIVATE KEY-----"
+        ));
+        for not in [
+            "-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJD\n-----END OPENSSH PRIVATE KEY-----\nmore",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQU JD\n-----END OPENSSH PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJD\n-----END RSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJD",
+            "Host *",
+        ] {
+            assert!(!pem_block(not), "{not}");
         }
     }
 

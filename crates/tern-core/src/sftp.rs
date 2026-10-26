@@ -594,7 +594,7 @@ fn local_name(name: &str) -> Result<(), String> {
 /// something else: a drive (`d:notes`), a file's hidden stream
 /// (`notes:old`), a device (`CON`, `nul.txt`), wildcards, control
 /// characters, and a name ending in a dot or a space, which it drops.
-fn windows_name(name: &str) -> Result<(), String> {
+pub(crate) fn windows_name(name: &str) -> Result<(), String> {
     if let Some(c) = name.chars().find(|c| r#"<>:"|?*"#.contains(*c)) {
         return Err(format!("A name on Windows can't contain {c}"));
     }
