@@ -82,6 +82,8 @@ const REPLAY_TICK: Duration = Duration::from_millis(33);
 const PLACEHOLDER: char = '\u{10EEEE}';
 /// Inline images kept, at most: older ones stop showing.
 const IMAGES_KEPT: usize = 64;
+/// Inline images a pane decodes at once; the rest wait their turn.
+const DECODES_AT_ONCE: usize = 2;
 /// Lines a search looks through at a time, before checking the clock.
 const HUNT_LINES: i32 = 256;
 /// How long a search works before everything else on the UI thread gets a
@@ -98,7 +100,9 @@ const BATCH_BYTES: usize = 128 * 1024;
 
 /// An inline image placed in the terminal, drawn over its cells.
 struct Placed {
-    image: Arc<RenderImage>,
+    /// `None` while it's decoded, in the background: its cells are kept
+    /// for it meanwhile.
+    image: Option<Arc<RenderImage>>,
     /// Its first column, and the columns and rows it covers.
     col: usize,
     cols: u16,
@@ -337,6 +341,9 @@ pub struct TerminalView {
     images: HashMap<u16, Placed>,
     image_order: VecDeque<u16>,
     next_image: u16,
+    /// Images still to decode, oldest first, and how many are decoding.
+    undecoded: VecDeque<Undecoded>,
+    decoding: usize,
     /// This pane plays back a recording instead of a session: the
     /// recording, unless it couldn't be read.
     played: bool,
@@ -1569,6 +1576,8 @@ impl TerminalView {
             images: HashMap::new(),
             image_order: VecDeque::new(),
             next_image: 1,
+            undecoded: VecDeque::new(),
+            decoding: 0,
             played: false,
             replay: None,
             _probing: None,
@@ -1633,7 +1642,7 @@ impl TerminalView {
                             cx.emit(TerminalEvent::Folder(folder));
                         }
                     }
-                    Piece::Image(content) => self.place_image(&content),
+                    Piece::Image(content) => self.place_image(&content, cx),
                 }
             }
         }
@@ -1721,19 +1730,21 @@ impl TerminalView {
     }
 
     /// Shows an inline image at the cursor over cells written for it,
-    /// leaving the cursor after it on its last row, as iTerm2 does. One
-    /// that isn't shown inline, or can't be read, is left out.
-    fn place_image(&mut self, content: &[u8]) {
+    /// leaving the cursor after it on its last row, as iTerm2 does. Only
+    /// its header is read here: its cells are set aside at once, in order
+    /// with the text around it, and the picture is decoded in the
+    /// background. One that isn't shown inline, or can't be read, is left
+    /// out.
+    fn place_image(&mut self, content: &[u8], cx: &mut Context<Self>) {
         let Ok(inline) = images::parse(content) else {
             return;
         };
         if !inline.inline {
             return;
         }
-        let Some(decoded) = decode_image(&inline.data) else {
+        let Some(pixels) = image_size(&inline.data) else {
             return;
         };
-        let mut pixels = decoded.into_rgba8();
         let geometry = self.grid.get();
         // Before the pane is first drawn, a cell is about this big.
         let cell = if geometry.cell_width > px(0.) {
@@ -1741,44 +1752,34 @@ impl TerminalView {
         } else {
             (8., 17.)
         };
-        let (cols, rows) = images::cells(
-            &inline,
-            pixels.dimensions(),
-            cell,
-            (self.size.cols, self.size.rows),
-        );
-        // Kept no larger than it's shown, twice over for sharp zooming.
-        let (width, height) = pixels.dimensions();
-        let fit = f32::min(
-            f32::from(cols) * cell.0 * 2. / width as f32,
-            f32::from(rows) * cell.1 * 2. / height as f32,
-        );
-        if fit < 1. {
-            let size = |side: u32| ((side as f32 * fit).round() as u32).max(1);
-            pixels = image::imageops::resize(
-                &pixels,
-                size(width),
-                size(height),
-                image::imageops::FilterType::Triangle,
-            );
-        }
-        // GPUI paints BGRA.
-        for pixel in pixels.pixels_mut() {
-            pixel.0.swap(0, 2);
-        }
-        let image = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
+        let (cols, rows) = images::cells(&inline, pixels, cell, (self.size.cols, self.size.rows));
         let id = self.next_image;
         self.next_image = self.next_image.checked_add(1).unwrap_or(1);
         let col = self.term.grid().cursor.point.column.0;
         self.images.insert(
             id,
             Placed {
-                image,
+                image: None,
                 col,
                 cols,
                 rows,
             },
         );
+        // Kept no larger than it's shown, twice over for sharp zooming.
+        let fit = (
+            (f32::from(cols) * cell.0 * 2.) as u32,
+            (f32::from(rows) * cell.1 * 2.) as u32,
+        );
+        self.undecoded.push_back(Undecoded {
+            id,
+            data: inline.data,
+            fit,
+        });
+        // A flood of images: those that would stop showing anyway go.
+        while self.undecoded.len() > IMAGES_KEPT {
+            self.undecoded.pop_front();
+        }
+        self.decode_images(cx);
         self.image_order.push_back(id);
         if self.image_order.len() > IMAGES_KEPT
             && let Some(oldest) = self.image_order.pop_front()
@@ -1795,6 +1796,34 @@ impl TerminalView {
         }
         cells += "\x1b[39m";
         self.parser.advance(&mut self.term, cells.as_bytes());
+    }
+
+    /// Decodes waiting images in the background, [`DECODES_AT_ONCE`] at a
+    /// time, each shown once it's done.
+    fn decode_images(&mut self, cx: &mut Context<Self>) {
+        while self.decoding < DECODES_AT_ONCE {
+            let Some(next) = self.undecoded.pop_front() else {
+                return;
+            };
+            if !self.images.contains_key(&next.id) {
+                continue;
+            }
+            self.decoding += 1;
+            let id = next.id;
+            let decoded = cx.background_spawn(async move { render_image(&next.data, next.fit) });
+            cx.spawn(async move |this, cx| {
+                let image = decoded.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.decoding -= 1;
+                    if let (Some(image), Some(placed)) = (image, this.images.get_mut(&id)) {
+                        placed.image = Some(image);
+                        cx.notify();
+                    }
+                    this.decode_images(cx);
+                });
+            })
+            .detach();
+        }
     }
 
     /// Acts on a shell integration mark, where the output has got to.
@@ -3346,7 +3375,9 @@ impl TerminalView {
             if cell.c == PLACEHOLDER {
                 if let AnsiColor::Spec(Rgb { r, g, b }) = cell.fg {
                     let id = u16::from(r) << 8 | u16::from(g);
-                    if let Some(placed) = self.images.get(&id) {
+                    if let Some(placed) = self.images.get(&id)
+                        && let Some(image) = &placed.image
+                    {
                         let image_row = usize::from(b);
                         match frame.images.last_mut() {
                             Some(tile)
@@ -3363,7 +3394,7 @@ impl TerminalView {
                                 to: col + 1,
                                 id,
                                 image_row,
-                                image: placed.image.clone(),
+                                image: image.clone(),
                                 col: placed.col,
                                 cols: placed.cols,
                                 rows: placed.rows,
@@ -3887,13 +3918,57 @@ impl Render for TerminalView {
 /// alacritty_terminal's configuration from Tern's terminal settings.
 /// Decodes an image a host sent, refusing one over 8,192 pixels a side or
 /// 64 MiB decoded: a few bytes can claim a huge image.
+/// An inline image waiting to be decoded: the number its cells carry, its
+/// file, and the size in pixels it's kept no larger than.
+struct Undecoded {
+    id: u16,
+    data: Vec<u8>,
+    fit: (u32, u32),
+}
+
+/// An image's size in pixels, from its header alone: `None` for one that
+/// can't be read, or bigger than [`decode_image`] takes.
+fn image_size(data: &[u8]) -> Option<(u32, u32)> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    (width <= MAX_IMAGE_SIDE && height <= MAX_IMAGE_SIDE).then_some((width, height))
+}
+
+/// The image in `data`, decoded and made no larger than `fit`, as GPUI
+/// paints it.
+fn render_image(data: &[u8], fit: (u32, u32)) -> Option<Arc<RenderImage>> {
+    let mut pixels = decode_image(data)?.into_rgba8();
+    let (width, height) = pixels.dimensions();
+    let scale = f32::min(fit.0 as f32 / width as f32, fit.1 as f32 / height as f32);
+    if scale < 1. {
+        let size = |side: u32| ((side as f32 * scale).round() as u32).max(1);
+        pixels = image::imageops::resize(
+            &pixels,
+            size(width),
+            size(height),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    // GPUI paints BGRA.
+    for pixel in pixels.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
+}
+
+/// The widest and tallest image decoded, in pixels.
+const MAX_IMAGE_SIDE: u32 = 8192;
+
 fn decode_image(data: &[u8]) -> Option<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
         .with_guessed_format()
         .ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
     limits.max_alloc = Some(64 << 20);
     reader.limits(limits);
     reader.decode().ok()
@@ -4592,6 +4667,19 @@ mod tests {
             view.on_session_event(Event::Output(download.into_bytes()), cx)
         });
         view.read_with(cx, |view, _| assert_eq!(view.images.len(), 1));
+        // Its cells are set aside at once, in order with the text; the
+        // picture shows once it's decoded, in the background.
+        view.update(cx, |view, cx| {
+            let again = format!("]1337;File=inline=1;width=5:{data}");
+            view.on_session_event(Event::Output(again.into_bytes()), cx);
+            assert_eq!(view.images.len(), 2);
+            let decoded = view.images.values().filter(|placed| placed.image.is_some());
+            assert_eq!(decoded.count(), 1);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.images.values().all(|placed| placed.image.is_some()));
+        });
     }
 
     #[gpui::test]
@@ -4615,7 +4703,7 @@ mod tests {
         let (view, cx) = pane_with(cx, &output);
         view.read_with(cx, |view, _| {
             let placed = view.images.values().next().unwrap();
-            let size = placed.image.size(0);
+            let size = placed.image.as_ref().expect("decoded").size(0);
             assert!(size.width.0 <= 5 * 8 * 2, "{size:?}");
             assert_eq!(size.width.0 / size.height.0, 2, "its shape kept");
         });
