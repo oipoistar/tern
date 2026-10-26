@@ -126,6 +126,30 @@ async fn copies_files_both_ways() {
         .unwrap();
     assert_eq!(put, "/docs/big (2).bin");
     assert_eq!(sftp.list("/").await.unwrap()[0].items, Some(4));
+
+    // Copies of one name at once each get a name of their own.
+    sftp.mkdir("/reports").await.unwrap();
+    let mut copies = tokio::task::JoinSet::new();
+    for n in 0..16u8 {
+        let folder = here.join(format!("from-{n}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("report.txt"), [b'a' + n; 50_000]).unwrap();
+        let copy = sftp.upload(folder.join("report.txt"), "/reports", Progress::default());
+        copies.spawn(async move { (n, copy.await.unwrap()) });
+    }
+    let mut landed = Vec::new();
+    while let Some(copied) = copies.join_next().await {
+        let (n, remote) = copied.unwrap();
+        let path = served.join(remote.trim_start_matches('/'));
+        assert_eq!(std::fs::read(path).unwrap(), [b'a' + n; 50_000], "{remote}");
+        landed.push(remote);
+    }
+    landed.sort();
+    landed.dedup();
+    assert_eq!(landed.len(), 16);
+    for n in 0..16u8 {
+        std::fs::remove_dir_all(here.join(format!("from-{n}"))).unwrap();
+    }
     if cfg!(unix) {
         // A `\` belongs to a name on Unix, but would part folders on a
         // host running Windows.
@@ -235,6 +259,45 @@ async fn copies_files_both_ways() {
     );
     assert_eq!(after.size, 9);
     assert_eq!(after, sftp.stamp("/motd").await.unwrap());
+    let beside = |served: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(served)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".motd.tern-"))
+            .collect()
+    };
+    assert!(beside(&served).is_empty());
+
+    // One that can't be written over keeps the host's file as it was, and
+    // the new version stays beside it, by the name the error gives.
+    let mut locked = std::fs::metadata(served.join("motd"))
+        .unwrap()
+        .permissions();
+    locked.set_readonly(true);
+    std::fs::set_permissions(served.join("motd"), locked.clone()).unwrap();
+    std::fs::write(scratch.join("motd"), "newer still").unwrap();
+    let refused = sftp
+        .replace(scratch.join("motd"), "/motd", Progress::default())
+        .await
+        .unwrap_err();
+    let kept = beside(&served);
+    assert_eq!(kept.len(), 1);
+    assert!(
+        refused.ends_with(&format!("the new version is in {}", kept[0])),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(served.join(&kept[0])).unwrap(),
+        "newer still"
+    );
+    assert_eq!(
+        std::fs::read_to_string(served.join("motd")).unwrap(),
+        "brand new"
+    );
+    #[allow(clippy::permissions_set_readonly_false)]
+    locked.set_readonly(false);
+    std::fs::set_permissions(served.join("motd"), locked).unwrap();
+    std::fs::remove_file(served.join(&kept[0])).unwrap();
 
     // And on this computer.
     mkdir_local(&here.join("box")).unwrap();

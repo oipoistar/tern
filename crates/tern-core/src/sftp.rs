@@ -1,9 +1,10 @@
 //! Files over a session's connection, with SFTP: listing folders on the host
 //! and on this computer, copying files either way with progress, and
 //! renaming, deleting, making folders and changing permissions. A copy
-//! never replaces a file; it takes the next free name instead. A name that
-//! comes from the other side has to be one name where it lands, never a
-//! path out of the folder.
+//! never replaces a file; it takes the next free name instead, made only if
+//! nothing has it yet, so copies of one name at once each get their own. A
+//! name that comes from the other side has to be one name where it lands,
+//! never a path out of the folder.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use russh::{ChannelMsg, client};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use russh_sftp::client::fs::File;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::ssh::spawn;
 
@@ -266,21 +268,12 @@ impl Sftp {
             one_name(&name, &['/', '\\'])?;
             let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
             progress.start(source.metadata().await.map_err(failed)?.len());
-            let remote = free_remote_name(&sftp, &remote_dir, &name).await;
-            let mut target = sftp
-                .create(&remote)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut buffer = vec![0u8; CHUNK];
-            loop {
-                let read = source.read(&mut buffer).await.map_err(failed)?;
-                if read == 0 {
-                    break;
-                }
-                target.write_all(&buffer[..read]).await.map_err(failed)?;
-                progress.add(read);
+            let (remote, mut target) = create_remote(&sftp, &remote_dir, &name).await?;
+            if let Err(error) = pour(&mut source, &mut target, &progress).await {
+                // Not left there looking like the whole file.
+                let _ = sftp.remove_file(remote).await;
+                return Err(error);
             }
-            target.shutdown().await.map_err(failed)?;
             Ok(remote)
         })
     }
@@ -335,8 +328,14 @@ impl Sftp {
     }
 
     /// Writes this computer's file `local` over the host's file `remote`,
-    /// keeping its permissions: how an edited copy goes back. Returns the
-    /// host's file as it is afterwards.
+    /// as that same file, so its owner, permissions and links stay: how an
+    /// edited copy goes back. The copy reaches the host first, as a new
+    /// file beside it, so one that fails partway (the connection drops, the
+    /// disk fills) leaves the host's file as it was; then it's written over
+    /// the file, and the new one removed. Should writing over fail in turn,
+    /// the new one stays, and the error names it. Where nothing new can be
+    /// made beside the file, it's written over directly. Returns the host's
+    /// file as it is afterwards.
     pub fn replace(
         &self,
         local: PathBuf,
@@ -347,22 +346,39 @@ impl Sftp {
         spawn(async move {
             let failed = |error: std::io::Error| error.to_string();
             let mut source = tokio::fs::File::open(&local).await.map_err(failed)?;
-            progress.start(source.metadata().await.map_err(failed)?.len());
-            let flags = OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE;
-            let mut target = sftp
-                .open_with_flags(&remote, flags)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut buffer = vec![0u8; CHUNK];
-            loop {
-                let read = source.read(&mut buffer).await.map_err(failed)?;
-                if read == 0 {
-                    break;
+            let size = source.metadata().await.map_err(failed)?.len();
+            let aside = beside(&sftp, &remote).await;
+            // Twice over when it goes beside the file first.
+            progress.start(if aside.is_some() { 2 * size } else { size });
+            let aside = match aside {
+                Some((path, mut file)) => {
+                    let copied = pour(&mut source, &mut file, &progress).await;
+                    if let Err(error) = copied.and(source.rewind().await.map_err(failed)) {
+                        let _ = sftp.remove_file(path).await;
+                        return Err(error);
+                    }
+                    Some(path)
                 }
-                target.write_all(&buffer[..read]).await.map_err(failed)?;
-                progress.add(read);
+                None => None,
+            };
+            let flags = OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE;
+            let over = match sftp.open_with_flags(&remote, flags).await {
+                Ok(mut target) => pour(&mut source, &mut target, &progress).await,
+                Err(error) => Err(error.to_string()),
+            };
+            match (over, aside) {
+                (Ok(()), Some(aside)) => {
+                    let _ = sftp.remove_file(aside).await;
+                }
+                (Ok(()), None) => {}
+                (Err(error), Some(aside)) => {
+                    return Err(format!(
+                        "{error}; the new version is in {}",
+                        name_of(&aside)
+                    ));
+                }
+                (Err(error), None) => return Err(error),
             }
-            target.shutdown().await.map_err(failed)?;
             let metadata = sftp
                 .metadata(remote)
                 .await
@@ -449,6 +465,73 @@ async fn remove_remote(sftp: &SftpSession, path: String, dir: bool) -> Result<()
 /// compared: a socket's and a block device's include a folder's bit.
 fn is_folder(mode: Option<u32>) -> bool {
     mode.is_some_and(|mode| mode & TYPE == FOLDER)
+}
+
+/// Makes a new file in the host's folder `dir` and opens it for writing:
+/// `name`, or the first of `name (2)`… that's free. The host makes a name
+/// only if nothing has it (`EXCLUDE`), so two copies of one name at once
+/// each get their own; names in use are passed over first, for a host that
+/// doesn't heed that.
+async fn create_remote(
+    sftp: &SftpSession,
+    dir: &str,
+    name: &str,
+) -> Result<(String, File), String> {
+    let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+    for n in 1.. {
+        let path = match n {
+            1 => join(dir, name),
+            n => join(dir, &numbered(name, n)),
+        };
+        if sftp.try_exists(path.clone()).await.unwrap_or(false) {
+            continue;
+        }
+        match sftp.open_with_flags(path.clone(), flags).await {
+            Ok(file) => return Ok((path, file)),
+            // SFTP has no "exists" of its own: a name that's there now was
+            // taken meanwhile. Any other failure is the copy's.
+            Err(_) if sftp.try_exists(path.clone()).await.unwrap_or(false) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("there's no free name".into())
+}
+
+/// A new file beside the host's file `path`, for this user only, opened for
+/// writing: `.name.tern-1a2b3c4d`. `None` where its folder takes none.
+async fn beside(sftp: &SftpSession, path: &str) -> Option<(String, File)> {
+    let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+    let attributes = FileAttributes {
+        permissions: Some(0o600),
+        ..FileAttributes::empty()
+    };
+    let name = format!(".{}.tern-{:08x}", name_of(path), rand::random::<u32>());
+    let aside = join(&parent(path), &name);
+    let file = sftp
+        .open_with_flags_and_attributes(aside.clone(), flags, attributes)
+        .await
+        .ok()?;
+    Some((aside, file))
+}
+
+/// Copies all of `source` into the host's file `target` and closes it,
+/// counting in `progress`.
+async fn pour(
+    source: &mut (impl AsyncRead + Unpin),
+    target: &mut File,
+    progress: &Progress,
+) -> Result<(), String> {
+    let failed = |error: std::io::Error| error.to_string();
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = source.read(&mut buffer).await.map_err(failed)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read]).await.map_err(failed)?;
+        progress.add(read);
+    }
+    target.shutdown().await.map_err(failed)
 }
 
 /// The first of `dir/name`, `dir/name (2)`… on the host that doesn't exist.

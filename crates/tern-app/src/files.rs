@@ -67,6 +67,9 @@ struct Editing {
     edit: Edit,
     /// Checking the host, writing back or asking: the next check waits.
     busy: bool,
+    /// The copy as it was when it last couldn't go back: still to go, at
+    /// its next save or once SFTP opens again.
+    refused: Option<Stamp>,
 }
 
 struct Transfer {
@@ -207,6 +210,10 @@ impl FilesPanel {
         // The folder is only worth going back to if SFTP had opened.
         let dir = self.sftp.take().map(|_| self.remote_dir.clone());
         self.open_sftp(&pane, dir, cx);
+        // Copies that couldn't go back over the old connection try the new.
+        for editing in &mut self.edits {
+            editing.refused = None;
+        }
         cx.notify();
         true
     }
@@ -553,6 +560,7 @@ impl FilesPanel {
                             ours,
                         },
                         busy: false,
+                        refused: None,
                     });
                     this.watch(cx);
                 }
@@ -605,7 +613,7 @@ impl FilesPanel {
             let Ok(ours) = edits::stamp(&editing.edit.local) else {
                 continue;
             };
-            if !editing.edit.changed_here(&ours) {
+            if !editing.edit.changed_here(&ours) || editing.refused == Some(ours) {
                 continue;
             }
             editing.busy = true;
@@ -670,10 +678,14 @@ impl FilesPanel {
         let then =
             move |this: &mut Self, replaced: Result<Stamp, String>, _: &mut Context<Self>| {
                 if let Some(editing) = this.edits.iter_mut().find(|e| e.edit.remote == remote) {
-                    // A copy that couldn't go back waits for its next save.
-                    editing.edit.ours = ours;
-                    if let Ok(theirs) = replaced {
-                        editing.edit.theirs = theirs;
+                    match replaced {
+                        Ok(theirs) => {
+                            editing.edit.ours = ours;
+                            editing.edit.theirs = theirs;
+                            editing.refused = None;
+                        }
+                        // Still to go back, so not taken for gone.
+                        Err(_) => editing.refused = Some(ours),
                     }
                     editing.busy = false;
                 }
