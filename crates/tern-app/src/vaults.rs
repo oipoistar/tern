@@ -51,7 +51,7 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Vaults)) {
     change(&mut vaults);
     if let Some(file) = &file {
         // Not written down, the change only doesn't outlast Tern.
-        let _ = vaults.save(file);
+        tern_core::paths::write_json_soon(file, &vaults);
     }
     cx.set_global(Open { vaults, file });
     cx.refresh_windows();

@@ -480,15 +480,25 @@ impl Vault {
     /// Writes the vault to `path`: to a temporary file first, then renamed
     /// over the old one, so a crash mid-write never leaves half a file.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        let mut json = serde_json::to_string_pretty(&FileOut {
+        let mut json = serde_json::to_string_pretty(&self.file())?;
+        json.push('\n');
+        paths::write_atomically(path, json.as_bytes())
+    }
+
+    /// Like [`Vault::save_to`], on the thread [`paths::write_soon`] writes
+    /// on: the caller doesn't wait for the disk.
+    pub fn save_soon(&self, path: &Path) -> paths::Written {
+        paths::write_json_soon(path, &self.file())
+    }
+
+    fn file(&self) -> FileOut<'_> {
+        FileOut {
             version: FILE_VERSION,
             groups: &self.groups,
             snippets: &self.snippets,
             identities: &self.identities,
             deleted: &self.deleted,
-        })?;
-        json.push('\n');
-        paths::write_atomically(path, json.as_bytes())
+        }
     }
 }
 
@@ -548,6 +558,7 @@ pub struct Opened {
 /// numbered if that exists) and the vault starts empty; one from a newer
 /// Tern stays where it is and nothing is saved over it.
 pub fn open(path: &Path) -> Opened {
+    paths::settle(path);
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -620,6 +631,7 @@ impl<'a> Hops<'a> {
 /// The vault at `path` as it is, for looking in a vault that isn't open:
 /// nothing when it's missing or can't be read, and nothing is moved.
 pub fn read(path: &Path) -> Option<Vault> {
+    paths::settle(path);
     parse(&std::fs::read_to_string(path).ok()?).ok()
 }
 

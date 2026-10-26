@@ -1,7 +1,10 @@
 //! Where Tern keeps its own files, and how it writes them.
 
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Tern's per-user data directory. `TERN_DATA_DIR` overrides it (tests and
 /// portable installs).
@@ -136,6 +139,170 @@ pub fn network_path(path: &Path) -> bool {
     slash(start.next()) && slash(start.next())
 }
 
+/// How a write that [`write_soon`] was asked for went, once it's done.
+pub struct Written(tokio::sync::oneshot::Receiver<Result<(), String>>);
+
+impl Written {
+    /// Waits for the write to be done, blocking: never on a UI thread.
+    pub fn wait(self) -> Result<(), String> {
+        self.0
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("it wasn't written".into()))
+    }
+}
+
+/// Writes `bytes` to `path` as [`write_atomically`] does, but on a thread
+/// of its own, so the caller never waits for the disk. Files are written
+/// in the order asked for; a file asked for again before it's written is
+/// written once, with the newest contents, so a burst of changes costs
+/// one write. [`wait_for_writes`] waits for them all, as Tern quits.
+pub fn write_soon(path: &Path, bytes: Vec<u8>) -> Written {
+    let (answer, written) = tokio::sync::oneshot::channel();
+    let writer = writer();
+    let mut queue = writer.lock();
+    match queue.waiting.iter_mut().find(|write| write.path == path) {
+        Some(write) => {
+            write.bytes = bytes;
+            write.answers.push(answer);
+        }
+        None => queue.waiting.push_back(Write {
+            path: path.to_path_buf(),
+            bytes,
+            answers: vec![answer],
+        }),
+    }
+    writer.changed.notify_all();
+    Written(written)
+}
+
+/// [`write_soon`] for `value` as pretty JSON, as Tern's own files are.
+pub fn write_json_soon(path: &Path, value: &impl serde::Serialize) -> Written {
+    match serde_json::to_string_pretty(value) {
+        Ok(mut json) => {
+            json.push('\n');
+            write_soon(path, json.into_bytes())
+        }
+        Err(error) => {
+            let (answer, written) = tokio::sync::oneshot::channel();
+            let _ = answer.send(Err(error.to_string()));
+            Written(written)
+        }
+    }
+}
+
+/// Waits, at most `limit`, until every write [`write_soon`] was given is
+/// done; says whether they all were.
+pub fn wait_for_writes(limit: Duration) -> bool {
+    let Some(writer) = WRITER.get() else {
+        return true;
+    };
+    let deadline = Instant::now() + limit;
+    let mut queue = writer.lock();
+    while !queue.waiting.is_empty() || queue.writing.is_some() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        queue = writer
+            .changed
+            .wait_timeout(queue, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    true
+}
+
+/// Waits, at most a few seconds, until a write of `path` that
+/// [`write_soon`] was given is done, so that what reads one of Tern's
+/// files reads what was last written.
+pub fn settle(path: &Path) {
+    let Some(writer) = WRITER.get() else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut queue = writer.lock();
+    while queue.waiting.iter().any(|write| write.path == path)
+        || queue.writing.as_deref() == Some(path)
+    {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        queue = writer
+            .changed
+            .wait_timeout(queue, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
+
+static WRITER: OnceLock<&'static Writer> = OnceLock::new();
+
+/// The thread [`write_soon`] writes on, and what it has to write.
+struct Writer {
+    queue: Mutex<Queue>,
+    /// Signalled when there's a write to do, and when one is done.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// Oldest first.
+    waiting: VecDeque<Write>,
+    /// The file being written.
+    writing: Option<PathBuf>,
+}
+
+/// A file to write: its newest contents, and who waits for them.
+struct Write {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    answers: Vec<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+fn writer() -> &'static Writer {
+    WRITER.get_or_init(|| {
+        let writer: &'static Writer = Box::leak(Box::new(Writer {
+            queue: Mutex::default(),
+            changed: Condvar::new(),
+        }));
+        std::thread::Builder::new()
+            .name("tern-writes".into())
+            .spawn(|| writer.run())
+            .expect("a thread for writing files");
+        writer
+    })
+}
+
+impl Writer {
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn run(&self) {
+        let mut queue = self.lock();
+        loop {
+            let Some(write) = queue.waiting.pop_front() else {
+                queue = self
+                    .changed
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            queue.writing = Some(write.path.clone());
+            drop(queue);
+            let written =
+                write_atomically(&write.path, &write.bytes).map_err(|error| error.to_string());
+            for answer in write.answers {
+                let _ = answer.send(written.clone());
+            }
+            queue = self.lock();
+            queue.writing = None;
+            self.changed.notify_all();
+        }
+    }
+}
+
 /// Writes `bytes` to `path` through a temporary file renamed over the old
 /// one, so a crash mid-write never leaves half a file. Creates the folder.
 /// On Unix, files and folders made are the user's alone (0600 and 0700):
@@ -217,6 +384,39 @@ pub fn new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writes_on_a_thread_of_its_own_the_newest_contents_once() {
+        use std::time::Duration;
+
+        use super::{settle, wait_for_writes, write_json_soon, write_soon};
+
+        let dir = std::env::temp_dir().join(format!("tern-write-soon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("settings.json");
+        let answers: Vec<_> = (0..50)
+            .map(|n| write_soon(&file, n.to_string().into_bytes()))
+            .collect();
+        assert!(wait_for_writes(Duration::from_secs(10)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "49");
+        // Everyone asking hears how the write carrying their bytes went.
+        for answer in answers {
+            assert_eq!(answer.wait(), Ok(()));
+        }
+
+        // What reads a file being written waits for it.
+        write_json_soon(&file, &["a", "b"]);
+        settle(&file);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[\n  \"a\",\n  \"b\"\n]\n"
+        );
+
+        // One that can't be written says why: its folder is a file.
+        let refused = write_soon(&file.join("inside"), b"x".to_vec());
+        assert!(refused.wait().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]

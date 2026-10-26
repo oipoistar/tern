@@ -1286,7 +1286,7 @@ impl VaultContent {
     fn save_waiting(&self) {
         if let Some(file) = &self.waiting_file {
             // Not written down, it only doesn't wait past a restart.
-            let _ = self.waiting.save(file);
+            paths::write_json_soon(file, &self.waiting);
         }
     }
 
@@ -1526,7 +1526,7 @@ impl VaultContent {
     fn save_sources(&self) {
         if let Some(file) = &self.sources_file {
             // Not written down, a source only isn't there next time.
-            let _ = self.sources.save(file);
+            paths::write_json_soon(file, &self.sources);
         }
     }
 
@@ -1675,11 +1675,9 @@ impl VaultContent {
         }
     }
 
-    /// Writes the vault to its file, if it has one. A failure stays on
-    /// screen until a later save works.
     /// Saves a change made here, and syncs it shortly.
     fn persist(&mut self, cx: &mut Context<Self>) {
-        self.write_vault();
+        self.write_vault(cx);
         if vaults::sync_settings(cx).folder.is_some() {
             self._sync_soon = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SYNC_SETTLE).await;
@@ -1769,7 +1767,7 @@ impl VaultContent {
         vault.relink_keys(&relink);
         if vault != self.vault {
             self.vault = vault;
-            self.write_vault();
+            self.write_vault(cx);
             if self.vault.find(&self.selected).is_none() {
                 self.selected = self
                     .vault
@@ -1805,16 +1803,28 @@ impl VaultContent {
         cx.notify();
     }
 
-    fn write_vault(&mut self) {
+    /// Writes the vault to its file, if it has one, on a thread of its own
+    /// so an edit never waits for the disk. A failure shows once it's
+    /// known, until a later save works.
+    fn write_vault(&mut self, cx: &mut Context<Self>) {
         self.filter.forget_missing(&self.vault);
-        let Some(path) = &self.file else {
+        let Some(path) = self.file.clone() else {
             return;
         };
-        self.notice = self
-            .vault
-            .save_to(path)
-            .err()
-            .map(|error| format!("Can't save {}: {error}", path.display()).into());
+        // Its answer is waited for in the background too, so that the
+        // writing thread only ever hands it over (and tests stay in step).
+        let written = self.vault.save_soon(&path);
+        let written = cx.background_spawn(async move { written.wait() });
+        cx.spawn(async move |this, cx| {
+            let written = written.await;
+            let _ = this.update(cx, |this, cx| {
+                this.notice = written
+                    .err()
+                    .map(|error| format!("Can't save {}: {error}", path.display()).into());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     #[cfg(test)]
@@ -2348,14 +2358,14 @@ impl VaultContent {
             let path = paths::history(&other);
             let mut history = History::load(&path);
             history.record(visit);
-            let _ = history.save(&path);
+            paths::write_json_soon(&path, &history);
             return;
         }
         self.history.record(visit);
         if let Some(path) = &self.history_file {
             // History is a convenience; failing to save it isn't worth a
             // message.
-            let _ = self.history.save(path);
+            paths::write_json_soon(path, &self.history);
         }
         if let Some(view) = &self.history_view {
             let visits = self.history.visits.clone();

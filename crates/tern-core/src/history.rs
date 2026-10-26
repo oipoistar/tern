@@ -81,6 +81,7 @@ impl History {
     /// The history in `path`. A missing or unreadable file is an empty
     /// history: unlike the vault, losing it costs little.
     pub fn load(path: &Path) -> Self {
+        paths::settle(path);
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())

@@ -79,6 +79,13 @@ fn main() {
                 }
             })
             .detach();
+            // Files are written on a thread of their own; what's still to
+            // write, quitting asked for included, is written before Tern
+            // ends.
+            cx.on_app_quit(|_| async {
+                tern_core::paths::wait_for_writes(std::time::Duration::from_secs(2));
+            })
+            .detach();
             if benching {
                 bench::start(cx);
             } else {

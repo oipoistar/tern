@@ -37,6 +37,7 @@ pub struct Sources {
 impl Sources {
     /// The sources in `path`; none if it's missing or unreadable.
     pub fn load(path: &Path) -> Self {
+        crate::paths::settle(path);
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())

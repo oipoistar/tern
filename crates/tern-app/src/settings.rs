@@ -56,8 +56,10 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
         settings.updated = tern_core::host::now_ms();
     }
     if let Some(file) = &file {
-        // A setting that can't be saved still applies until Tern quits.
-        let _ = settings.save(file);
+        // Written on a thread of its own, so typing a value never waits for
+        // the disk. A setting that can't be saved still applies until Tern
+        // quits.
+        tern_core::paths::write_json_soon(file, &settings);
     }
     cx.set_global(Current { settings, file });
     cx.refresh_windows();
@@ -73,7 +75,7 @@ pub fn take_synced(cx: &mut App, synced: &SyncedSettings) {
     settings.terminal = synced.terminal.clone().clamped();
     settings.updated = synced.updated;
     if let Some(file) = &file {
-        let _ = settings.save(file);
+        tern_core::paths::write_json_soon(file, &settings);
     }
     cx.set_global(Current { settings, file });
     cx.refresh_windows();

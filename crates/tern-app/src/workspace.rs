@@ -859,8 +859,9 @@ impl Workspace {
                 .collect(),
             active: self.active,
         };
-        // Not written down, the tabs only don't come back.
-        let _ = open.save(file);
+        // Written on a thread of its own: switching tabs never waits for
+        // the disk. Not written down, the tabs only don't come back.
+        tern_core::paths::write_json_soon(file, &open);
         let ids = tabs
             .iter()
             .map(|tab| tab.iter().map(|pane| pane.entity_id()).collect())

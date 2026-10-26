@@ -103,6 +103,7 @@ pub struct OpenTabs {
 impl OpenTabs {
     /// The tabs saved at `path`; none when it's missing or unreadable.
     pub fn load(path: &Path) -> Self {
+        paths::settle(path);
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())

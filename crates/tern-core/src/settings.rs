@@ -154,6 +154,7 @@ impl Settings {
     /// The settings in `path`, in range; the defaults when there's no file
     /// or it can't be read.
     pub fn load(path: &Path) -> Self {
+        paths::settle(path);
         let mut settings: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())

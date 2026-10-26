@@ -59,6 +59,7 @@ impl Vaults {
     /// The list in `path`, always with the first vault in it and with the
     /// open one among them; just the first when there's no list yet.
     pub fn load(path: &Path) -> Self {
+        crate::paths::settle(path);
         let mut vaults: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
