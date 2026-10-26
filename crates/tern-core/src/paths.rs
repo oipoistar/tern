@@ -144,14 +144,44 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         private_dir(dir)?;
     }
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file = private_file(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    // A temporary file of its own, so writes at once (two windows, or two
+    // Terns on one folder) never write into one another's.
+    let (temp, mut file) = loop {
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(format!(".{:08x}.tmp", rand::random::<u32>()));
+        let temp = PathBuf::from(temp);
+        match new_private_file(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    std::fs::rename(&temp, path)
+    let replaced = written.and_then(|()| replace(&temp, path));
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    replaced
+}
+
+/// Renames `from` over `to`. Windows refuses for a moment while another
+/// rename over `to` is under way, so it's tried again then.
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && tries < 100 =>
+            {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Creates `dir` and the folders above it that are missing, the ones made
@@ -204,6 +234,32 @@ mod tests {
             assert_eq!(mode(&dir.join("inner")), 0o700);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_at_once_never_share_a_temporary_file() {
+        let dir = std::env::temp_dir().join(format!("tern-paths-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("vault.json");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let writers: Vec<_> = (0..16u8)
+            .map(|n| {
+                let (start, path) = (start.clone(), path.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    write_atomically(&path, &[b'a' + n; 1 << 20])
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        // One of them, whole, and nothing left over.
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written.len(), 1 << 20);
+        assert!(written.iter().all(|&byte| byte == written[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

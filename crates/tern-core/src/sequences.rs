@@ -49,9 +49,12 @@ pub struct Scanner {
 
 impl Scanner {
     /// Whether `bytes` holds nothing for the scanner: no OSC sequence
-    /// starts in it and nothing is held. Most output is like that.
+    /// starts in it, nor may at its end (an `ESC` the next chunk's `]`
+    /// follows), and nothing is held. Most output is like that.
     pub fn quiet(&self, bytes: &[u8]) -> bool {
-        self.held.is_empty() && !bytes.windows(2).any(|pair| pair == b"\x1b]")
+        self.held.is_empty()
+            && bytes.last() != Some(&0x1b)
+            && !bytes.windows(2).any(|pair| pair == b"\x1b]")
     }
 
     /// Splits `bytes` (after what was held) into output for the terminal and
@@ -256,6 +259,34 @@ mod tests {
             scanner.scan(b"\x1b]2;title\x07"),
             [text("\x1b]2;title\x07")]
         );
+    }
+
+    #[test]
+    fn a_sequence_split_after_its_escape_is_still_seen() {
+        // Each split of each sequence, as feeding the terminal goes: past
+        // the scanner while it's quiet, through it otherwise.
+        for whole in [
+            &b"ls\x1b]7;file://host/work\x07$ "[..],
+            b"ls\x1b]133;A\x07$ ",
+            b"ls\x1b]1337;File=inline=1:QUJD\x1b\\$ ",
+        ] {
+            for split in 1..whole.len() {
+                let mut scanner = Scanner::default();
+                let mut pieces = Vec::new();
+                for chunk in [&whole[..split], &whole[split..]] {
+                    if scanner.quiet(chunk) {
+                        pieces.push(Piece::Text(chunk.to_vec()));
+                    } else {
+                        pieces.extend(scanner.scan(chunk));
+                    }
+                }
+                let picked = pieces
+                    .iter()
+                    .filter(|piece| !matches!(piece, Piece::Text(_)))
+                    .count();
+                assert_eq!(picked, 1, "{whole:?} split at {split}");
+            }
+        }
     }
 
     #[test]
