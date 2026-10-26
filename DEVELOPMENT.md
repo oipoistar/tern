@@ -57,9 +57,11 @@ claude mcp add tern-dev -- C:\path\to\tern\target\debug\tern.exe --mcp
 
 On Windows Tern is a windowed program, with no console of its own, and
 carries Tern's icon and version (`crates/tern-app/build.rs`;
-`resources/tern.ico` is `docs/images/mark.svg` at each icon size). Started
-from a terminal it still prints there, as `--bench` needs. A panic, on any
-system, writes what happened and where to `crash.log` in the data folder.
+`resources/tern.ico` is `docs/images/mark.svg` at each icon size) and the
+C runtime (`.cargo/config.toml`), so it runs without the Visual C++
+redistributable. Started from a terminal it still prints there, as
+`--bench` needs. A panic, on any system, writes what happened and where to
+`crash.log` in the data folder.
 
 ## Develop
 

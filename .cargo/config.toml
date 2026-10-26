@@ -1,0 +1,7 @@
+# tern.exe carries the C runtime instead of importing VCRUNTIME140.dll,
+# which Windows doesn't ship (only the Visual C++ redistributable does), so
+# it runs on a PC without it. C that build scripts compile with `cc` (ring's)
+# follows the flag and links the same runtime. A RUSTFLAGS variable replaces
+# these flags, so the workflows mustn't set one.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
