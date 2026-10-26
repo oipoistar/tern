@@ -7,6 +7,7 @@
 //! switcher opens another vault, which the workspace shows in place of this
 //! one ([`VaultEvent::Switch`]).
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,6 +32,7 @@ use tern_core::ssh::{
     known_host_keys_for, probe, quick_destination,
 };
 use tern_core::sync::Syncer;
+use tern_core::vault::Hops;
 use tern_core::vaults::{FIRST, VaultEntry};
 use tern_core::waiting::Waiting;
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
@@ -79,6 +81,48 @@ const DEV_KEY: &str = "dev/test-ssh/id_ed25519";
 /// Wide enough for `user@host` and two tags; three fit beside the sidebar
 /// in the default window.
 const CARD_WIDTH: f32 = 320.;
+
+/// A row of the hosts screen's list, which builds only those on screen.
+/// Each says what its height depends on, so that a change to one leaves
+/// the others measured.
+#[derive(Clone, Debug, PartialEq)]
+enum Item {
+    /// The toolbar and the lines under it: an open group form (and whether
+    /// it shows a problem), a notice, the typed destination.
+    Top {
+        form: Option<bool>,
+        notice: bool,
+        destination: bool,
+    },
+    /// A group's heading, by the group's index in the vault, with its hosts
+    /// shown (by index) and whether a command fills it or failed to.
+    Heading {
+        group: usize,
+        shown: Vec<usize>,
+        sourced: bool,
+        problem: bool,
+    },
+    /// Hosts of a group, by index: a line of cards, or a row. The last
+    /// before the next group is spaced from it.
+    Hosts {
+        group: usize,
+        hosts: Vec<usize>,
+        cards: bool,
+        last: bool,
+    },
+}
+
+/// The space between two cards, and between lines of them.
+const CARD_GAP: f32 = 14.;
+
+/// How many cards fit side by side in `width`; three before the list is
+/// first laid out.
+fn cards_per_line(width: Pixels) -> usize {
+    if width <= px(0.) {
+        return 3;
+    }
+    (((width + px(CARD_GAP)) / px(CARD_WIDTH + CARD_GAP)).floor() as usize).max(1)
+}
 
 /// A session without a shell, carrying a host's rules that run without a
 /// terminal.
@@ -207,6 +251,12 @@ pub struct VaultContent {
     notice: Option<SharedString>,
     selected: String,
     live: LiveSlots,
+    /// The hosts screen's list, what it lists as of the last render, and
+    /// how many cards that put on a line, for the width its list last had.
+    hosts_list: ListState,
+    items: Vec<Item>,
+    per_line: usize,
+    hosts_width: Rc<Cell<Pixels>>,
     /// Art for each host whose key a known_hosts file already trusts, by
     /// (address, port).
     keys: HashMap<(String, u16), Randomart>,
@@ -561,6 +611,7 @@ impl VaultContent {
     /// The hosts the search and the filter let through, with their group,
     /// in vault order.
     fn visible(&self) -> Vec<(&str, &Host)> {
+        let hops = self.vault.hops();
         self.vault
             .groups
             .iter()
@@ -570,11 +621,70 @@ impl VaultContent {
                     .iter()
                     .map(move |host| (group.name.as_str(), host))
             })
-            .filter(|(group, host)| {
-                host.matches(&self.query)
-                    && self.filter.matches(group, host, self.trace(host).status)
-            })
+            .filter(|(group, host)| self.lets_through(group, host, &hops))
             .collect()
+    }
+
+    /// Whether the search and the filter let `host`, of `group`, through.
+    fn lets_through<'a>(&self, group: &str, host: &'a Host, hops: &Hops<'a>) -> bool {
+        host.matches(&self.query)
+            && self
+                .filter
+                .matches(group, host, self.monitor.status(&hops.first_hop(host)))
+    }
+
+    /// What the hosts screen lists: the hosts the search and the filter
+    /// let through, by group, `per_line` cards to a line.
+    fn items(&self, per_line: usize) -> Vec<Item> {
+        let mut items = vec![Item::Top {
+            form: self.source_form.as_ref().map(|form| form.problem.is_some()),
+            notice: self.notice.is_some(),
+            destination: self.destination.is_some(),
+        }];
+        let hops = self.vault.hops();
+        let cards = self.layout == Layout::Cards;
+        for (index, group) in self.vault.groups.iter().enumerate() {
+            let shown: Vec<usize> = (0..group.hosts.len())
+                .filter(|&at| self.lets_through(&group.name, &group.hosts[at], &hops))
+                .collect();
+            if shown.is_empty() {
+                continue;
+            }
+            let lines: Vec<&[usize]> = shown.chunks(if cards { per_line } else { 1 }).collect();
+            let count = lines.len();
+            items.push(Item::Heading {
+                group: index,
+                shown: shown.clone(),
+                sourced: self.sources.command(&group.name).is_some(),
+                problem: self.source_problems.contains_key(&group.name),
+            });
+            items.extend(lines.into_iter().enumerate().map(|(n, line)| Item::Hosts {
+                group: index,
+                hosts: line.to_vec(),
+                cards,
+                last: n + 1 == count,
+            }));
+        }
+        items
+    }
+
+    /// Brings the list up to `items`. Only the rows between those that
+    /// stayed the same at either end are measured again, and the scroll
+    /// stays where it was.
+    fn set_items(&mut self, items: Vec<Item>) {
+        let old = &self.items;
+        let same = old.iter().zip(&items).take_while(|(a, b)| a == b).count();
+        let same_end = old[same..]
+            .iter()
+            .rev()
+            .zip(items[same..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if same < old.len() || same < items.len() {
+            self.hosts_list
+                .splice(same..old.len() - same_end, items.len() - same - same_end);
+        }
+        self.items = items;
     }
 
     /// Arrows move the selection, Enter connects, E edits; only while the
@@ -752,6 +862,10 @@ impl VaultContent {
             notice: None,
             selected,
             live,
+            hosts_list: ListState::new(0, ListAlignment::Top, px(300.)),
+            items: Vec::new(),
+            per_line: cards_per_line(px(0.)),
+            hosts_width: Rc::default(),
             keys: HashMap::new(),
             search,
             query: SharedString::default(),
@@ -2616,14 +2730,97 @@ impl VaultContent {
         cx.notify();
     }
 
-    fn hosts(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
-        let theme = ui.theme;
+    /// The hosts screen: a list that builds only the rows on screen, so a
+    /// vault of thousands costs what the hosts in view do. Laid out at a
+    /// width that fits another number of cards to a line, it lines them up
+    /// again.
+    fn hosts(&self, cx: &Context<Self>) -> impl IntoElement {
+        let (width, per_line, entity) = (self.hosts_width.clone(), self.per_line, cx.entity_id());
+        let cards = self.layout == Layout::Cards;
         div()
             .id("hosts")
             .flex_1()
             .min_w_0()
             .h_full()
-            .overflow_y_scroll()
+            .relative()
+            .child(
+                list(
+                    self.hosts_list.clone(),
+                    cx.processor(|this, ix, _, cx| this.host_item(ix, cx)),
+                )
+                .size_full(),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        width.set(bounds.size.width);
+                        if cards && cards_per_line(bounds.size.width) != per_line {
+                            cx.notify(entity);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+    }
+
+    /// Row `ix` of the hosts screen's list, built as it comes on screen.
+    fn host_item(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = theme::current(cx);
+        let ui = Ui {
+            theme: &theme,
+            live: &self.live,
+        };
+        match self.items.get(ix) {
+            Some(Item::Top { .. }) => self.hosts_top(&ui, cx).into_any_element(),
+            Some(Item::Heading { group, shown, .. }) => {
+                self.heading(*group, shown, &ui, cx).into_any_element()
+            }
+            Some(Item::Hosts {
+                group,
+                hosts,
+                cards,
+                last,
+            }) => {
+                let group = &self.vault.groups[*group];
+                let space = match (*last, *cards) {
+                    (true, _) => 22.,
+                    (false, true) => CARD_GAP,
+                    (false, false) => 8.,
+                };
+                // Each row of the list as wide as the list, as it would be in a
+                // column.
+                let line = div().w_full().pb(px(space)).flex();
+                if *cards {
+                    line.gap(px(CARD_GAP))
+                        .children(
+                            hosts
+                                .iter()
+                                .map(|&at| self.host_card(&group.hosts[at], &ui, cx)),
+                        )
+                        .into_any_element()
+                } else {
+                    line.flex_col()
+                        .children(
+                            hosts
+                                .iter()
+                                .map(|&at| self.host_row(&group.hosts[at], &ui, cx)),
+                        )
+                        .into_any_element()
+                }
+            }
+            None => div().into_any_element(),
+        }
+    }
+
+    /// The top of the hosts screen: the toolbar, and under it an open
+    /// group form, a notice and the typed destination.
+    fn hosts_top(&self, ui: &Ui, cx: &Context<Self>) -> impl IntoElement {
+        let theme = ui.theme;
+        div()
+            .w_full()
+            .pb(px(22.))
             .flex()
             .flex_col()
             .gap(px(22.))
@@ -2644,122 +2841,106 @@ impl VaultContent {
             .when_some(self.destination.clone(), |d, (target, identity)| {
                 d.child(destination_card(target, identity, theme, cx))
             })
-            .children({
-                let visible = self.visible();
-                self.vault.groups.iter().filter_map(move |group| {
-                    let hosts: Vec<&Host> = visible
-                        .iter()
-                        .filter(|(of, _)| *of == group.name)
-                        .map(|(_, host)| *host)
-                        .collect();
-                    if hosts.is_empty() {
-                        return None;
-                    }
-                    // The hosts shown, opened side by side in one go.
-                    let together: Vec<String> =
-                        hosts.iter().map(|host| host.name.clone()).collect();
-                    let open_all =
-                        (together.len() > 1).then(|| {
-                            let id = format!("open-group-{}", group.name);
-                            div()
-                                .id(SharedString::from(id.clone()))
-                                .debug_selector(move || id)
-                                .h(px(28.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .rounded(px(9.))
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.text2)
-                                .cursor_pointer()
-                                .hover(|d| d.bg(theme.card2))
-                                .child(icon(IconName::LayoutGrid, 13., theme.text2))
-                                .child("Open all")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_together(&together, cx)
-                                }))
-                        });
-                    let hosts = match self.layout {
-                        Layout::Cards => div().flex().flex_wrap().gap(px(14.)).children(
-                            hosts
-                                .into_iter()
-                                .map(|host| self.host_card(host, ui, cx).into_any_element()),
-                        ),
-                        Layout::List => div().flex().flex_col().gap(px(8.)).children(
-                            hosts
-                                .into_iter()
-                                .map(|host| self.host_row(host, ui, cx).into_any_element()),
-                        ),
-                    };
-                    // A group a command fills: Refresh runs it again (its
-                    // icon turning while it runs), the pencil opens it.
-                    let sourced = self.sources.command(&group.name).is_some().then(|| {
-                        let (refresh, change) = (
-                            format!("refresh-group-{}", group.name),
-                            format!("source-group-{}", group.name),
-                        );
-                        let (again, open) = (group.name.clone(), group.name.clone());
-                        let running = self.refreshing.contains(&group.name);
-                        let small = |id: String, glyph: IconName| {
-                            div()
-                                .id(SharedString::from(id.clone()))
-                                .debug_selector(move || id)
-                                .size(px(28.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(9.))
-                                .cursor_pointer()
-                                .hover(|d| d.bg(theme.card2))
-                                .child(icon(glyph, 13., theme.text2))
-                        };
-                        div()
-                            .flex()
-                            .child(
-                                small(
-                                    refresh,
-                                    if running {
-                                        IconName::LoaderCircle
-                                    } else {
-                                        IconName::RefreshCw
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.refresh_source(again.clone(), cx),
-                                )),
-                            )
-                            .child(small(change, IconName::Pencil).on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.open_source(Some(open.clone()), window, cx)
-                                },
-                            )))
-                    });
-                    let problem = self.source_problems.get(&group.name).cloned();
-                    Some(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(14.))
-                            .child(
-                                group_heading(group.name.clone(), theme)
-                                    .children(open_all)
-                                    .children(sourced),
-                            )
-                            .when_some(problem, |d, problem| {
-                                d.child(
-                                    div()
-                                        .px(px(4.))
-                                        .text_size(px(12.))
-                                        .text_color(theme.danger)
-                                        .truncate()
-                                        .child(problem),
-                                )
-                            })
-                            .child(hosts),
+    }
+
+    /// The heading of the group at `index`, whose hosts `shown` are on the
+    /// screen.
+    fn heading(
+        &self,
+        index: usize,
+        shown: &[usize],
+        ui: &Ui,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = ui.theme;
+        let group = &self.vault.groups[index];
+        // The hosts shown, opened side by side in one go.
+        let together: Vec<String> = shown
+            .iter()
+            .map(|&at| group.hosts[at].name.clone())
+            .collect();
+        let open_all = (together.len() > 1).then(|| {
+            let id = format!("open-group-{}", group.name);
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id)
+                .h(px(28.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(9.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text2)
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.card2))
+                .child(icon(IconName::LayoutGrid, 13., theme.text2))
+                .child("Open all")
+                .on_click(cx.listener(move |this, _, _, cx| this.open_together(&together, cx)))
+        });
+        // A group a command fills: Refresh runs it again (its
+        // icon turning while it runs), the pencil opens it.
+        let sourced = self.sources.command(&group.name).is_some().then(|| {
+            let (refresh, change) = (
+                format!("refresh-group-{}", group.name),
+                format!("source-group-{}", group.name),
+            );
+            let (again, open) = (group.name.clone(), group.name.clone());
+            let running = self.refreshing.contains(&group.name);
+            let small = |id: String, glyph: IconName| {
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id)
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.card2))
+                    .child(icon(glyph, 13., theme.text2))
+            };
+            div()
+                .flex()
+                .child(
+                    small(
+                        refresh,
+                        if running {
+                            IconName::LoaderCircle
+                        } else {
+                            IconName::RefreshCw
+                        },
                     )
-                })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.refresh_source(again.clone(), cx)),
+                    ),
+                )
+                .child(small(change, IconName::Pencil).on_click(cx.listener(
+                    move |this, _, window, cx| this.open_source(Some(open.clone()), window, cx),
+                )))
+        });
+        let problem = self.source_problems.get(&group.name).cloned();
+        div()
+            .w_full()
+            .pb(px(14.))
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                group_heading(group.name.clone(), theme)
+                    .children(open_all)
+                    .children(sourced),
+            )
+            .when_some(problem, |d, problem| {
+                d.child(
+                    div()
+                        .px(px(4.))
+                        .text_size(px(12.))
+                        .text_color(theme.danger)
+                        .truncate()
+                        .child(problem),
+                )
             })
     }
 
@@ -3291,6 +3472,10 @@ impl Render for VaultContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Placeholders re-record their marks during this frame's prepaint.
         self.live.clear();
+        if self.section == Section::Hosts {
+            self.per_line = cards_per_line(self.hosts_width.get());
+            self.set_items(self.items(self.per_line));
+        }
         let theme = theme::current(cx);
         let ui = Ui {
             theme: &theme,
@@ -3333,7 +3518,7 @@ impl Render for VaultContent {
             .map(|d| match screen {
                 Some(view) => d.child(view),
                 None => d
-                    .child(self.hosts(&ui, cx))
+                    .child(self.hosts(cx))
                     .when_some(self.vault.find(&self.selected), |d, host| {
                         d.child(self.side_panel(host, &ui, cx))
                     }),
@@ -3542,6 +3727,46 @@ mod tests {
             .unwrap_or_else(|| panic!("nothing on screen is tagged {selector}"));
         cx.simulate_click(bounds.center(), Modifiers::none());
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn builds_only_the_hosts_on_screen(cx: &mut TestAppContext) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, point, px};
+        use tern_core::HostGroup;
+
+        cx.update(gpui_kit::init);
+        let mut many = Vault::default();
+        many.groups.push(HostGroup {
+            name: "Many".into(),
+            hosts: (0..300)
+                .map(|i| Host::new(&format!("h{i:03}"), "me", "10.0.0.1", 22))
+                .collect(),
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            VaultContent::new(many, None, LiveSlots::default(), window, cx)
+        });
+        cx.run_until_parked();
+        let first = cx
+            .debug_bounds("host-h000")
+            .expect("the first card is built");
+        assert!(
+            cx.debug_bounds("host-h299").is_none(),
+            "far below, not built"
+        );
+
+        // Scrolled to the end, a wheel turn at a time as the list measures
+        // what comes into view, the last cards are built, and the first no
+        // longer.
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: first.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-1000.))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        }
+        assert!(cx.debug_bounds("host-h299").is_some());
+        assert!(cx.debug_bounds("host-h000").is_none());
     }
 
     #[gpui::test]
