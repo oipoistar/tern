@@ -8,7 +8,9 @@ mod common;
 
 use common::*;
 use russh::keys::{Algorithm, PrivateKey};
-use tern_core::sftp::{Entry, Progress, list_local, mkdir_local, remove_local, rename_local};
+use tern_core::sftp::{
+    Entry, Progress, list_local, mkdir_local, remove_local, rename_local, set_counts,
+};
 use tern_core::ssh::{Credential, Event, Session, check_host_key};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -49,7 +51,11 @@ async fn copies_files_both_ways() {
 
     let sftp = input.open_sftp().await.expect("the server offers SFTP");
     assert_eq!(sftp.home().await.unwrap(), "/");
-    let listed = sftp.list("/").await.unwrap();
+    // Names first; the folders' items counted after.
+    let mut listed = sftp.list("/").await.unwrap();
+    assert_eq!(listed[0].items, None);
+    let counts = sftp.count("/", &listed).await;
+    set_counts(&mut listed, &counts);
     assert_eq!(
         listed,
         [
@@ -125,7 +131,8 @@ async fn copies_files_both_ways() {
         .await
         .unwrap();
     assert_eq!(put, "/docs/big (2).bin");
-    assert_eq!(sftp.list("/").await.unwrap()[0].items, Some(4));
+    let listed = sftp.list("/").await.unwrap();
+    assert_eq!(sftp.count("/", &listed).await, [("docs".to_string(), 4)]);
 
     // Copies of one name at once each get a name of their own.
     sftp.mkdir("/reports").await.unwrap();

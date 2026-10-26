@@ -20,8 +20,12 @@ use crate::ssh::spawn;
 
 /// Bytes moved per read and write.
 const CHUNK: usize = 32 * 1024;
-/// Folders on the host whose items are counted per listing, at most.
+/// Folders whose items are counted per listing, at most.
 const COUNT_AT_MOST: usize = 64;
+/// Folders on the host counted at once.
+const COUNTS_AT_ONCE: usize = 8;
+/// How long counting one folder on the host may take.
+const COUNT_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 /// Where permission bits keep a file's type (`S_IFMT`).
 const TYPE: u32 = 0o170000;
 /// A folder's type there (`S_IFDIR`).
@@ -123,8 +127,8 @@ impl Sftp {
         })
     }
 
-    /// What `dir` holds, folders first, with the items of the first
-    /// folders counted.
+    /// What `dir` holds, folders first. Folders' items aren't counted: see
+    /// [`Sftp::count`], so the names show without waiting for that.
     pub fn list(&self, dir: &str) -> impl Future<Output = Result<Vec<Entry>, String>> + 'static {
         let (sftp, dir) = (self.0.clone(), dir.to_string());
         spawn(async move {
@@ -146,30 +150,49 @@ impl Sftp {
                 .filter(|entry| entry.name != "." && entry.name != "..")
                 .collect();
             sort(&mut entries);
-            let mut counts = tokio::task::JoinSet::new();
-            for (index, entry) in entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.dir)
-                .take(COUNT_AT_MOST)
-            {
-                let (sftp, path) = (sftp.clone(), join(&dir, &entry.name));
-                counts.spawn(async move {
-                    let items = sftp.read_dir(path).await.ok().map(|read| {
-                        read.filter(|entry| {
-                            let name = entry.file_name();
-                            name != "." && name != ".."
-                        })
-                        .count()
-                    });
-                    (index, items)
-                });
-            }
-            while let Some(Ok((index, items))) = counts.join_next().await {
-                entries[index].items = items;
-            }
             Ok(entries)
         })
+    }
+
+    /// How many items the first [`COUNT_AT_MOST`] folders of `entries` (a
+    /// listing of `dir`) hold, by name, a few counted at a time; a folder
+    /// that can't be read, or takes longer than [`COUNT_TIME`], is left out.
+    pub fn count(
+        &self,
+        dir: &str,
+        entries: &[Entry],
+    ) -> impl Future<Output = Vec<(String, usize)>> + 'static + use<> {
+        let (sftp, dir) = (self.0.clone(), dir.to_string());
+        let mut folders: Vec<String> = counted(entries);
+        let counting = spawn(async move {
+            let mut counts = Vec::new();
+            let mut running = tokio::task::JoinSet::new();
+            folders.reverse();
+            while !folders.is_empty() || !running.is_empty() {
+                while running.len() < COUNTS_AT_ONCE
+                    && let Some(name) = folders.pop()
+                {
+                    let (sftp, path) = (sftp.clone(), join(&dir, &name));
+                    running.spawn(async move {
+                        let read = tokio::time::timeout(COUNT_TIME, sftp.read_dir(path)).await;
+                        let items = read.ok().and_then(Result::ok).map(|read| {
+                            read.filter(|entry| {
+                                let name = entry.file_name();
+                                name != "." && name != ".."
+                            })
+                            .count()
+                        });
+                        (name, items)
+                    });
+                }
+                if let Some(Ok((name, Some(items)))) = running.join_next().await {
+                    counts.push((name, items));
+                }
+            }
+            Ok(counts)
+        });
+        // Counts are a convenience: none, if the session's gone.
+        async move { counting.await.unwrap_or_default() }
     }
 
     /// Renames (or moves) `from` to `to` on the host. Refused if `to`
@@ -773,15 +796,49 @@ pub fn list_local(dir: &Path) -> Result<Vec<Entry>, String> {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 dir,
                 size: if dir { 0 } else { metadata.len() },
-                items: dir
-                    .then(|| std::fs::read_dir(entry.path()).ok().map(Iterator::count))
-                    .flatten(),
+                items: None,
                 mode: local_mode(&metadata),
             })
         })
         .collect();
     sort(&mut entries);
     Ok(entries)
+}
+
+/// Like [`Sftp::count`], for a listing of the folder `dir` on this
+/// computer.
+pub fn count_local(dir: &Path, entries: &[Entry]) -> Vec<(String, usize)> {
+    counted(entries)
+        .into_iter()
+        .filter_map(|name| {
+            let items = std::fs::read_dir(dir.join(&name)).ok()?.count();
+            Some((name, items))
+        })
+        .collect()
+}
+
+/// The folders of a listing whose items are counted: the first few.
+fn counted(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.dir)
+        .take(COUNT_AT_MOST)
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
+/// Puts `counts`, from [`Sftp::count`] or [`count_local`], into the listing
+/// they were made of.
+pub fn set_counts(entries: &mut [Entry], counts: &[(String, usize)]) {
+    let counts: std::collections::HashMap<&str, usize> = counts
+        .iter()
+        .map(|(name, items)| (name.as_str(), *items))
+        .collect();
+    for entry in entries.iter_mut().filter(|entry| entry.dir) {
+        if let Some(&items) = counts.get(entry.name.as_str()) {
+            entry.items = Some(items);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -998,7 +1055,10 @@ mod tests {
         std::fs::create_dir_all(dir.join("Beta")).unwrap();
         std::fs::write(dir.join("Beta").join("one"), "1").unwrap();
         std::fs::write(dir.join("alpha.txt"), "hello").unwrap();
-        let entries = list_local(&dir).unwrap();
+        let mut entries = list_local(&dir).unwrap();
+        assert_eq!(entries[0].items, None, "names come first, counts after");
+        let counts = count_local(&dir, &entries);
+        set_counts(&mut entries, &counts);
         assert_eq!(
             entries,
             [

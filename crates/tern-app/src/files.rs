@@ -10,6 +10,7 @@
 //! reconnected, Refresh or showing the panel again opens SFTP on the new
 //! connection.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,6 +28,9 @@ use crate::ui::icon;
 
 /// How often transfers redraw their progress while running.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
+/// How long after a transfer ends its side is listed again: transfers that
+/// end together are listed once.
+const REFRESH_SETTLE: Duration = Duration::from_millis(150);
 /// How often edited copies are checked for saves.
 const EDIT_POLL: Duration = Duration::from_secs(1);
 
@@ -94,6 +98,13 @@ pub struct FilesPanel {
     local_dir: PathBuf,
     remote: Vec<Entry>,
     local: Vec<Entry>,
+    /// The listing of each side asked for last, by number: an older one
+    /// that ends later doesn't replace it.
+    remote_listing: u64,
+    local_listing: u64,
+    /// Sides a transfer changed, to list again once transfers settle.
+    stale: Vec<Side>,
+    refreshing: Option<Task<()>>,
     transfers: Vec<Transfer>,
     form: Option<Form>,
     edits: Vec<Editing>,
@@ -111,7 +122,6 @@ impl FilesPanel {
     /// A panel for `pane`'s host, starting in its home folder there and in
     /// `local_dir` here.
     pub fn new(pane: &Entity<TerminalView>, local_dir: PathBuf, cx: &mut Context<Self>) -> Self {
-        let local = sftp::list_local(&local_dir).unwrap_or_default();
         let mut panel = Self {
             pane: pane.downgrade(),
             session: 0,
@@ -122,7 +132,11 @@ impl FilesPanel {
             remote_dir: "/".into(),
             local_dir,
             remote: Vec::new(),
-            local,
+            local: Vec::new(),
+            remote_listing: 0,
+            local_listing: 0,
+            stale: Vec::new(),
+            refreshing: None,
             transfers: Vec::new(),
             form: None,
             edits: Vec::new(),
@@ -134,6 +148,9 @@ impl FilesPanel {
             _watch: None,
         };
         panel.open_sftp(pane, None, cx);
+        // This computer's side lists in the background too; a problem on
+        // the host's side, from opening SFTP, stays.
+        panel.list_here(panel.local_dir.clone(), false, cx);
         panel
     }
 
@@ -277,38 +294,121 @@ impl FilesPanel {
         if downloads.is_dir() { downloads } else { home }
     }
 
+    /// Lists `dir` on the host: its names as soon as they come, then its
+    /// folders' items as they're counted. Only the listing asked for last
+    /// shows.
     fn go_remote(&mut self, dir: String, cx: &mut Context<Self>) {
         let Some(sftp) = self.sftp.clone() else {
             return;
         };
-        let listing = sftp.list(&dir);
+        self.remote_listing += 1;
+        let listing = self.remote_listing;
+        let names = sftp.list(&dir);
         cx.spawn(async move |this, cx| {
-            let listed = listing.await;
-            let _ = this.update(cx, |this, cx| {
+            let listed = names.await;
+            let counting = this.update(cx, |this, cx| {
+                if this.remote_listing != listing {
+                    return None;
+                }
+                cx.notify();
                 match listed {
                     Ok(entries) => {
+                        let counting = sftp.count(&dir, &entries);
                         this.remote_dir = dir;
                         this.remote = entries;
                         this.problem = None;
+                        Some(counting)
                     }
-                    Err(problem) => this.problem = Some(problem.into()),
+                    Err(problem) => {
+                        this.problem = Some(problem.into());
+                        None
+                    }
                 }
-                cx.notify();
             });
+            if let Ok(Some(counting)) = counting {
+                let counts = counting.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.remote_listing == listing {
+                        sftp::set_counts(&mut this.remote, &counts);
+                        cx.notify();
+                    }
+                });
+            }
         })
         .detach();
     }
 
     fn go_local(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        match sftp::list_local(&dir) {
-            Ok(entries) => {
-                self.local_dir = dir;
-                self.local = entries;
-                self.problem = None;
+        self.list_here(dir, true, cx);
+    }
+
+    /// Lists the folder `dir` on this computer, away from the UI thread,
+    /// as [`FilesPanel::go_remote`] does on the host; once listed, it
+    /// `clears` the problem shown, if asked to.
+    fn list_here(&mut self, dir: PathBuf, clears: bool, cx: &mut Context<Self>) {
+        self.local_listing += 1;
+        let listing = self.local_listing;
+        let folder = dir.clone();
+        let names = cx.background_spawn(async move { sftp::list_local(&folder) });
+        cx.spawn(async move |this, cx| {
+            let listed = names.await;
+            let counting = this.update(cx, |this, cx| {
+                if this.local_listing != listing {
+                    return None;
+                }
+                cx.notify();
+                match listed {
+                    Ok(entries) => {
+                        let (folder, listed) = (dir.clone(), entries.clone());
+                        this.local_dir = dir;
+                        this.local = entries;
+                        if clears {
+                            this.problem = None;
+                        }
+                        Some(
+                            cx.background_spawn(async move { sftp::count_local(&folder, &listed) }),
+                        )
+                    }
+                    Err(problem) => {
+                        this.problem = Some(problem.into());
+                        None
+                    }
+                }
+            });
+            if let Ok(Some(counting)) = counting {
+                let counts = counting.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.local_listing == listing {
+                        sftp::set_counts(&mut this.local, &counts);
+                        cx.notify();
+                    }
+                });
             }
-            Err(problem) => self.problem = Some(problem.into()),
+        })
+        .detach();
+    }
+
+    /// Lists `side` again once the transfers ending now have settled:
+    /// many ending together are listed once.
+    fn refresh_soon(&mut self, side: Side, cx: &mut Context<Self>) {
+        if !self.stale.contains(&side) {
+            self.stale.push(side);
         }
-        cx.notify();
+        if self.refreshing.is_some() {
+            return;
+        }
+        self.refreshing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REFRESH_SETTLE).await;
+            let _ = this.update(cx, |this, cx| {
+                this.refreshing = None;
+                for side in std::mem::take(&mut this.stale) {
+                    match side {
+                        Side::Remote => this.go_remote(this.remote_dir.clone(), cx),
+                        Side::Local => this.go_local(this.local_dir.clone(), cx),
+                    }
+                }
+            });
+        }));
     }
 
     /// Opens the line under the path bar for `change`, with the field
@@ -495,7 +595,7 @@ impl FilesPanel {
             .unwrap_or_default();
         let progress = Progress::default();
         let copy = sftp.upload(local, &self.remote_dir, progress.clone());
-        self.track(name, progress, copy, |_, _, _| {}, cx);
+        self.track(name, progress, copy, Some(Side::Remote), |_, _, _| {}, cx);
     }
 
     fn download(&mut self, remote: String, name: String, cx: &mut Context<Self>) {
@@ -504,7 +604,7 @@ impl FilesPanel {
         };
         let progress = Progress::default();
         let copy = sftp.download(&remote, self.local_dir.clone(), progress.clone());
-        self.track(name, progress, copy, |_, _, _| {}, cx);
+        self.track(name, progress, copy, Some(Side::Local), |_, _, _| {}, cx);
     }
 
     /// Opens the host's file in this computer's app for it, from a copy in
@@ -567,7 +667,8 @@ impl FilesPanel {
                 Err(problem) => this.problem = Some(problem.to_string().into()),
             }
         };
-        self.track(name, progress, copy, then, cx);
+        // The copy lands in a folder of its own: neither side changes.
+        self.track(name, progress, copy, None, then, cx);
     }
 
     /// Opens this computer's file in the app the system has for it.
@@ -690,16 +791,17 @@ impl FilesPanel {
                     editing.busy = false;
                 }
             };
-        self.track(name, progress, copy, then, cx);
+        self.track(name, progress, copy, Some(Side::Remote), then, cx);
     }
 
-    /// Shows a transfer until it ends, then refreshes both sides; `then`
-    /// gets what the copy gave.
+    /// Shows a transfer until it ends, then lists the side it `changed`
+    /// again; `then` gets what the copy gave.
     fn track<T: 'static>(
         &mut self,
         name: String,
         progress: Progress,
         copy: impl Future<Output = Result<T, String>> + 'static,
+        changed: Option<Side>,
         then: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
@@ -715,9 +817,9 @@ impl FilesPanel {
                 this.transfers[index].outcome =
                     Some(copied.as_ref().map(|_| ()).map_err(Clone::clone));
                 then(this, copied, cx);
-                // Both sides may have changed.
-                this.go_remote(this.remote_dir.clone(), cx);
-                this.go_local(this.local_dir.clone(), cx);
+                if let Some(side) = changed {
+                    this.refresh_soon(side, cx);
+                }
             });
         })
         .detach();
@@ -915,6 +1017,7 @@ impl FilesPanel {
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
             .group(group.clone())
+            .w_full()
             .h(px(34.))
             .px(px(8.))
             .flex()
@@ -1229,20 +1332,28 @@ impl Render for FilesPanel {
                     )))
                 },
             )
+            // Rows are one height, so only those in view are built: a folder
+            // of thousands costs what fits on screen.
             .child(
-                div()
-                    .id("files-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .children(
-                        entries
-                            .iter()
-                            .enumerate()
-                            .map(|(index, entry)| self.row(index, entry, t, cx)),
-                    ),
+                uniform_list(
+                    "files-list",
+                    entries.len(),
+                    cx.processor(|this, range: Range<usize>, _, cx| {
+                        let theme = theme::current(cx);
+                        let entries = match this.side {
+                            Side::Remote => &this.remote,
+                            Side::Local => &this.local,
+                        };
+                        range
+                            .filter_map(|index| {
+                                let entry = entries.get(index)?;
+                                Some(this.row(index, entry, &theme, cx).into_any_element())
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .when(!self.transfers.is_empty(), |d| {
                 d.child(div().h(px(1.)).bg(t.line)).child(
@@ -1278,6 +1389,52 @@ mod tests {
             .unwrap_or_else(|| panic!("nothing on screen is tagged {selector}"));
         cx.simulate_click(bounds.center(), Modifiers::none());
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn shows_the_listing_asked_for_last_and_lists_once_for_many_transfers(cx: &mut TestAppContext) {
+        use super::{REFRESH_SETTLE, Side};
+
+        let dir = std::env::temp_dir().join(format!("tern-ui-listings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a").join("one"), "1").unwrap();
+
+        cx.update(gpui_kit::init);
+        let start = dir.clone();
+        let (panel, cx) = cx.add_window_view(move |_, cx| {
+            let pane = cx.new(TerminalView::offline);
+            FilesPanel::new(&pane, start, cx)
+        });
+        cx.run_until_parked();
+        // Names, then the folders' items, counted after.
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.local[0].name, "a");
+            assert_eq!(panel.local[0].items, Some(1));
+        });
+
+        // A listing that ends after a later one was asked for is passed over.
+        panel.update(cx, |panel, cx| {
+            panel.go_local(dir.join("a"), cx);
+            panel.local_listing += 1;
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(panel.local_dir, dir));
+
+        // Transfers that end together list their side once, after they
+        // settle.
+        let before = panel.read_with(cx, |panel, _| panel.local_listing);
+        panel.update(cx, |panel, cx| {
+            for _ in 0..5 {
+                panel.refresh_soon(Side::Local, cx);
+            }
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(panel.local_listing, before));
+        cx.executor().advance_clock(REFRESH_SETTLE);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert_eq!(panel.local_listing, before + 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]
