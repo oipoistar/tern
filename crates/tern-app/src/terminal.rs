@@ -308,6 +308,8 @@ pub struct TerminalView {
     /// Picks shell integration's marks out of the output, and when the
     /// command running started.
     scanner: Scanner,
+    /// Output given to the terminal so far, in chunks.
+    fed: u64,
     command_since: Option<Instant>,
     /// A long command finished while the pane wasn't looked at: whether
     /// it succeeded.
@@ -398,8 +400,17 @@ struct Find {
     /// Which match is selected, counting from the oldest, and how many
     /// there are, as of the last search or step.
     count: (usize, usize),
+    /// What the scrollback held when `count` was made ([`TerminalView::
+    /// contents`]), and the match it's at: stepping on from that match
+    /// with nothing changed since is one along, with nothing to count.
+    counted: Option<(Contents, Match)>,
     _subscription: Subscription,
 }
+
+/// What the scrollback holds, as far as counting matches goes: output
+/// given so far, and the lines kept and their size, which clearing and
+/// resizing change.
+type Contents = (u64, usize, usize, usize);
 
 /// A link on screen, from its first cell to its last.
 #[derive(Clone, Debug, PartialEq)]
@@ -1480,6 +1491,7 @@ impl TerminalView {
             containers: None,
             recording: None,
             scanner: Scanner::default(),
+            fed: 0,
             command_since: None,
             finished: None,
             folder: None,
@@ -1538,6 +1550,7 @@ impl TerminalView {
     /// Gives the terminal output, picking out the sequences Tern acts on
     /// itself.
     fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.fed += 1;
         if self.scanner.quiet(bytes) {
             self.parser.advance(&mut self.term, bytes);
         } else {
@@ -2871,6 +2884,7 @@ impl TerminalView {
                 query: String::new(),
                 regex: None,
                 count: (0, 0),
+                counted: None,
                 _subscription: subscription,
             });
         }
@@ -2940,21 +2954,46 @@ impl TerminalView {
         if let Some(found) = &found {
             self.term.scroll_to_point(*found.start());
         }
-        // Counted afresh each time: output may have added matches since.
+        let grid = self.term.grid();
+        let contents = (
+            self.fed,
+            grid.history_size(),
+            grid.columns(),
+            grid.screen_lines(),
+        );
+        // From the match counted last, with nothing changed since, the next
+        // is one along. Otherwise all are counted afresh (output may have
+        // added some), one by one rather than kept.
+        let along = find.counted.as_ref().is_some_and(|(then, at)| {
+            *then == contents
+                && current.is_some_and(|range| range.start == *at.start() && range.end == *at.end())
+        });
         find.count = match (&mut find.regex, &found) {
+            (Some(_), Some(_)) if along => {
+                let (at, total) = find.count;
+                let at = match direction {
+                    Direction::Left if at <= 1 => total,
+                    Direction::Left => at - 1,
+                    Direction::Right if at >= total => 1,
+                    Direction::Right => at + 1,
+                };
+                (at, total)
+            }
             (Some(regex), Some(found)) => {
                 let top = GridPoint::new(self.term.topmost_line(), Column(0));
                 let bottom = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
-                let all: Vec<Match> =
-                    RegexIter::new(top, bottom, Direction::Right, &self.term, regex).collect();
-                let at = all
-                    .iter()
-                    .position(|each| each == found)
-                    .map_or(0, |at| at + 1);
-                (at, all.len())
+                let (mut at, mut total) = (0, 0);
+                for each in RegexIter::new(top, bottom, Direction::Right, &self.term, regex) {
+                    total += 1;
+                    if each == *found {
+                        at = total;
+                    }
+                }
+                (at, total)
             }
             _ => (0, 0),
         };
+        find.counted = found.map(|found| (contents, found));
         cx.notify();
     }
 
@@ -4614,6 +4653,12 @@ mod tests {
         assert_eq!(count(cx), Some((2, 2)));
         cx.simulate_keystrokes("shift-enter");
         assert_eq!(count(cx), Some((1, 2)));
+        // New output may bring new matches: they're counted at the next.
+        view.update(cx, |view, cx| view.feed(b"alpha three\r\n", cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(count(cx), Some((3, 3)));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(count(cx), Some((2, 3)));
 
         // Nothing typed in the bar reaches the shell.
         view.read_with(cx, |view, _| assert!(view.sent.borrow().is_empty()));
