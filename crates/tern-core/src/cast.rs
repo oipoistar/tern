@@ -13,6 +13,15 @@ use serde_json::{Value, json};
 
 /// How long written events may wait in memory before reaching the file.
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
+/// The largest terminal a recording plays in. A recording names its size,
+/// and its terminal is made that size before anything plays: one naming
+/// more (`65535x65535` is four billion cells) plays at this size instead.
+pub const MAX_COLS: u16 = 500;
+pub const MAX_ROWS: u16 = 300;
+/// The largest recording read, and the most events played, so opening one
+/// never fills memory.
+pub const MAX_BYTES: u64 = 128 << 20;
+const MAX_EVENTS: usize = 4 << 20;
 
 /// A recording being written.
 pub struct Recorder {
@@ -120,7 +129,18 @@ impl Cast {
     }
 }
 
+/// Reads the recording in the file `path`, as [`read`] does; one too big
+/// to play says so.
+pub fn load(path: &Path) -> Result<Cast, String> {
+    let size = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if size.len() > MAX_BYTES {
+        return Err("It's too big to play".into());
+    }
+    read(&std::fs::read_to_string(path).map_err(|error| error.to_string())?)
+}
+
 /// Reads an asciicast v2 recording. Input and marker events are skipped.
+/// Its terminal is at most [`MAX_COLS`] by [`MAX_ROWS`].
 pub fn read(text: &str) -> Result<Cast, String> {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let header: Value = lines
@@ -130,16 +150,19 @@ pub fn read(text: &str) -> Result<Cast, String> {
     if header["version"] != 2 {
         return Err("Only asciicast v2 recordings play".into());
     }
-    let size = |field: &str| {
+    let size = |field: &str, most: u16| {
         header[field]
             .as_u64()
-            .and_then(|size| u16::try_from(size).ok())
             .filter(|&size| size > 0)
+            .map(|size| size.min(most.into()) as u16)
             .ok_or("Its terminal size is missing")
     };
-    let (cols, rows) = (size("width")?, size("height")?);
+    let (cols, rows) = (size("width", MAX_COLS)?, size("height", MAX_ROWS)?);
     let mut events = Vec::new();
     for line in lines {
+        if events.len() == MAX_EVENTS {
+            return Err("It's too long to play".into());
+        }
         let event: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
         let (Some(at), Some(kind), Some(data)) =
             (event[0].as_f64(), event[1].as_str(), event[2].as_str())
@@ -152,8 +175,10 @@ pub fn read(text: &str) -> Result<Cast, String> {
                 let Some((cols, rows)) = data.split_once('x') else {
                     continue;
                 };
-                match (cols.parse(), rows.parse()) {
-                    (Ok(cols), Ok(rows)) if cols > 0 && rows > 0 => Shown::Resize(cols, rows),
+                match (cols.parse::<u16>(), rows.parse::<u16>()) {
+                    (Ok(cols), Ok(rows)) if cols > 0 && rows > 0 => {
+                        Shown::Resize(cols.min(MAX_COLS), rows.min(MAX_ROWS))
+                    }
                     _ => continue,
                 }
             }
@@ -220,5 +245,29 @@ mod tests {
         assert_eq!(cast.duration(), 2.5);
         assert!(read("not a recording").is_err());
         assert!(read("{\"version\": 1, \"width\": 80, \"height\": 24}").is_err());
+    }
+
+    #[test]
+    fn plays_in_a_terminal_of_reasonable_size() {
+        // A few bytes naming four billion cells, then more.
+        let cast = read(
+            "{\"version\": 2, \"width\": 65535, \"height\": 65535}\n\
+             [1, \"r\", \"65535x65535\"]\n[2, \"r\", \"100000x9\"]\n[3, \"r\", \"120x40\"]\n",
+        )
+        .unwrap();
+        assert_eq!((cast.cols, cast.rows), (MAX_COLS, MAX_ROWS));
+        let shown: Vec<&Shown> = cast.events.iter().map(|(_, shown)| shown).collect();
+        assert_eq!(
+            shown,
+            [&Shown::Resize(MAX_COLS, MAX_ROWS), &Shown::Resize(120, 40)]
+        );
+        let huge = read("{\"version\": 2, \"width\": 4294967296, \"height\": 9}").unwrap();
+        assert_eq!((huge.cols, huge.rows), (MAX_COLS, 9));
+
+        // And a file too big to read isn't.
+        let path = std::env::temp_dir().join(format!("tern-cast-big-{}.cast", std::process::id()));
+        File::create(&path).unwrap().set_len(MAX_BYTES + 1).unwrap();
+        assert_eq!(load(&path).unwrap_err(), "It's too big to play");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1630,9 +1630,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let read = std::fs::read_to_string(path)
-            .map_err(|error| error.to_string())
-            .and_then(|text| tern_core::cast::read(&text));
+        let read = tern_core::cast::load(path);
         let title = read
             .as_ref()
             .ok()
