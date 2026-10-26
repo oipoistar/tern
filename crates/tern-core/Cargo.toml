@@ -39,6 +39,10 @@ russh-sftp = "3"
 tern-devserver = { path = "../tern-devserver" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }
 
+# Stopping what a group's command started along with it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Reading PuTTY's saved sessions, which live in the registry on Windows,
 # and reaching Pageant for agent forwarding.
 [target.'cfg(windows)'.dependencies]

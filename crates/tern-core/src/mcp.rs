@@ -790,6 +790,9 @@ fn handle(line: &str) -> Handling {
     }
 }
 
+/// Tool calls the relay runs at once, at most.
+const CALLS_AT_ONCE: usize = 64;
+
 /// Serves MCP on standard input and output until input ends: what
 /// `tern --mcp` runs.
 pub fn serve_stdio() -> io::Result<()> {
@@ -820,6 +823,8 @@ pub async fn serve(
     let mut calls = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(input).lines();
     while let Some(line) = lines.next_line().await? {
+        // Calls answered since are let go, rather than kept until the end.
+        while calls.try_join_next().is_some() {}
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -830,12 +835,15 @@ pub async fn serve(
                 let _ = replies.send(reply);
             }
             // Calls run side by side: one waiting for a session doesn't
-            // hold up the next.
+            // hold up the next. So many at once, the next waits for one.
             Handling::Call {
                 id,
                 name,
                 arguments,
             } => {
+                if calls.len() >= CALLS_AT_ONCE {
+                    calls.join_next().await;
+                }
                 let (relay, replies) = (relay.clone(), replies.clone());
                 calls.spawn(async move {
                     let answer = relay.call(&name, arguments).await;

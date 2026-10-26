@@ -7606,6 +7606,7 @@ dependencies = [
  "chacha20poly1305",
  "hmac 0.13.0",
  "keyring",
+ "libc",
  "pageant",
  "portable-pty",
  "rand 0.10.3",

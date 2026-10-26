@@ -5,9 +5,10 @@
 //! a synced vault mustn't be able to run anything here.
 
 use std::collections::HashMap;
-use std::io::Read as _;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ use crate::vault::Vault;
 
 /// How long a source's command may take.
 pub const WAIT: Duration = Duration::from_secs(30);
+/// What a source's command may print, at most.
+const PRINTED_AT_MOST: u64 = 16 << 20;
 
 /// A group and the command that fills it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,39 +72,47 @@ impl Sources {
 /// Runs `command` in this computer's shell (cmd on Windows, sh elsewhere)
 /// for at most `wait`: what it printed, or why it failed in one line.
 pub fn run(command: &str, wait: Duration) -> Result<String, String> {
+    run_printing(command, wait, PRINTED_AT_MOST)
+}
+
+/// [`run`], keeping at most `at_most` bytes of each of what the command
+/// prints and complains. Its deadline covers what it starts too: a program
+/// it leaves running that still holds its output doesn't hold this up.
+fn run_printing(command: &str, wait: Duration, at_most: u64) -> Result<String, String> {
     let mut child = shell(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
-    // Read as it comes, so a full pipe never stops the command.
-    let mut out = child.stdout.take().expect("piped");
-    let mut err = child.stderr.take().expect("piped");
-    let printed = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = out.read_to_string(&mut text);
-        text
-    });
-    let complained = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = err.read_to_string(&mut text);
-        text
-    });
+    let printed = read_all(child.stdout.take().expect("piped"), at_most);
+    let complained = read_all(child.stderr.take().expect("piped"), at_most);
     let deadline = Instant::now() + wait;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop(&mut child);
             return Err("It took too long".into());
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let printed = printed.join().unwrap_or_default();
-    let complained = complained.join().unwrap_or_default();
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let (Ok(printed), Ok(complained)) = (
+        printed.recv_timeout(left()),
+        complained.recv_timeout(left()),
+    ) else {
+        stop(&mut child);
+        return Err("It took too long".into());
+    };
+    let (Some(printed), Some(complained)) = (printed, complained) else {
+        return Err("It printed too much".into());
+    };
+    let (printed, complained) = (
+        String::from_utf8_lossy(&printed).into_owned(),
+        String::from_utf8_lossy(&complained).into_owned(),
+    );
     if status.success() {
         return Ok(printed);
     }
@@ -114,6 +125,48 @@ pub fn run(command: &str, wait: Duration) -> Result<String, String> {
         (None, Some(code)) => format!("It ended with status {code}"),
         (None, None) => "It was stopped".into(),
     })
+}
+
+/// Reads all of `pipe` as it comes, on a thread of its own, so a full pipe
+/// never stops the command: up to `at_most` bytes of it, `None` if there's
+/// more (that's read too, and let go).
+fn read_all(mut pipe: impl Read + Send + 'static, at_most: u64) -> mpsc::Receiver<Option<Vec<u8>>> {
+    let (done, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let _ = (&mut pipe).take(at_most).read_to_end(&mut kept);
+        let more = std::io::copy(&mut pipe, &mut std::io::sink()).unwrap_or(0) > 0;
+        let _ = done.send((!more).then_some(kept));
+    });
+    read
+}
+
+/// Ends the command, and what it started that's still running: its
+/// process group on Unix, its process tree on Windows.
+fn stop(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(group) = i32::try_from(child.id()) {
+            // SAFETY: signals the process group the shell leads (made at
+            // its start, see `shell`), which nothing else is in.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new(crate::paths::system_program("taskkill.exe"))
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(windows)]
@@ -131,8 +184,10 @@ fn shell(command: &str) -> Command {
 
 #[cfg(not(windows))]
 fn shell(command: &str) -> Command {
+    use std::os::unix::process::CommandExt as _;
     let mut shell = Command::new("sh");
-    shell.arg("-c").arg(command);
+    // A process group of its own, so what it starts stops with it.
+    shell.arg("-c").arg(command).process_group(0);
     shell
 }
 
@@ -313,6 +368,34 @@ mod tests {
         assert_eq!(
             run(slow, Duration::from_millis(300)).unwrap_err(),
             "It took too long"
+        );
+    }
+
+    #[test]
+    fn a_command_that_leaves_a_program_running_still_ends_in_time() {
+        // It ends at once, but leaves something holding its output open.
+        let leaves = if cfg!(windows) {
+            "start /b ping -n 6 127.0.0.1"
+        } else {
+            "sleep 5 &"
+        };
+        let started = Instant::now();
+        assert_eq!(
+            run(leaves, Duration::from_millis(800)).unwrap_err(),
+            "It took too long"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        // And it keeps to so much of what it prints.
+        let says = if cfg!(windows) {
+            "for /l %i in (1,1,300) do @echo line %i"
+        } else {
+            "for i in $(seq 300); do echo line $i; done"
+        };
+        assert!(run_printing(says, WAIT, 64 << 10).is_ok());
+        assert_eq!(
+            run_printing(says, WAIT, 100).unwrap_err(),
+            "It printed too much"
         );
     }
 }
