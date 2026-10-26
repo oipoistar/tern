@@ -59,7 +59,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # rustup now and then aborts here, making the TLS connection to sync
+      # the channel (exception 0xc0000409, which Git's bash reports as 127;
+      # about 1 run in 30 on the project's machine). The step goes once
+      # more when it did.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        id: toolchain
+        continue-on-error: true
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.toolchain.outcome == 'failure'
         with:
           toolchain: stable
           components: clippy, rustfmt

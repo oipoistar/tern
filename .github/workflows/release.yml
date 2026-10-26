@@ -42,7 +42,15 @@ jobs:
             exit 1
           fi
 
+      # rustup now and then aborts while it syncs the channel; once more
+      # when it did, as in ci.yml.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        id: toolchain
+        continue-on-error: true
+        with:
+          toolchain: stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.toolchain.outcome == 'failure'
         with:
           toolchain: stable
 
