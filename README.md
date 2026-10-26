@@ -235,7 +235,7 @@ The agent then works in the Tern you have open, in tabs you can watch: it lists 
 - **Passwords and the sync passphrase** live in your system's credential store: Windows Credential Manager, the macOS Keychain or the Secret Service on Linux. Never in Tern's files.
 - **Hosts, snippets and settings** are plain files in Tern's data folder (`%APPDATA%\Tern`, `~/Library/Application Support/Tern` or `~/.local/share/tern`), readable only by you. They hold no passwords or private keys, though notes and environment variables are kept as you write them. A vault file that can't be read is set aside as `vault.json.unreadable`, never overwritten.
 - **Keys and host keys** go where your system expects them. On Linux and macOS, keys you make or import in Tern land in `~/.ssh` and hosts you trust in `~/.ssh/known_hosts`, so `ssh` and `git` use them too, and Tern deletes only the keys it added. On Windows, Tern keeps both in its own folder and only reads `~/.ssh`.
-- **Sync** encrypts everything on your device (Argon2id and XChaCha20-Poly1305) before it reaches the cloud folder. Private keys sync only if you pick them, one by one.
+- **Sync** encrypts everything on your device (Argon2id and XChaCha20-Poly1305) before it reaches the cloud folder. Private keys sync only if you pick them, one by one, and a key that arrives is checked before it's written, never as one of ssh's own files.
 
 ## Contributing
 
