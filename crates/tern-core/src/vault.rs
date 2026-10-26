@@ -185,6 +185,8 @@ impl Vault {
                 for other in self.groups.iter_mut().flat_map(|group| &mut group.hosts) {
                     if other.jump.as_deref() == Some(old) {
                         other.jump = Some(host.name.clone());
+                        // Changed too, so sync takes it with the rename.
+                        other.updated = host.updated;
                     }
                 }
             }

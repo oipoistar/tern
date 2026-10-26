@@ -20,7 +20,7 @@
 //! [`FORMAT`], and a device that meets a newer format stops syncing until
 //! it's updated, rather than merge what it may get wrong.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -254,22 +254,36 @@ pub fn snapshot(vault: &Vault, settings: &Settings, keys: Vec<SyncedKey>) -> Sna
 
 /// Merges other devices' snapshots into `local`: for each host and snippet
 /// the newest change wins, a deletion newer than a change removes it, and
-/// kinds this device doesn't sync are left as they are. Hosts that end up
+/// kinds this device doesn't sync are left as they are, deletions
+/// included. A snapshot's deletions count only for the kinds it carries:
+/// one that leaves hosts out says nothing about them. Hosts that end up
 /// sharing a name get " (2)"… in an order every device agrees on.
 pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged {
     let sync = &settings.sync;
-    let mut deleted: HashMap<String, u64> = local
+    let ours: HashMap<String, u64> = local
         .deleted
         .iter()
         .map(|tombstone| (tombstone.id.clone(), tombstone.at))
         .collect();
-    for snapshot in others {
-        for tombstone in &snapshot.deleted {
-            let at = deleted.entry(tombstone.id.clone()).or_default();
-            *at = (*at).max(tombstone.at);
+    // The deletions that count for a kind: this device's own and those of
+    // the snapshots that carry it.
+    let deletions = |carries: fn(&Snapshot) -> bool| {
+        let mut deleted = ours.clone();
+        for snapshot in others.iter().filter(|snapshot| carries(snapshot)) {
+            for tombstone in &snapshot.deleted {
+                let at = deleted.entry(tombstone.id.clone()).or_default();
+                *at = (*at).max(tombstone.at);
+            }
         }
-    }
-    let gone = |id: &str, updated: u64| deleted.get(id).is_some_and(|&at| at >= updated);
+        deleted
+    };
+    let (host_deletions, snippet_deletions) = (
+        deletions(|snapshot| snapshot.has_hosts),
+        deletions(|snapshot| snapshot.has_snippets),
+    );
+    let gone = |deleted: &HashMap<String, u64>, id: &str, updated: u64| {
+        deleted.get(id).is_some_and(|&at| at >= updated)
+    };
 
     // Hosts, in local order, then newcomers in the order they're met.
     let mut order: Vec<String> = local
@@ -322,7 +336,9 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
             }
         }
     }
-    hosts.retain(|(_, host)| !gone(&host.id, host.updated));
+    if sync.hosts {
+        hosts.retain(|(_, host)| !gone(&host_deletions, &host.id, host.updated));
+    }
     tell_apart(&mut hosts);
     let groups = order
         .into_iter()
@@ -354,7 +370,9 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
             }
         }
     }
-    snippets.retain(|snippet| !gone(&snippet.id, snippet.updated));
+    if sync.snippets {
+        snippets.retain(|snippet| !gone(&snippet_deletions, &snippet.id, snippet.updated));
+    }
 
     let mut identities = local.identities.clone();
     if sync.hosts {
@@ -373,8 +391,17 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
             }
         }
     }
-    identities.retain(|identity| !gone(&identity.id, identity.updated));
+    if sync.hosts {
+        identities.retain(|identity| !gone(&host_deletions, &identity.id, identity.updated));
+    }
 
+    // Every deletion is kept and passed on, a kind this device doesn't
+    // sync too: they count once it does.
+    let mut deleted = ours.clone();
+    for tombstone in others.iter().flat_map(|snapshot| &snapshot.deleted) {
+        let at = deleted.entry(tombstone.id.clone()).or_default();
+        *at = (*at).max(tombstone.at);
+    }
     let mut tombstones: Vec<Tombstone> = deleted
         .into_iter()
         .map(|(id, at)| Tombstone { id, at })
@@ -416,23 +443,30 @@ pub fn merge(local: &Vault, settings: &Settings, others: &[Snapshot]) -> Merged 
 }
 
 /// Gives hosts that share a name (ignoring case) distinct ones: the
-/// earliest changed keeps it, the rest get " (2)", " (3)"…
+/// earliest changed keeps it, the rest get the first of " (2)", " (3)"…
+/// that no host has, in an order every device agrees on.
 fn tell_apart(hosts: &mut [(String, Host)]) {
-    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, (_, host)) in hosts.iter().enumerate() {
         by_name
             .entry(host.name.to_lowercase())
             .or_default()
             .push(index);
     }
+    let mut taken: HashSet<String> = by_name.keys().cloned().collect();
     for mut same in by_name.into_values().filter(|same| same.len() > 1) {
         same.sort_by(|&a, &b| {
             let (a, b) = (&hosts[a].1, &hosts[b].1);
             a.updated.cmp(&b.updated).then_with(|| a.id.cmp(&b.id))
         });
-        for (n, &index) in same.iter().enumerate().skip(1) {
+        for &index in same.iter().skip(1) {
             let host = &mut hosts[index].1;
-            host.name = format!("{} ({})", host.name, n + 1);
+            let free = (2..)
+                .map(|n| format!("{} ({n})", host.name))
+                .find(|name| !taken.contains(&name.to_lowercase()))
+                .expect("a free name");
+            taken.insert(free.to_lowercase());
+            host.name = free;
         }
     }
 }
@@ -791,6 +825,81 @@ mod tests {
             .map(|h| h.name.as_str())
             .collect();
         assert_eq!(names, ["nas", "nas (2)"]);
+
+        // A name given to tell two apart is never one a host already has.
+        let mut first = Host::new("web", "a", "10.0.0.4", 22);
+        first.updated = 1;
+        let mut second = Host::new("web", "b", "10.0.0.5", 22);
+        second.updated = 2;
+        let here = Vault {
+            groups: vec![HostGroup {
+                name: "Web".into(),
+                hosts: vec![first, Host::new("Web (2)", "c", "10.0.0.6", 22)],
+            }],
+            ..Vault::default()
+        };
+        let there = Vault {
+            groups: vec![HostGroup {
+                name: "Web".into(),
+                hosts: vec![second],
+            }],
+            ..Vault::default()
+        };
+        let merged = merge(
+            &here,
+            &settings("Here"),
+            &[snapshot(&there, &settings("There"), Vec::new())],
+        );
+        let names: Vec<&str> = merged.vault.hosts().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["web", "Web (2)", "web (3)"]);
+    }
+
+    #[test]
+    fn deletions_count_only_for_kinds_both_sides_sync() {
+        // Here doesn't sync hosts: a host deleted there stays here...
+        let (here, mut there) = pair();
+        there.delete("prod-db-01").unwrap();
+        let mut no_hosts = settings("Here");
+        no_hosts.sync.hosts = false;
+        let from_there = snapshot(&there, &settings("There"), Vec::new());
+        let merged = merge(&here, &no_hosts, &[from_there]).vault;
+        assert!(merged.find("prod-db-01").is_some());
+        // ...until it does: the deletion it kept counts then.
+        let merged = merge(&merged, &settings("Here"), &[]).vault;
+        assert!(merged.find("prod-db-01").is_none());
+
+        // There doesn't sync hosts, and deletes one of its own: its file,
+        // which carries snippets and deletions, leaves the host here.
+        let (here, mut there) = pair();
+        there.delete("prod-db-01").unwrap();
+        let mut no_hosts = settings("There");
+        no_hosts.sync.hosts = false;
+        let from_there = snapshot(&there, &no_hosts, Vec::new());
+        assert!(!from_there.deleted.is_empty());
+        let merged = merge(&here, &settings("Here"), &[from_there]).vault;
+        assert!(merged.find("prod-db-01").is_some());
+    }
+
+    #[test]
+    fn a_renamed_jump_host_takes_the_hosts_behind_it_along() {
+        let mut synced = Vault::sample();
+        let mut db = synced.find("prod-db-01").unwrap().clone();
+        db.jump = Some("bastion".into());
+        synced.save(Some("prod-db-01"), db, "Production");
+        let (here, mut there) = (synced.clone(), synced);
+        later();
+        let mut bastion = there.find("bastion").unwrap().clone();
+        bastion.name = "gateway".into();
+        there.save(Some("bastion"), bastion, "Production");
+        let merged = merge(
+            &here,
+            &settings("Here"),
+            &[snapshot(&there, &settings("There"), Vec::new())],
+        )
+        .vault;
+        let db = merged.find("prod-db-01").unwrap();
+        assert_eq!(db.jump.as_deref(), Some("gateway"));
+        assert!(merged.connection(db).is_ok());
     }
 
     #[test]
