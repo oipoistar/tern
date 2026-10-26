@@ -39,6 +39,12 @@ russh-sftp = "3"
 tern-devserver = { path = "../tern-devserver" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }
 
+# The agent, `tern --mcp` and the Tern it starts are each a process: the
+# check is a program of its own, playing all three.
+[[test]]
+name = "relay_pipes"
+harness = false
+
 # Stopping what a group's command started along with it.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

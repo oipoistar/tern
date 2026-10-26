@@ -1023,6 +1023,7 @@ fn start(program: &Path) -> io::Result<()> {
         const DETACHED_PROCESS: u32 = 0x8;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        keep_stdio_to_ourselves();
         // Out of the agent's job, when it may leave it, so that ending the
         // agent's processes doesn't end Tern.
         command.creation_flags(
@@ -1036,6 +1037,33 @@ fn start(program: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command.spawn().map(drop)
+}
+
+/// Keeps standard input, output and error, the agent's pipes, from the
+/// programs this process starts. On Windows a program starts with every
+/// handle of ours that may be inherited, not only the ones it's given, so
+/// Tern would hold the pipes open: an agent reading the relay's output to
+/// its end would wait for as long as Tern runs.
+#[cfg(windows)]
+fn keep_stdio_to_ourselves() {
+    use std::os::windows::io::{AsRawHandle as _, RawHandle};
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: RawHandle, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in handles {
+        // SAFETY: changes only whether the handle passes to what this
+        // process starts. One it doesn't have (null) fails, changing
+        // nothing.
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 }
 
 /// Tern taking agents' tool calls, for as long as it's kept: on a loopback
