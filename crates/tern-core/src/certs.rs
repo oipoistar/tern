@@ -2,36 +2,10 @@
 //! known_hosts file's `@cert-authority` lines vouch for, and user
 //! certificates (`<key>-cert.pub` beside a key file), which sign us in.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use russh::keys::ssh_key::certificate::CertType;
 use russh::keys::{Certificate, HashAlg, PublicKey};
-
-/// The certificate authorities `files` trust for `host:port`: the keys of
-/// their `@cert-authority` lines whose host patterns take it.
-pub fn authorities(files: &[PathBuf], host: &str, port: u16) -> Vec<PublicKey> {
-    files
-        .iter()
-        .filter_map(|file| std::fs::read_to_string(file).ok())
-        .flat_map(|text| authorities_in(&text, host, port))
-        .collect()
-}
-
-fn authorities_in(text: &str, host: &str, port: u16) -> Vec<PublicKey> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line
-                .trim()
-                .strip_prefix("@cert-authority")?
-                .split_whitespace();
-            let patterns = fields.next()?;
-            let key = format!("{} {}", fields.next()?, fields.next()?);
-            crate::known_hosts::takes(patterns, host, port)
-                .then(|| PublicKey::from_openssh(&key).ok())
-                .flatten()
-        })
-        .collect()
-}
 
 /// Glob matching with `*` (any run) and `?` (any one character).
 pub(crate) fn wildcard(pattern: &str, text: &str) -> bool {
@@ -61,8 +35,10 @@ pub(crate) fn wildcard(pattern: &str, text: &str) -> bool {
 
 /// Checks a host certificate as OpenSSH does: a host certificate, valid
 /// at `now` (Unix seconds), signed by one of `authorities`, naming `host`
-/// among its principals (or naming none), with no critical options. The
-/// error says what's wrong in a few lowercase words.
+/// among its principals, which may be patterns (`*.example.com`), with no
+/// critical options. One naming no host is for none: taken for any, it
+/// would let whoever holds it pass for every host its authority vouches
+/// for. The error says what's wrong in a few lowercase words.
 pub fn check_host(
     cert: &Certificate,
     host: &str,
@@ -82,10 +58,13 @@ pub fn check_host(
     cert.validate_at(now, &trusted)
         .map_err(|_| "isn't signed by a trusted authority".to_string())?;
     let principals = cert.valid_principals();
-    if !principals.is_empty()
-        && !principals
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(host))
+    if principals.is_empty() {
+        return Err("names no host".into());
+    }
+    let lower = host.to_lowercase();
+    if !principals
+        .iter()
+        .any(|name| wildcard(&name.to_lowercase(), &lower))
     {
         return Err(format!("isn't for {host}"));
     }
@@ -149,26 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_authorities_for_a_host() {
-        let ca = key();
-        let other = key();
-        let text = format!(
-            "# a comment\n\
-             db.example.com {}\n\
-             @cert-authority *.example.com {}\n\
-             @cert-authority *.example.org {}\n\
-             @revoked * {}\n",
-            other.public_key().to_openssh().unwrap(),
-            ca.public_key().to_openssh().unwrap(),
-            other.public_key().to_openssh().unwrap(),
-            other.public_key().to_openssh().unwrap(),
-        );
-        let found = authorities_in(&text, "db.example.com", 22);
-        assert_eq!(found, [ca.public_key().clone()]);
-        assert!(authorities_in(&text, "db.example.net", 22).is_empty());
-    }
-
-    #[test]
     fn checks_host_certificates() {
         let (ca, host) = (key(), key());
         let cas = [ca.public_key().clone()];
@@ -191,11 +150,23 @@ mod tests {
         );
 
         // A user certificate isn't a host's, and one naming nobody names
-        // any host.
+        // no host, as OpenSSH reads it now.
         let user = certificate(&host, &ca, CertType::User, &["db.example.com"]);
         assert!(check_host(&user, "db.example.com", &cas, 1500).is_err());
         let anyone = certificate(&host, &ca, CertType::Host, &[]);
-        assert_eq!(check_host(&anyone, "web.example.com", &cas, 1500), Ok(()));
+        assert_eq!(
+            check_host(&anyone, "web.example.com", &cas, 1500).unwrap_err(),
+            "names no host"
+        );
+
+        // A principal may be a pattern, and names compare ignoring case.
+        let many = certificate(&host, &ca, CertType::Host, &["*.Example.com", "db-?"]);
+        for name in ["web.example.com", "DB.EXAMPLE.COM", "db-1"] {
+            assert_eq!(check_host(&many, name, &cas, 1500), Ok(()), "{name}");
+        }
+        for name in ["example.com", "example.org", "db-12"] {
+            assert!(check_host(&many, name, &cas, 1500).is_err(), "{name}");
+        }
     }
 
     #[test]

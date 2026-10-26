@@ -125,5 +125,37 @@ async fn signs_in_and_trusts_hosts_with_certificates() {
         matches!(event, Event::Failed(ConnectError::AuthFailed { .. })),
         "{event:?}"
     );
+
+    // A revoked authority vouches for nothing.
+    let trusting = std::fs::read_to_string(&known_hosts).unwrap();
+    let revoking = format!(
+        "{trusting}@revoked [127.0.0.1]:{port} {}\n",
+        ca.public_key().to_openssh().unwrap()
+    );
+    std::fs::write(&known_hosts, revoking).unwrap();
+    let mut session = Session::open(request(port, password(), None));
+    match next(&mut session).await {
+        Event::Failed(ConnectError::Other(message)) => {
+            assert!(
+                message.starts_with("the host certificate is revoked by"),
+                "{message}"
+            )
+        }
+        other => panic!("expected the authority to be revoked, got {other:?}"),
+    }
+
+    // Nor does one while a known_hosts file can't be read: it might revoke
+    // the authority the other trusts.
+    std::fs::write(&known_hosts, trusting).unwrap();
+    let system = tern_core::paths::system_known_hosts().unwrap();
+    std::fs::create_dir_all(&system).unwrap();
+    let mut session = Session::open(request(port, password(), None));
+    match next(&mut session).await {
+        Event::Failed(ConnectError::Other(message)) => {
+            assert!(message.starts_with("can't read"), "{message}")
+        }
+        other => panic!("expected an unreadable known_hosts to stop it, got {other:?}"),
+    }
+    std::fs::remove_dir(&system).unwrap();
     let _ = std::fs::remove_dir_all(&scratch);
 }

@@ -916,7 +916,8 @@ async fn open(
     agent_forwarding: bool,
 ) -> Result<client::Handle<Verifier>, ConnectError> {
     let files = known_hosts_files();
-    let authorities = certs::authorities(&files, &target.host, target.port);
+    let authorities =
+        crate::known_hosts::authorities(&files, &target.host, target.port).map_err(other)?;
     let mut config = client::Config {
         keepalive_interval: keep_alive.then_some(KEEP_ALIVE),
         ..Default::default()
@@ -1111,9 +1112,10 @@ fn same_type(known: &Algorithm, algorithm: &Algorithm) -> bool {
 
 /// A host certificate is good when an authority known_hosts names for the
 /// host vouches for it, and neither that authority nor the key is
-/// `@revoked`. Otherwise, as OpenSSH does, the key inside counts as a plain
-/// host key, already trusted or not; it isn't offered for trust, because a
-/// host that has an authority shouldn't need it.
+/// `@revoked`; a known_hosts file that can't be read is no answer to that,
+/// so it fails. Otherwise, as OpenSSH does, the key inside counts as a
+/// plain host key, already trusted or not; it isn't offered for trust,
+/// because a host that has an authority shouldn't need it.
 fn check_host_certificate(
     host: &str,
     port: u16,
@@ -1124,7 +1126,7 @@ fn check_host_certificate(
     let authority = PublicKey::from(cert.signature_key().clone());
     for revoked in [&key, &authority] {
         if let Some((file, line)) =
-            crate::known_hosts::revoked(&known_hosts_files(), host, port, revoked)
+            crate::known_hosts::revoked(&known_hosts_files(), host, port, revoked).map_err(other)?
         {
             return Err(other(format!(
                 "the host certificate is revoked by {}:{line}",

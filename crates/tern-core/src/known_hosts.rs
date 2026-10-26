@@ -125,20 +125,31 @@ pub fn verdict(
 }
 
 /// The `@revoked` line of `files` that names `key` for `host:port`, if
-/// one does: how a revoked certificate authority is told too.
+/// one does: how a revoked certificate authority is told too. A file that
+/// can't be read is an error, never a no: what it revokes isn't known.
 pub fn revoked(
     files: &[PathBuf],
     host: &str,
     port: u16,
     key: &PublicKey,
-) -> Option<(PathBuf, usize)> {
-    entries_for(files, host, port)
-        .ok()?
+) -> Result<Option<(PathBuf, usize)>, String> {
+    Ok(entries_for(files, host, port)?
         .into_iter()
         .find(|(marker, known, ..)| {
             *marker == Marker::Revoked && known.key_data() == key.key_data()
         })
-        .map(|(_, _, file, line)| (file, line))
+        .map(|(_, _, file, line)| (file, line)))
+}
+
+/// The certificate authorities `files` trust for `host:port`: the keys of
+/// their `@cert-authority` lines that take it. A file that can't be read is
+/// an error, as it is for a host's own key.
+pub fn authorities(files: &[PathBuf], host: &str, port: u16) -> Result<Vec<PublicKey>, String> {
+    Ok(entries_for(files, host, port)?
+        .into_iter()
+        .filter(|(marker, ..)| *marker == Marker::Authority)
+        .map(|(_, key, ..)| key)
+        .collect())
 }
 
 /// The types of the keys `files` trust for `host:port`, which a connection
@@ -535,13 +546,53 @@ mod tests {
         assert_eq!(check("db.example.com", &gone), revoked_line);
         assert_eq!(
             revoked(&files, "elsewhere", 2222, &gone),
-            Some((file.clone(), 1))
+            Ok(Some((file.clone(), 1)))
         );
-        assert_eq!(revoked(&files, "elsewhere", 22, &ed), None);
+        assert_eq!(revoked(&files, "elsewhere", 22, &ed), Ok(None));
         assert_eq!(
             known_types(&files, "db.example.com", 22),
             [Algorithm::Ed25519]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_authorities_and_fails_closed_on_a_file_it_cant_read() {
+        let dir = std::env::temp_dir().join(format!("tern-authorities-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("known_hosts");
+        let (ca, other) = (key(), key());
+        let line = |key: &PublicKey| key.to_openssh().unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "db.example.com {}\n@cert-authority *.example.com {}\n\
+                 @cert-authority *.example.org {}\n@revoked * {}\n",
+                line(&other),
+                line(&ca),
+                line(&other),
+                line(&ca),
+            ),
+        )
+        .unwrap();
+        let files = [file.clone(), dir.join("missing")];
+        assert_eq!(
+            authorities(&files, "db.example.com", 22),
+            Ok(vec![ca.clone()])
+        );
+        assert_eq!(authorities(&files, "db.example.net", 22), Ok(Vec::new()));
+        assert_eq!(
+            revoked(&files, "db.example.com", 22, &ca),
+            Ok(Some((file.clone(), 4)))
+        );
+        // A file that's there but can't be read (here a folder) may revoke
+        // what another trusts: neither question has an answer.
+        let unreadable = dir.join("folder");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let files = [unreadable, file];
+        assert!(authorities(&files, "db.example.com", 22).is_err());
+        assert!(revoked(&files, "db.example.com", 22, &other).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
