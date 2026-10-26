@@ -22,6 +22,9 @@ pub struct KnownHostsView {
     query: SharedString,
     /// Why the last Forget didn't work.
     notice: Option<SharedString>,
+    /// The reading of the files asked for last, by number: an older one
+    /// that ends later doesn't replace it.
+    reading: u64,
     _subscription: Subscription,
 }
 
@@ -34,21 +37,43 @@ impl KnownHostsView {
                 cx.notify();
             }
         });
-        Self {
-            entries: known_hosts::list_in(&files),
+        let mut view = Self {
+            entries: Vec::new(),
             files,
             search,
             query: SharedString::default(),
             notice: None,
+            reading: 0,
             _subscription: subscription,
-        }
+        };
+        view.read(cx);
+        view
     }
 
     /// Reads the files again, for keys trusted or forgotten elsewhere.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.entries = known_hosts::list_in(&self.files);
         self.notice = None;
+        self.read(cx);
         cx.notify();
+    }
+
+    /// Reads the files, and works out each key's art, away from the UI
+    /// thread: a big file takes a while.
+    fn read(&mut self, cx: &mut Context<Self>) {
+        self.reading += 1;
+        let reading = self.reading;
+        let files = self.files.clone();
+        let read = cx.background_spawn(async move { known_hosts::list_in(&files) });
+        cx.spawn(async move |this, cx| {
+            let entries = read.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.reading == reading {
+                    this.entries = entries;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn forget(&mut self, index: usize, cx: &mut Context<Self>) {

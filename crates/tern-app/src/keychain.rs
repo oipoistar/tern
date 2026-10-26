@@ -49,6 +49,11 @@ pub struct KeychainView {
     picking_host: bool,
     /// Delete was clicked once; the next click deletes.
     confirm_delete: bool,
+    /// The listing of the key folders asked for last, by number: an older
+    /// one that ends later doesn't replace it.
+    listing: u64,
+    /// A key is being made; the Generate form waits for it.
+    generating: bool,
     _subscription: Subscription,
 }
 
@@ -66,10 +71,9 @@ impl KeychainView {
                 cx.notify();
             }
         });
-        let keys = keys::list_in(&dirs);
-        Self {
-            selected: keys.first().map(|key| key.path.clone()),
-            keys,
+        let mut view = Self {
+            selected: None,
+            keys: Vec::new(),
             dirs,
             vault,
             search,
@@ -78,25 +82,44 @@ impl KeychainView {
             generate: None,
             picking_host: false,
             confirm_delete: false,
+            listing: 0,
+            generating: false,
             _subscription: subscription,
-        }
+        };
+        view.reload(None, cx);
+        view
     }
 
     /// Reads the key folders again and takes a fresh look at the vault.
     pub fn refresh(&mut self, vault: Vault, cx: &mut Context<Self>) {
         self.vault = vault;
-        self.reload(None);
+        self.reload(None, cx);
         cx.notify();
     }
 
-    /// Re-lists the keys, selecting `select` if given, else keeping the
-    /// selection while it exists.
-    fn reload(&mut self, select: Option<PathBuf>) {
-        self.keys = keys::list_in(&self.dirs);
-        let keep = select.or_else(|| self.selected.take());
-        self.selected = keep
-            .filter(|path| self.keys.iter().any(|key| key.path == *path))
-            .or_else(|| self.keys.first().map(|key| key.path.clone()));
+    /// Re-lists the keys, away from the UI thread (each is read, and
+    /// checked against the trusted files), selecting `select` if given,
+    /// else keeping the selection while it exists.
+    fn reload(&mut self, select: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.listing += 1;
+        let listing = self.listing;
+        let dirs = self.dirs.clone();
+        let listed = cx.background_spawn(async move { keys::list_in(&dirs) });
+        cx.spawn(async move |this, cx| {
+            let keys = listed.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.listing != listing {
+                    return;
+                }
+                this.keys = keys;
+                let keep = select.or_else(|| this.selected.take());
+                this.selected = keep
+                    .filter(|path| this.keys.iter().any(|key| key.path == *path))
+                    .or_else(|| this.keys.first().map(|key| key.path.clone()));
+                cx.notify();
+            });
+        })
+        .detach();
         self.confirm_delete = false;
         self.picking_host = false;
     }
@@ -137,20 +160,42 @@ impl KeychainView {
         cx.notify();
     }
 
+    /// Makes the key the form asks for, away from the UI thread: an
+    /// encrypted one takes a moment.
     fn create_key(&mut self, cx: &mut Context<Self>) {
-        let Some(form) = &mut self.generate else {
+        let Some(form) = &self.generate else {
             return;
         };
+        if self.generating {
+            return;
+        }
         let name = form.name.read(cx).value().trim().to_string();
         let passphrase = form.passphrase.read(cx).value().to_string();
-        match keys::generate(&self.dirs, &name, Some(&passphrase), &comment()) {
-            Ok(pair) => {
-                self.generate = None;
-                self.notice = None;
-                self.reload(Some(pair.path));
-            }
-            Err(problem) => form.problem = Some(problem.into()),
-        }
+        let (dirs, comment) = (self.dirs.clone(), comment());
+        let made = cx.background_spawn(async move {
+            keys::generate(&dirs, &name, Some(&passphrase), &comment)
+        });
+        self.generating = true;
+        cx.spawn(async move |this, cx| {
+            let made = made.await;
+            let _ = this.update(cx, |this, cx| {
+                this.generating = false;
+                match made {
+                    Ok(pair) => {
+                        this.generate = None;
+                        this.notice = None;
+                        this.reload(Some(pair.path), cx);
+                    }
+                    Err(problem) => {
+                        if let Some(form) = &mut this.generate {
+                            form.problem = Some(problem.into());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -166,11 +211,15 @@ impl KeychainView {
             if let Ok(Ok(Some(paths))) = chosen.await
                 && let Some(path) = paths.into_iter().next()
             {
+                let imported = cx
+                    .background_executor()
+                    .spawn(async move { keys::import(&dirs, &path) })
+                    .await;
                 let _ = this.update(cx, |this, cx| {
-                    match keys::import(&dirs, &path) {
+                    match imported {
                         Ok(pair) => {
                             this.notice = None;
-                            this.reload(Some(pair.path));
+                            this.reload(Some(pair.path), cx);
                         }
                         Err(error) => this.notice = Some(error.into()),
                     }
@@ -195,8 +244,12 @@ impl KeychainView {
             if let Ok(Ok(Some(paths))) = chosen.await
                 && let Some(folder) = paths.into_iter().next()
             {
+                let exported = cx
+                    .background_executor()
+                    .spawn(async move { keys::export(&pair, &folder) })
+                    .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.notice = keys::export(&pair, &folder).err().map(Into::into);
+                    this.notice = exported.err().map(Into::into);
                     cx.notify();
                 });
             }
@@ -216,7 +269,7 @@ impl KeychainView {
                 Ok(()) => {
                     self.notice = None;
                     self.selected = None;
-                    self.reload(None);
+                    self.reload(None, cx);
                 }
                 Err(error) => self.notice = Some(error.into()),
             }
@@ -335,7 +388,14 @@ impl KeychainView {
                             .h(px(44.))
                             .px(px(18.))
                             .rounded(px(14.))
-                            .child("Generate")
+                            // A key being made: the button turns while it is.
+                            .map(|d| {
+                                if self.generating {
+                                    d.child(icon(IconName::LoaderCircle, 16., t.card))
+                                } else {
+                                    d.child("Generate")
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.create_key(cx))),
                     ),
             )
@@ -811,9 +871,20 @@ mod tests {
         assert!(cx.debug_bounds("delete-key").is_none());
 
         // Generate a key under the suggested name: in ~/.ssh beside the
-        // other on Linux and macOS, in Tern's own folder on Windows.
+        // other on Linux and macOS, in Tern's own folder on Windows. It's
+        // made in the background, the form waiting, and a second click
+        // while it's made makes no second key.
         click(cx, "generate-key");
-        click(cx, "create-key");
+        view.update(cx, |view, cx| {
+            view.create_key(cx);
+            view.create_key(cx);
+            assert!(view.generating && view.generate.is_some());
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.generating && view.generate.is_none());
+            assert_eq!(view.keys.len(), 2);
+        });
         let made = view.read_with(cx, |view, _| view.selected().cloned().unwrap());
         let (home, name) = if cfg!(unix) {
             (&ssh, "id_ed25519-2")
