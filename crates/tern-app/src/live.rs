@@ -8,6 +8,7 @@
 //! per frame, from that record.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::*;
@@ -27,24 +28,36 @@ struct Slot {
 /// Marks recorded by a screen, keyed by a stable id so a repeated prepaint
 /// replaces its entry instead of duplicating it.
 #[derive(Clone, Default)]
-pub struct LiveSlots(Rc<RefCell<Vec<(SharedString, Slot)>>>);
+pub struct LiveSlots(Rc<RefCell<Recorded>>);
+
+#[derive(Default)]
+struct Recorded {
+    slots: Vec<Slot>,
+    /// Where each id's slot is in `slots`.
+    at: HashMap<SharedString, usize>,
+}
 
 impl LiveSlots {
     /// Forget every mark; call at the start of the screen's render.
     pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+        let mut recorded = self.0.borrow_mut();
+        recorded.slots.clear();
+        recorded.at.clear();
     }
 
     /// Whether anything on screen needs animating.
     pub fn is_empty(&self) -> bool {
-        self.0.borrow().is_empty()
+        self.0.borrow().slots.is_empty()
     }
 
     fn record(&self, id: SharedString, slot: Slot) {
-        let mut slots = self.0.borrow_mut();
-        match slots.iter_mut().find(|(existing, _)| *existing == id) {
-            Some(entry) => entry.1 = slot,
-            None => slots.push((id, slot)),
+        let recorded = &mut *self.0.borrow_mut();
+        match recorded.at.get(&id) {
+            Some(&at) => recorded.slots[at] = slot,
+            None => {
+                recorded.at.insert(id, recorded.slots.len());
+                recorded.slots.push(slot);
+            }
         }
     }
 }
@@ -76,13 +89,18 @@ pub fn live(
 }
 
 /// Paints every recorded mark at `time` seconds into the animation. Render it
-/// after (on top of) the cached screen, filling the window.
+/// after (on top of) the cached screen, filling the window. A mark its
+/// screen clips away entirely (scrolled out of view) isn't drawn at all,
+/// so the work follows the marks on screen, not all there are.
 pub fn live_layer(slots: &LiveSlots, time: f32) -> impl IntoElement {
     let slots = slots.clone();
     canvas(
         |_, _, _| (),
         move |_, _, window, cx| {
-            for (_, slot) in slots.0.borrow().iter() {
+            for slot in &slots.0.borrow().slots {
+                if !slot.bounds.intersects(&slot.mask.bounds) {
+                    continue;
+                }
                 window.with_content_mask(Some(slot.mask), |window| {
                     (slot.paint)(slot.bounds, time, window, cx)
                 });
@@ -94,4 +112,53 @@ pub fn live_layer(slots: &LiveSlots, time: f32) -> impl IntoElement {
     .top_0()
     .left_0()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports: `gpui_kit::*` would shadow Rust's `#[test]`.
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+    use gpui_kit::{
+        Bounds, ContentMask, Context, IntoElement, ParentElement as _, Render, Styled as _, Window,
+        div, point, px, size,
+    };
+
+    use super::{LiveSlots, Slot, live_layer};
+
+    struct Layer(LiveSlots);
+
+    impl Render for Layer {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(live_layer(&self.0, 0.))
+        }
+    }
+
+    #[gpui::test]
+    fn paints_only_marks_their_screen_shows(cx: &mut TestAppContext) {
+        let painted = Rc::new(Cell::new(0));
+        let slots = LiveSlots::default();
+        let view = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(100.)));
+        let slot = |y: f32| {
+            let painted = painted.clone();
+            Slot {
+                bounds: Bounds::new(point(px(10.), px(y)), size(px(80.), px(20.))),
+                mask: ContentMask { bounds: view },
+                paint: Rc::new(move |_, _, _, _| painted.set(painted.get() + 1)),
+            }
+        };
+        slots.record("shown".into(), slot(10.));
+        // Scrolled out of its screen's view.
+        slots.record("below".into(), slot(400.));
+        // Prepainted again: replaced, not added.
+        slots.record("shown".into(), slot(20.));
+        assert_eq!(slots.0.borrow().slots.len(), 2);
+
+        let layer = slots.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Layer(layer));
+        cx.run_until_parked();
+        assert_eq!(painted.get(), 1);
+    }
 }
