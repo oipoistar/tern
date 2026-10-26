@@ -168,6 +168,33 @@ impl Vault {
     /// `replacing` (the host's name before editing) the old entry is updated
     /// in place, or moved when the group changed, and hosts that went through
     /// the old name follow a rename. A group left empty goes away.
+    /// Points what signs in with a key file `from` of `moves` (hosts and
+    /// identities) at its `to`: where this device keeps the key another
+    /// names by its own path ([`crate::sync::relink`]). Nothing changed
+    /// for sync: the key is the same. Says whether any did.
+    pub fn relink_keys(&mut self, moves: &[(PathBuf, PathBuf)]) -> bool {
+        let mut moved = false;
+        let auths = self
+            .groups
+            .iter_mut()
+            .flat_map(|group| &mut group.hosts)
+            .map(|host| &mut host.auth)
+            .chain(
+                self.identities
+                    .iter_mut()
+                    .map(|identity| &mut identity.auth),
+            );
+        for auth in auths {
+            if let Auth::Key(path) = auth
+                && let Some((_, to)) = moves.iter().find(|(from, _)| from == path)
+            {
+                *path = to.clone();
+                moved = true;
+            }
+        }
+        moved
+    }
+
     pub fn save(&mut self, replacing: Option<&str>, mut host: Host, group: &str) {
         host.updated = now_ms();
         let mut slot = None;

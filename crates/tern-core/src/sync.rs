@@ -29,7 +29,7 @@ use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305, XNonce};
 use russh::keys::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::host::{Host, HostGroup, new_id, now_ms};
+use crate::host::{Auth, Host, HostGroup, new_id, now_ms};
 use crate::identity::Identity;
 use crate::keys::{self, KeyPair};
 use crate::paths;
@@ -149,6 +149,10 @@ pub struct Snapshot {
     pub settings: Option<SyncedSettings>,
     #[serde(default)]
     pub keys: Vec<SyncedKey>,
+    /// The key files its hosts and identities sign in with, so a device
+    /// that keeps those keys elsewhere finds them there ([`relink`]).
+    #[serde(default)]
+    pub key_files: Vec<KeyFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +169,14 @@ pub struct SyncedSettings {
     pub appearance: Appearance,
     pub terminal: TerminalSettings,
     pub updated: u64,
+}
+
+/// A key file that hosts or identities sign in with, as the device that
+/// wrote a snapshot keeps it: where, and the key's fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyFile {
+    pub path: PathBuf,
+    pub fingerprint: String,
 }
 
 /// A private key chosen to sync, as its files hold it.
@@ -249,6 +261,7 @@ pub fn snapshot(vault: &Vault, settings: &Settings, keys: Vec<SyncedKey>) -> Sna
             updated: settings.updated,
         }),
         keys,
+        key_files: Vec::new(),
     }
 }
 
@@ -483,6 +496,66 @@ pub fn keys_to_sync(pairs: &[KeyPair], fingerprints: &[String]) -> Vec<SyncedKey
                 public: pair.public.clone(),
                 fingerprint: pair.fingerprint.clone(),
             })
+        })
+        .collect()
+}
+
+/// The key files `vault`'s hosts and identities sign in with, each once.
+fn key_paths(vault: &Vault) -> Vec<&PathBuf> {
+    let mut paths: Vec<&PathBuf> = Vec::new();
+    let auths = vault
+        .hosts()
+        .map(|host| &host.auth)
+        .chain(vault.identities.iter().map(|identity| &identity.auth));
+    for auth in auths {
+        if let Auth::Key(path) = auth
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The key files `vault`'s hosts and identities sign in with that are keys
+/// this device lists (`pairs`), which are those that can sync, each with
+/// its key's fingerprint: for this device's snapshot.
+pub fn key_files(vault: &Vault, pairs: &[KeyPair]) -> Vec<KeyFile> {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    key_paths(vault)
+        .into_iter()
+        .filter_map(|path| {
+            let pair = pairs.iter().find(|pair| {
+                pair.path == *path
+                    || canonical(&pair.path).is_some_and(|it| Some(it) == canonical(path))
+            })?;
+            Some(KeyFile {
+                path: path.clone(),
+                fingerprint: pair.fingerprint.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Where this device keeps keys that `vault`'s hosts and identities name by
+/// another device's path: each key file that isn't here which a snapshot
+/// says holds a key this device has (`pairs`), with that key's path here.
+/// Files read; run it off the UI thread.
+pub fn relink(vault: &Vault, others: &[Snapshot], pairs: &[KeyPair]) -> Vec<(PathBuf, PathBuf)> {
+    key_paths(vault)
+        .into_iter()
+        .filter(|path| !path.exists())
+        .filter_map(|path| {
+            let here = others
+                .iter()
+                .flat_map(|snapshot| &snapshot.key_files)
+                .filter(|file| file.path == *path)
+                .find_map(|file| {
+                    pairs
+                        .iter()
+                        .find(|pair| pair.fingerprint == file.fingerprint)
+                })?;
+            Some((path.clone(), here.path.clone()))
         })
         .collect()
 }
@@ -1070,6 +1143,54 @@ mod tests {
         for dir in [ours, theirs] {
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn hosts_find_a_synced_key_where_this_device_keeps_it() {
+        let (ours, theirs) = (
+            std::env::temp_dir().join(format!("tern-sync-relink-a-{}", std::process::id())),
+            std::env::temp_dir().join(format!("tern-sync-relink-b-{}", std::process::id())),
+        );
+        for dir in [&ours, &theirs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let (here, there) = ([(ours.clone(), true)], [(theirs.clone(), true)]);
+        // There: a host signs in with a key there, which syncs.
+        let key = keys::generate(&there, "deploy", None, "").unwrap();
+        let mut vault = Vault::default();
+        let mut db = Host::new("db", "ops", "db.lan", 22);
+        db.auth = Auth::Key(key.path.clone());
+        vault.save(None, db, "Prod");
+        let pairs = keys::list_in(&there);
+        let chosen = std::slice::from_ref(&key.fingerprint);
+        let mut from_there = snapshot(&vault, &settings("There"), keys_to_sync(&pairs, chosen));
+        from_there.key_files = key_files(&vault, &pairs);
+        assert_eq!(
+            from_there.key_files,
+            [KeyFile {
+                path: key.path.clone(),
+                fingerprint: key.fingerprint.clone(),
+            }]
+        );
+
+        // Here, the key goes where this device keeps keys, and the path
+        // there isn't one here: the host finds the key here instead.
+        std::fs::remove_dir_all(&theirs).unwrap();
+        let merged = merge(&Vault::default(), &settings("Here"), &[from_there.clone()]);
+        receive_keys(&here, &merged.keys, &[]).unwrap();
+        let pairs = keys::list_in(&here);
+        let moves = relink(&merged.vault, &[from_there.clone()], &pairs);
+        assert_eq!(moves, [(key.path.clone(), pairs[0].path.clone())]);
+        let mut vault = merged.vault;
+        let updated = vault.find("db").unwrap().updated;
+        assert!(vault.relink_keys(&moves));
+        let db = vault.find("db").unwrap();
+        assert_eq!(db.auth, Auth::Key(pairs[0].path.clone()));
+        // The key is the same, so nothing changed for other devices.
+        assert_eq!(db.updated, updated);
+        // A key file that's here is left as it is.
+        assert!(relink(&vault, &[from_there], &pairs).is_empty());
+        std::fs::remove_dir_all(ours).unwrap();
     }
 
     #[test]

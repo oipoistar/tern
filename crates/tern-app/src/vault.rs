@@ -30,7 +30,7 @@ use tern_core::ssh::{
     ConnectError, Connection, Event, Session, SessionInput, Target, TermSize, key_art,
     known_host_keys_for, probe, quick_destination,
 };
-use tern_core::sync::{Merged, Syncer};
+use tern_core::sync::Syncer;
 use tern_core::vaults::{FIRST, VaultEntry};
 use tern_core::waiting::Waiting;
 use tern_core::{Auth, Host, HostGroup, HostStatus, Vault, openssh, paths, putty};
@@ -47,7 +47,7 @@ use crate::live::LiveSlots;
 use crate::marks::{self, Trace};
 use crate::settings;
 use crate::snippets::{SnippetEvent, SnippetsView};
-use crate::sync::{self, Status, SyncState};
+use crate::sync::{self, Status, SyncState, Synced};
 use crate::terminal::Preview;
 use crate::theme::{self, MONO, TermPalette, Theme};
 use crate::ui::{
@@ -1583,12 +1583,10 @@ impl VaultContent {
                 devices,
             },
         );
-        let keys =
-            tern_core::sync::keys_to_sync(&keys::list_in(&keys::dirs()), &settings.sync.keys);
         let vault = self.vault.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { sync::run(&syncer, &vault, &settings, keys) });
+            .spawn(async move { sync::run(&syncer, &vault, &settings) });
         self._sync = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -1600,12 +1598,13 @@ impl VaultContent {
 
     /// Takes in what a sync brought: hosts and snippets, newer settings
     /// and keys this device lacks.
-    fn finish_sync(
-        &mut self,
-        result: Result<(Merged, Vec<(String, u64)>), String>,
-        cx: &mut Context<Self>,
-    ) {
-        let (merged, devices) = match result {
+    fn finish_sync(&mut self, result: Result<Synced, String>, cx: &mut Context<Self>) {
+        let Synced {
+            merged,
+            devices,
+            relink,
+            refused,
+        } = match result {
             Ok(done) => done,
             Err(reason) => {
                 let devices = sync::state(cx).devices;
@@ -1622,7 +1621,8 @@ impl VaultContent {
         let settings = vaults::sync_view(cx);
         // Changes made here while the sync ran are newer than what it read.
         let synced = tern_core::sync::snapshot(&merged.vault, &settings, Vec::new());
-        let vault = tern_core::sync::merge(&self.vault, &settings, &[synced]).vault;
+        let mut vault = tern_core::sync::merge(&self.vault, &settings, &[synced]).vault;
+        vault.relink_keys(&relink);
         if vault != self.vault {
             self.vault = vault;
             self.write_vault();
@@ -1648,14 +1648,12 @@ impl VaultContent {
                 let _ = window.update(cx, |_, window, cx| settings::apply_appearance(window, cx));
             });
         }
-        let have = keys::list_in(&keys::dirs());
-        let received = tern_core::sync::receive_keys(&keys::dirs(), &merged.keys, &have);
         sync::set_state(
             cx,
             SyncState {
-                status: match received {
-                    Ok(_) => Status::Synced(tern_core::host::now_ms()),
-                    Err(reason) => Status::Failed(reason.into()),
+                status: match refused {
+                    None => Status::Synced(tern_core::host::now_ms()),
+                    Some(reason) => Status::Failed(reason.into()),
                 },
                 devices,
             },

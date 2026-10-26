@@ -2,14 +2,15 @@
 //! it, the secrets store the passphrase lives in, and one sync run, done
 //! off the UI thread.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::*;
-use tern_core::Vault;
 use tern_core::host::now_ms;
 use tern_core::secrets::{Secrets, SystemSecrets};
 use tern_core::settings::Settings;
-use tern_core::sync::{self, Merged, SyncedKey, Syncer};
+use tern_core::sync::{self, Merged, Syncer};
+use tern_core::{Vault, keys};
 
 /// How sync stands.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -61,16 +62,26 @@ pub fn secrets(cx: &App) -> Arc<dyn Secrets> {
     }
 }
 
+/// What one sync brought, for the vault to take in.
+pub struct Synced {
+    pub merged: Merged,
+    /// The other devices: name and when each last wrote.
+    pub devices: Vec<(String, u64)>,
+    /// Key files hosts name that aren't on this device, and where it keeps
+    /// those keys ([`sync::relink`]).
+    pub relink: Vec<(PathBuf, PathBuf)>,
+    /// Why a key another device syncs wasn't kept, in one line.
+    pub refused: Option<String>,
+}
+
 /// One sync: reads the other devices' files, merges them into `vault` and
-/// `settings`, and writes the result as this device's file. Blocking (it
-/// derives keys and touches files); run it off the UI thread.
-pub fn run(
-    syncer: &Mutex<Syncer>,
-    vault: &Vault,
-    settings: &Settings,
-    keys: Vec<SyncedKey>,
-) -> Result<(Merged, Vec<(String, u64)>), String> {
+/// `settings`, writes the result as this device's file, and keeps the keys
+/// the others sync that this one lacks. Blocking (it derives keys and
+/// touches files, keys' among them); run it off the UI thread.
+pub fn run(syncer: &Mutex<Syncer>, vault: &Vault, settings: &Settings) -> Result<Synced, String> {
     let folder = settings.sync.folder.clone().ok_or("No sync folder")?;
+    let dirs = keys::dirs();
+    let pairs = keys::list_in(&dirs);
     let mut syncer = syncer.lock().unwrap();
     let others = syncer.read(&folder, &settings.sync.device_id)?;
     let merged = sync::merge(vault, settings, &others);
@@ -81,12 +92,29 @@ pub fn run(
         ours.terminal = newer.terminal.clone();
         ours.updated = newer.updated;
     }
-    syncer.write(&folder, &sync::snapshot(&merged.vault, &ours, keys))?;
+    let keys = sync::keys_to_sync(&pairs, &settings.sync.keys);
+    let mut snapshot = sync::snapshot(&merged.vault, &ours, keys);
+    if settings.sync.hosts {
+        snapshot.key_files = sync::key_files(&merged.vault, &pairs);
+    }
+    syncer.write(&folder, &snapshot)?;
+    let refused = sync::receive_keys(&dirs, &merged.keys, &pairs).err();
+    // Keys just kept may be the ones hosts name.
+    let pairs = match merged.keys.is_empty() {
+        true => pairs,
+        false => keys::list_in(&dirs),
+    };
+    let relink = sync::relink(&merged.vault, &others, &pairs);
     let devices = others
         .iter()
         .map(|snapshot| (snapshot.device.clone(), snapshot.written))
         .collect();
-    Ok((merged, devices))
+    Ok(Synced {
+        merged,
+        devices,
+        relink,
+        refused,
+    })
 }
 
 /// "just now", "2 min ago"… for a time in milliseconds.
