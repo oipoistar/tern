@@ -1631,18 +1631,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let read = tern_core::cast::load(path);
-        let title = read
-            .as_ref()
-            .ok()
-            .and_then(|cast| cast.title.clone())
-            .or_else(|| {
-                path.file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-            })
-            .unwrap_or_default();
-        let terminal = cx.new(|cx| TerminalView::replay(read, title, cx));
-        self.add_session(terminal, window, cx);
+        // Read in the background: a long recording takes a while. Its tab
+        // opens once it's read.
+        let path = path.to_path_buf();
+        let reading = {
+            let path = path.clone();
+            cx.background_spawn(async move { tern_core::cast::load(&path) })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let read = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let title = read
+                    .as_ref()
+                    .ok()
+                    .and_then(|cast| cast.title.clone())
+                    .or_else(|| {
+                        path.file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                let terminal = cx.new(|cx| TerminalView::replay(read, title, cx));
+                this.add_session(terminal, window, cx);
+            });
+        })
+        .detach();
     }
 
     /// Opens the list of the focused host's running containers, listed
@@ -4103,6 +4115,9 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.tabs[0].focused().clone());
         pane.update(cx, |pane, cx| {
             pane.record_to(&path, cx);
+            // Some time in, so that the start of the track is before it:
+            // times are kept to the microsecond.
+            std::thread::sleep(std::time::Duration::from_millis(5));
             pane.on_session_event(Event::Output(b"hello\r\n".to_vec()), cx);
             pane.on_session_event(Event::Output(b"world".to_vec()), cx);
         });
@@ -4112,12 +4127,14 @@ mod tests {
         let cast = tern_core::cast::read(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cast.events.len(), 2);
 
-        // Played back in a tab of its own; the track moves it.
+        // Played back in a tab of its own, once read in the background; the
+        // track moves it.
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.play_recording(&path, window, cx)
             })
         });
+        cx.run_until_parked();
         let replay = workspace.read_with(cx, |workspace, _| workspace.tabs[1].focused().clone());
         assert!(replay.read_with(cx, |replay, _| replay.replaying()));
         cx.run_until_parked();
@@ -4152,6 +4169,7 @@ mod tests {
                 workspace.play_recording(&dir.join("notes.cast"), window, cx)
             })
         });
+        cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             let pane = workspace.tabs[2].focused().read(cx);
             assert!(matches!(&pane.phase, crate::terminal::Phase::Ended(why) if why == "It isn't a recording"));

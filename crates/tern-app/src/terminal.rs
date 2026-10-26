@@ -77,6 +77,13 @@ const FRESH_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1
 const PROBE_EVERY: Duration = Duration::from_secs(5);
 /// How often a recording being played moves on.
 const REPLAY_TICK: Duration = Duration::from_millis(33);
+/// How long a recording moved far catches up before everything else on
+/// the UI thread gets a turn; in tests, one event.
+const REPLAY_SLICE: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_millis(4)
+};
 /// What an inline image's cells hold: a character no font draws, in a
 /// colour naming the image (red and green) and its row (blue).
 const PLACEHOLDER: char = '\u{10EEEE}';
@@ -162,6 +169,8 @@ struct Replay {
     /// Where the track was painted, for clicks on it.
     track: Rc<Cell<Bounds<Pixels>>>,
     _ticker: Option<Task<()>>,
+    /// Moved far: the terminal catching up, in turns.
+    _catching_up: Option<Task<()>>,
 }
 
 /// The last lines of a session, shared with the vault's side panel.
@@ -679,6 +688,7 @@ impl TerminalView {
                     playing: None,
                     track: Rc::default(),
                     _ticker: None,
+                    _catching_up: None,
                 });
                 view.restart_replay(cx);
                 view.play(cx);
@@ -723,7 +733,9 @@ impl TerminalView {
     }
 
     /// Shows the recording as it was `at` seconds in: on from where it is,
-    /// or again from the start to go back.
+    /// or again from the start to go back. A long way is gone in turns,
+    /// taking turns with everything else on the UI thread; moving again
+    /// meanwhile goes on from there.
     fn seek(&mut self, at: f64, cx: &mut Context<Self>) {
         let back = self.replay.as_ref().is_some_and(|replay| at < replay.at);
         if back {
@@ -732,26 +744,63 @@ impl TerminalView {
         let Some(replay) = &mut self.replay else {
             return;
         };
-        let at = at.clamp(0., replay.cast.duration());
-        replay.at = at;
-        let due: Vec<Shown> = replay.cast.events[replay.next..]
-            .iter()
-            .take_while(|(when, _)| *when <= at)
-            .map(|(_, shown)| shown.clone())
-            .collect();
-        replay.next += due.len();
-        for shown in due {
+        replay.at = at.clamp(0., replay.cast.duration());
+        replay._catching_up = None;
+        if !self.catch_up(cx) {
+            return;
+        }
+        let catching_up = cx.spawn(async move |this, cx| {
+            loop {
+                yield_now().await;
+                if !matches!(this.update(cx, |this, cx| this.catch_up(cx)), Ok(true)) {
+                    break;
+                }
+            }
+        });
+        if let Some(replay) = &mut self.replay {
+            replay._catching_up = Some(catching_up);
+        }
+    }
+
+    /// Gives the terminal the recording's events up to where it's been
+    /// moved to, for a turn at most ([`REPLAY_SLICE`]); says whether more
+    /// are left.
+    fn catch_up(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(replay) = &mut self.replay else {
+            return false;
+        };
+        // Taken out meanwhile, so that they're fed as they are, not copied.
+        let events = std::mem::take(&mut replay.cast.events);
+        let (at, mut next) = (replay.at, replay.next);
+        let started = Instant::now();
+        while let Some((when, shown)) = events.get(next) {
+            if *when > at {
+                break;
+            }
             match shown {
                 Shown::Output(text) => self.feed(text.as_bytes(), cx),
                 Shown::Resize(cols, rows) => {
-                    self.size = TermSize { cols, rows };
+                    self.size = TermSize {
+                        cols: *cols,
+                        rows: *rows,
+                    };
                     self.term.resize(GridSize(self.size));
                 }
             }
+            next += 1;
+            if started.elapsed() >= REPLAY_SLICE {
+                break;
+            }
+        }
+        let more = events.get(next).is_some_and(|(when, _)| *when <= at);
+        if let Some(replay) = &mut self.replay {
+            replay.cast.events = events;
+            replay.next = next;
         }
         // Nothing answers a recording's questions, and its title stays.
         self.term_events.borrow_mut().clear();
         cx.notify();
+        more
     }
 
     /// Plays on from where the recording is, or from the start once it's
@@ -5121,6 +5170,55 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert_eq!(count(cx), None);
         cx.update(|window, cx| assert!(view.read(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_long_seek_catches_up_in_turns(cx: &mut TestAppContext) {
+        use tern_core::cast::{Cast, Shown};
+
+        cx.update(gpui_kit::init);
+        let cast = Cast {
+            cols: 80,
+            rows: 24,
+            title: None,
+            events: (0..500)
+                .map(|i| {
+                    (
+                        i as f64 / 100.,
+                        Shown::Output(format!(
+                            "line {i}
+
+"
+                        )),
+                    )
+                })
+                .collect(),
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, cx| TerminalView::replay(Ok(cast), "long".into(), cx));
+        cx.run_until_parked();
+        // Moved to the end: not all at once, but in turns.
+        view.update(cx, |view, cx| {
+            view.pause(cx);
+            view.seek(5., cx);
+            let next = view.replay.as_ref().unwrap().next;
+            assert!(next < 500, "fed {next} at once");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.replay.as_ref().unwrap().next, 500);
+            assert!(view.output_text().contains("line 499"));
+        });
+        // Back: again from the start, in turns too.
+        view.update(cx, |view, cx| view.seek(1., cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let text = view.output_text();
+            assert!(
+                text.contains("line 100") && !text.contains("line 101"),
+                "{text}"
+            );
+        });
     }
 
     #[gpui::test]
